@@ -93,3 +93,108 @@ pub fn apply_to_target(
         ClientKind::GithubCopilotApp => github_app::apply(connection, secret, target),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::{ApiProtocol, ModelCapabilities, ModelSpec, ProviderKind};
+    use std::collections::BTreeMap;
+
+    fn connection() -> Connection {
+        Connection {
+            id: "one".to_string(),
+            name: "One".to_string(),
+            base_url: "https://example.invalid/v1".to_string(),
+            provider_kind: ProviderKind::Openai,
+            protocol: ApiProtocol::ChatCompletions,
+            headers: BTreeMap::new(),
+            models: vec![ModelSpec {
+                id: "model".to_string(),
+                model_id: "gpt-example".to_string(),
+                name: "GPT Example".to_string(),
+                enabled: true,
+                capabilities: ModelCapabilities::default(),
+            }],
+            secret_ref: "connection:one".to_string(),
+            has_secret: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn discover_all_always_includes_cli_and_app_targets() {
+        let targets = discover_all();
+        assert!(targets
+            .iter()
+            .any(|target| target.id == "copilot-cli:user-environment"));
+        assert!(targets
+            .iter()
+            .any(|target| target.id == "github-copilot-app:local"));
+    }
+
+    #[test]
+    fn preview_requires_at_least_one_target() {
+        let error = preview(&connection(), &[]).expect_err("empty selection must fail");
+        assert!(matches!(error, AppError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn preview_rejects_unknown_target_ids() {
+        let error = preview(&connection(), &["no-such-target".to_string()])
+            .expect_err("unknown target must fail");
+        assert!(matches!(error, AppError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn preview_deduplicates_repeated_targets() {
+        let plan = preview(
+            &connection(),
+            &[
+                "github-copilot-app:local".to_string(),
+                "github-copilot-app:local".to_string(),
+            ],
+        )
+        .expect("plan");
+        assert_eq!(plan.operations.len(), 1);
+        assert_eq!(plan.target_ids, vec!["github-copilot-app:local"]);
+    }
+
+    #[test]
+    fn preview_describes_the_default_model_for_cli_and_app() {
+        let plan = preview(
+            &connection(),
+            &[
+                "copilot-cli:user-environment".to_string(),
+                "github-copilot-app:local".to_string(),
+            ],
+        )
+        .expect("plan");
+        assert_eq!(plan.operations.len(), 2);
+        for operation in &plan.operations {
+            let rendered = format!("{} {}", operation.description, operation.changes.join(" "));
+            assert!(
+                rendered.contains("gpt-example"),
+                "operation should name the active model: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn apply_to_target_rejects_undetected_targets() {
+        let target = ClientTarget {
+            id: "copilot-cli:user-environment".to_string(),
+            kind: ClientKind::CopilotCli,
+            name: "GitHub Copilot CLI".to_string(),
+            detail: "not detected".to_string(),
+            path: None,
+            detected: false,
+            supports_write: false,
+            status: ClientStatus::NotInstalled,
+            diagnostic: None,
+        };
+        let error = apply_to_target(&connection(), Some("secret"), &target)
+            .expect_err("undetected target must fail");
+        assert!(matches!(error, AppError::Unsupported(_)));
+    }
+}

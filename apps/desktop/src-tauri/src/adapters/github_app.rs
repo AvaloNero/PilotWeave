@@ -116,3 +116,67 @@ fn installation_candidates() -> Vec<PathBuf> {
 
     candidates
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::{ApiProtocol, ModelCapabilities, ModelSpec, ProviderKind};
+    use chrono::Utc;
+    use std::collections::BTreeMap;
+
+    fn connection() -> Connection {
+        Connection {
+            id: "one".to_string(),
+            name: "One".to_string(),
+            base_url: "https://example.invalid/v1".to_string(),
+            provider_kind: ProviderKind::Openai,
+            protocol: ApiProtocol::ChatCompletions,
+            headers: BTreeMap::new(),
+            models: vec![ModelSpec {
+                id: "model".to_string(),
+                model_id: "gpt-example".to_string(),
+                name: "GPT Example".to_string(),
+                enabled: true,
+                capabilities: ModelCapabilities::default(),
+            }],
+            secret_ref: "connection:one".to_string(),
+            has_secret: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn discovered_target_is_never_writable() {
+        let target = discover_target();
+        assert_eq!(target.id, "github-copilot-app:local");
+        assert_eq!(target.kind, ClientKind::GithubCopilotApp);
+        assert!(!target.supports_write);
+        match target.status {
+            ClientStatus::ReadOnly | ClientStatus::NotInstalled => {}
+            other => panic!("unexpected GitHub Copilot app status: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn preview_is_a_manual_runbook_with_connection_details() {
+        let target = discover_target();
+        let operation = preview(&connection(), &target);
+
+        assert!(!operation.supported);
+        assert_eq!(operation.target_kind, ClientKind::GithubCopilotApp);
+        let runbook = operation.changes.join("\n");
+        assert!(runbook.contains("https://example.invalid/v1"));
+        assert!(runbook.contains("gpt-example"));
+        assert!(runbook.contains("One"));
+    }
+
+    #[test]
+    fn apply_is_intentionally_unsupported() {
+        let target = discover_target();
+        let error = apply(&connection(), Some("secret"), &target)
+            .expect_err("GitHub Copilot app writes are out of scope");
+        assert!(matches!(error, AppError::Unsupported(_)));
+        assert!(error.to_string().contains("read-only"));
+    }
+}

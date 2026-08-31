@@ -473,26 +473,68 @@ mod tests {
     use crate::domain::{ModelCapabilities, ModelSpec, ProviderKind};
     use chrono::Utc;
 
-    fn connection() -> Connection {
+    fn model(model_id: &str, enabled: bool) -> ModelSpec {
+        ModelSpec {
+            id: format!("id-{model_id}"),
+            model_id: model_id.to_string(),
+            name: format!("Model {model_id}"),
+            enabled,
+            capabilities: ModelCapabilities::default(),
+        }
+    }
+
+    fn connection_with(
+        provider_kind: ProviderKind,
+        protocol: ApiProtocol,
+        models: Vec<ModelSpec>,
+    ) -> Connection {
         Connection {
             id: "openrouter".to_string(),
             name: "OpenRouter".to_string(),
             base_url: "https://openrouter.example/v1/chat/completions".to_string(),
-            provider_kind: ProviderKind::Openai,
-            protocol: ApiProtocol::ChatCompletions,
+            provider_kind,
+            protocol,
             headers: BTreeMap::new(),
-            models: vec![ModelSpec {
-                id: "model-1".to_string(),
-                model_id: "example/model".to_string(),
-                name: "Example Model".to_string(),
-                enabled: true,
-                capabilities: ModelCapabilities::default(),
-            }],
+            models,
             secret_ref: "connection:openrouter".to_string(),
             has_secret: true,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
+    }
+
+    fn connection() -> Connection {
+        connection_with(
+            ProviderKind::Openai,
+            ApiProtocol::ChatCompletions,
+            vec![model("example/model", true)],
+        )
+    }
+
+    fn target_for(path: &Path) -> ClientTarget {
+        ClientTarget {
+            id: "vscode:stable:default".to_string(),
+            kind: ClientKind::VsCodeCopilot,
+            name: "Visual Studio Code · Default".to_string(),
+            detail: "test target".to_string(),
+            path: Some(path.to_string_lossy().to_string()),
+            detected: true,
+            supports_write: true,
+            status: ClientStatus::Available,
+            diagnostic: None,
+        }
+    }
+
+    fn read_config(path: &Path) -> Vec<Value> {
+        let text = fs::read_to_string(path).expect("config file");
+        serde_json::from_str(&text).expect("config must be valid JSON after a write")
+    }
+
+    fn managed_group<'a>(groups: &'a [Value], connection_id: &str) -> &'a Value {
+        groups
+            .iter()
+            .find(|group| is_owned_group(group, connection_id))
+            .expect("a group owned by the connection")
     }
 
     #[test]
@@ -514,5 +556,176 @@ mod tests {
         assert!(groups
             .iter()
             .any(|value| value[CONNECTION_ID_FIELD] == "openrouter"));
+    }
+
+    #[test]
+    fn apply_publishes_enabled_models_to_a_fresh_config() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let path = directory.path().join(LANGUAGE_MODELS_FILE);
+        let connection = connection();
+
+        apply(&connection, Some("secret"), &target_for(&path)).expect("apply");
+
+        let groups = read_config(&path);
+        assert_eq!(groups.len(), 1);
+        let group = managed_group(&groups, "openrouter");
+        assert_eq!(group["name"], "OpenRouter");
+        assert_eq!(group["vendor"], "customendpoint");
+        assert_eq!(group["apiType"], "chat-completions");
+        assert_eq!(group["apiKey"], "secret");
+
+        let models = group["models"].as_array().expect("models array");
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0]["id"], "example/model");
+        assert_eq!(models[0]["name"], "Model example/model");
+        assert_eq!(
+            models[0]["url"],
+            "https://openrouter.example/v1/chat/completions"
+        );
+        assert_eq!(
+            models[0]["requestHeaders"]["Authorization"],
+            "Bearer secret"
+        );
+
+        // Nothing existed before, so there is nothing to roll back to.
+        assert!(!backup_path(&path).exists());
+    }
+
+    #[test]
+    fn apply_switches_models_and_preserves_foreign_groups() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let path = directory.path().join(LANGUAGE_MODELS_FILE);
+        let seed =
+            r#"[{"name":"User Group","vendor":"customendpoint","models":[{"id":"user/model"}]}]"#;
+        fs::write(&path, seed).expect("seed config");
+        let target = target_for(&path);
+
+        // First activation publishes model-a next to the user's group.
+        let first = connection_with(
+            ProviderKind::Openai,
+            ApiProtocol::ChatCompletions,
+            vec![model("upstream/model-a", true)],
+        );
+        apply(&first, Some("secret"), &target).expect("first apply");
+        let groups = read_config(&path);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(
+            managed_group(&groups, "openrouter")["models"][0]["id"],
+            "upstream/model-a"
+        );
+
+        // The backup captured the pre-PilotWeave file exactly once.
+        let backup = fs::read_to_string(backup_path(&path)).expect("backup after first write");
+        assert_eq!(backup, seed);
+
+        // Switching the connection to model-b replaces only the managed group.
+        let switched = connection_with(
+            ProviderKind::Openai,
+            ApiProtocol::ChatCompletions,
+            vec![model("upstream/model-b", true)],
+        );
+        apply(&switched, Some("secret"), &target).expect("second apply");
+        let groups = read_config(&path);
+        assert_eq!(groups.len(), 2);
+        assert!(groups.iter().any(|group| group["name"] == "User Group"));
+        let managed = managed_group(&groups, "openrouter");
+        assert_eq!(managed["models"].as_array().expect("models").len(), 1);
+        assert_eq!(managed["models"][0]["id"], "upstream/model-b");
+        let rendered = serde_json::to_string(&groups).expect("serialize groups");
+        assert!(!rendered.contains("upstream/model-a"));
+
+        // The rollback backup still holds the original user configuration.
+        let backup = fs::read_to_string(backup_path(&path)).expect("backup after second write");
+        assert_eq!(backup, seed);
+    }
+
+    #[test]
+    fn apply_without_enabled_models_removes_the_managed_group() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let path = directory.path().join(LANGUAGE_MODELS_FILE);
+        fs::write(
+            &path,
+            r#"[{"name":"User Group","vendor":"customendpoint"}]"#,
+        )
+        .expect("seed config");
+        let target = target_for(&path);
+
+        apply(&connection(), Some("secret"), &target).expect("first apply");
+        assert_eq!(read_config(&path).len(), 2);
+
+        let disabled = connection_with(
+            ProviderKind::Openai,
+            ApiProtocol::ChatCompletions,
+            vec![model("example/model", false)],
+        );
+        apply(&disabled, Some("secret"), &target).expect("second apply");
+
+        let groups = read_config(&path);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0]["name"], "User Group");
+    }
+
+    #[test]
+    fn apply_materializes_anthropic_headers() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let path = directory.path().join(LANGUAGE_MODELS_FILE);
+        let connection = connection_with(
+            ProviderKind::Anthropic,
+            ApiProtocol::Messages,
+            vec![model("claude-example", true)],
+        );
+
+        apply(&connection, Some("sk-ant"), &target_for(&path)).expect("apply");
+
+        let groups = read_config(&path);
+        let group = managed_group(&groups, "openrouter");
+        assert_eq!(group["apiType"], "messages");
+        let headers = &group["models"][0]["requestHeaders"];
+        assert_eq!(headers["x-api-key"], "sk-ant");
+        assert_eq!(headers["anthropic-version"], "2023-06-01");
+    }
+
+    #[test]
+    fn apply_without_a_secret_writes_no_authorization_header() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let path = directory.path().join(LANGUAGE_MODELS_FILE);
+
+        apply(&connection(), None, &target_for(&path)).expect("apply");
+
+        let groups = read_config(&path);
+        let group = managed_group(&groups, "openrouter");
+        assert_eq!(group["apiKey"], "");
+        assert!(group["models"][0].get("requestHeaders").is_none());
+    }
+
+    #[test]
+    fn apply_tolerates_json5_comments_in_existing_config() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let path = directory.path().join(LANGUAGE_MODELS_FILE);
+        fs::write(
+            &path,
+            "[\n  // user-owned group\n  { name: 'User Group', vendor: 'customendpoint', },\n]\n",
+        )
+        .expect("seed json5 config");
+
+        apply(&connection(), Some("secret"), &target_for(&path)).expect("apply");
+
+        let groups = read_config(&path);
+        assert_eq!(groups.len(), 2);
+        assert!(groups.iter().any(|group| group["name"] == "User Group"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_refuses_a_symlinked_config() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let real = directory.path().join("real.json");
+        fs::write(&real, "[]").expect("real file");
+        let path = directory.path().join(LANGUAGE_MODELS_FILE);
+        std::os::unix::fs::symlink(&real, &path).expect("symlink");
+
+        let error = apply(&connection(), Some("secret"), &target_for(&path))
+            .expect_err("must refuse symlink");
+        assert!(matches!(error, AppError::InvalidInput(_)));
     }
 }

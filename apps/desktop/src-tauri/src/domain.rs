@@ -7,18 +7,13 @@ use uuid::Uuid;
 
 pub const STATE_VERSION: u32 = 1;
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum ApiProtocol {
+    #[default]
     ChatCompletions,
     Responses,
     Messages,
-}
-
-impl Default for ApiProtocol {
-    fn default() -> Self {
-        Self::ChatCompletions
-    }
 }
 
 impl ApiProtocol {
@@ -31,20 +26,15 @@ impl ApiProtocol {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ProviderKind {
+    #[default]
     Openai,
     Azure,
     Anthropic,
     Local,
     Custom,
-}
-
-impl Default for ProviderKind {
-    fn default() -> Self {
-        Self::Openai
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -362,5 +352,103 @@ impl Default for PersistentState {
             connections: Vec::new(),
             deployments: Vec::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn model(id: &str, model_id: &str, enabled: bool) -> ModelSpec {
+        ModelSpec {
+            id: id.to_string(),
+            model_id: model_id.to_string(),
+            name: model_id.to_string(),
+            enabled,
+            capabilities: ModelCapabilities::default(),
+        }
+    }
+
+    fn connection_with(models: Vec<ModelSpec>) -> Connection {
+        Connection {
+            id: "one".to_string(),
+            name: "One".to_string(),
+            base_url: "https://example.invalid/v1".to_string(),
+            provider_kind: ProviderKind::Openai,
+            protocol: ApiProtocol::ChatCompletions,
+            headers: BTreeMap::new(),
+            models,
+            secret_ref: String::new(),
+            has_secret: false,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn the_first_enabled_model_is_the_default() {
+        let connection = connection_with(vec![
+            model("a", "upstream/disabled", false),
+            model("b", "upstream/active", true),
+            model("c", "upstream/also-active", true),
+        ]);
+        assert_eq!(
+            connection
+                .default_model()
+                .map(|model| model.model_id.as_str()),
+            Some("upstream/active")
+        );
+        assert_eq!(connection.enabled_models().count(), 2);
+    }
+
+    #[test]
+    fn disabling_every_model_leaves_no_default() {
+        let connection = connection_with(vec![model("a", "upstream/model", false)]);
+        assert!(connection.default_model().is_none());
+        assert_eq!(connection.enabled_models().count(), 0);
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_upstream_model_ids_case_insensitively() {
+        let connection = connection_with(vec![
+            model("a", "Vendor/Model", true),
+            model("b", "vendor/model", true),
+        ]);
+        let error = connection.validate().expect_err("duplicates must fail");
+        assert!(matches!(error, AppError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn validate_rejects_non_http_endpoints() {
+        let mut connection = connection_with(vec![model("a", "upstream/model", true)]);
+        connection.base_url = "file:///etc/passwd".to_string();
+        assert!(connection.validate().is_err());
+        connection.base_url = "not a url".to_string();
+        assert!(connection.validate().is_err());
+    }
+
+    #[test]
+    fn validate_requires_at_least_one_model() {
+        let connection = connection_with(Vec::new());
+        assert!(connection.validate().is_err());
+    }
+
+    #[test]
+    fn normalize_trims_urls_and_defaults_the_secret_reference() {
+        let mut connection = connection_with(vec![model("a", "upstream/model", true)]);
+        connection.base_url = "  https://example.invalid/v1/  ".to_string();
+        connection.normalize();
+        assert_eq!(connection.base_url, "https://example.invalid/v1");
+        assert_eq!(connection.secret_ref, "connection:one");
+    }
+
+    #[test]
+    fn normalize_drops_zeroed_capability_limits() {
+        let mut spec = model("a", "upstream/model", true);
+        spec.capabilities.context_window = Some(0);
+        spec.capabilities.max_output_tokens = Some(0);
+        spec.normalize();
+        assert_eq!(spec.capabilities.context_window, None);
+        assert_eq!(spec.capabilities.max_output_tokens, None);
     }
 }

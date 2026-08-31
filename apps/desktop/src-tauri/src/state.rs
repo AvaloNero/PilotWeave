@@ -182,7 +182,7 @@ impl StateStore {
         self.state.deployments.extend(records);
         self.state
             .deployments
-            .sort_by(|left, right| right.created_at.cmp(&left.created_at));
+            .sort_by_key(|record| std::cmp::Reverse(record.created_at));
         self.state.deployments.truncate(MAX_DEPLOYMENT_RECORDS);
         self.persist()
     }

@@ -4,7 +4,6 @@ on:
   push:
     branches:
       - main
-      - feature/initial-mvp
   pull_request:
 
 jobs:
@@ -18,6 +17,8 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Install Linux build dependencies
         if: runner.os == 'Linux'
@@ -41,7 +42,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.88.0
-          components: rustfmt
+          components: rustfmt, clippy
 
       - name: Install Node.js
         uses: actions/setup-node@v4
@@ -54,5 +55,13 @@ jobs:
       - name: Check Rust formatting
         run: cargo fmt --all -- --check
 
-      - name: Run Rust tests
+      - name: Run Rust tests (unit + model-switching integration)
         run: cargo test --workspace
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Check patch whitespace
+        if: github.event_name == 'pull_request'
+        shell: bash
+        run: git diff --check "origin/${{ github.base_ref }}...HEAD"

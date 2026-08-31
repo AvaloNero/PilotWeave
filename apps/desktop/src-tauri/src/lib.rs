@@ -1,7 +1,7 @@
-mod adapters;
+pub mod adapters;
 mod commands;
-mod domain;
-mod error;
+pub mod domain;
+pub mod error;
 mod secrets;
 mod state;
 

@@ -62,6 +62,18 @@ npm run dev
 
 For a frontend-only review, open `apps/desktop/web/index.html` directly. Browser fallback data is disposable and must never be presented as native state.
 
+## Tests
+
+`npm run check` runs the full local gate: web syntax check, `cargo fmt --check`, `cargo test --workspace`, and `cargo clippy -- -D warnings`. CI runs the same checks on Ubuntu, Windows, and macOS for every push to `main` and every pull request.
+
+Model-switching coverage lives in the adapter test modules and in `apps/desktop/src-tauri/tests/model_switching.rs`:
+
+- **VS Code Copilot** — enabled models are projected into `chatLanguageModels.json` in a temporary directory; switching models replaces only the PilotWeave-owned group, foreign groups survive, and the rollback backup keeps the original file.
+- **Copilot CLI** — the `COPILOT_PROVIDER_*` environment projection is verified per provider kind and protocol; switching the default model rewrites every model variable, and a failing store write restores the previous snapshot (tested against an in-memory environment store, never the real registry or shell files).
+- **GitHub Copilot app** — deployment is intentionally read-only; tests pin the manual-configuration boundary and the runbook preview.
+
+Tests use temporary directories and fakes only; they never modify real VS Code profiles, registry keys, environment variables, or shell files.
+
 ## Architecture
 
 ```text
