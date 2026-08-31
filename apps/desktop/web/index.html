@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark" />
+    <title>PilotWeave</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark" aria-hidden="true">
+            <span></span><span></span><span></span>
+          </div>
+          <div>
+            <strong>PilotWeave</strong>
+            <small>Copilot control plane</small>
+          </div>
+        </div>
+
+        <nav id="primary-nav" aria-label="Primary navigation">
+          <button class="nav-item active" data-route="overview">
+            <span class="nav-icon">⌂</span><span>Overview</span>
+          </button>
+          <button class="nav-item" data-route="connections">
+            <span class="nav-icon">◇</span><span>Connections</span>
+          </button>
+          <button class="nav-item" data-route="clients">
+            <span class="nav-icon">▦</span><span>Clients</span>
+          </button>
+          <button class="nav-item" data-route="resources">
+            <span class="nav-icon">✦</span><span>Resources</span>
+          </button>
+          <button class="nav-item" data-route="activity">
+            <span class="nav-icon">↗</span><span>Activity</span>
+          </button>
+          <button class="nav-item" data-route="settings">
+            <span class="nav-icon">⚙</span><span>Settings</span>
+          </button>
+        </nav>
+
+        <div class="sidebar-footer">
+          <div class="runtime-dot"></div>
+          <div>
+            <strong id="runtime-label">Loading</strong>
+            <small id="runtime-detail">Checking backend</small>
+          </div>
+        </div>
+      </aside>
+
+      <main class="main-panel">
+        <header class="topbar">
+          <div>
+            <p class="eyebrow">LOCAL CONTROL PLANE</p>
+            <h1 id="page-title">Overview</h1>
+            <p id="page-subtitle">One model setup across every Copilot surface.</p>
+          </div>
+          <div class="topbar-actions">
+            <button id="refresh-button" class="button ghost">Refresh</button>
+            <button id="add-connection-button" class="button primary">Add connection</button>
+          </div>
+        </header>
+        <section id="content" class="content" aria-live="polite"></section>
+      </main>
+    </div>
+
+    <div id="modal-root"></div>
+    <div id="toast-root" aria-live="assertive"></div>
+    <script src="app.js"></script>
+  </body>
+</html>

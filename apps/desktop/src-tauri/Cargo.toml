@@ -1,0 +1,38 @@
+[package]
+name = "pilotweave"
+version = "0.1.0"
+description = "Local control plane for GitHub Copilot clients"
+authors = ["AvaloNero"]
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "pilotweave_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+doctest = false
+
+[build-dependencies]
+tauri-build = { version = "2.4.0", features = [] }
+
+[dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "5.0"
+json5 = "0.4"
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
+log = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["preserve_order"] }
+tauri = { version = "2.8.2", features = [] }
+tauri-plugin-log = "2"
+tauri-plugin-opener = "2"
+thiserror = "2.0"
+url = "2.5"
+uuid = { version = "1.11", features = ["v4", "serde"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+winreg = "0.52"
+windows-sys = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging"] }
+
+[dev-dependencies]
+tempfile = "3"
