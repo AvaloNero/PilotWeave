@@ -320,6 +320,35 @@ pub struct ApplyResult {
     pub records: Vec<DeploymentRecord>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum UsageDbState {
+    Available,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageDbStatus {
+    pub state: UsageDbState,
+    pub detail: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_version: Option<u32>,
+}
+
+impl UsageDbStatus {
+    pub fn unavailable(detail: impl Into<String>) -> Self {
+        Self {
+            state: UsageDbState::Unavailable,
+            detail: detail.into(),
+            path: None,
+            schema_version: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DashboardSnapshot {
@@ -328,6 +357,9 @@ pub struct DashboardSnapshot {
     pub connections: Vec<Connection>,
     pub clients: Vec<ClientTarget>,
     pub deployments: Vec<DeploymentRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_recovery: Option<String>,
+    pub usage_db: UsageDbStatus,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

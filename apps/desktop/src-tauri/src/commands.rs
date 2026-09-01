@@ -2,7 +2,7 @@ use crate::adapters;
 use crate::deployment::{self, PlanStore, StoredPlan};
 use crate::domain::{
     ApplyResult, Connection, ConnectionInput, DashboardSnapshot, DeploymentOperation,
-    DeploymentPlan, DeploymentRecord, DeploymentStatus, STATE_VERSION,
+    DeploymentPlan, DeploymentRecord, DeploymentStatus, UsageDbStatus, STATE_VERSION,
 };
 use crate::error::{AppError, AppResult};
 use crate::installer::{
@@ -10,6 +10,7 @@ use crate::installer::{
 };
 use crate::redact;
 use crate::state::StateStore;
+use crate::usage_db::UsageDb;
 use chrono::Utc;
 use std::sync::{Mutex, MutexGuard};
 use tauri::State;
@@ -19,14 +20,22 @@ pub struct ManagedState {
     store: Mutex<StateStore>,
     plans: Mutex<PlanStore>,
     install_plans: Mutex<InstallPlanStore>,
+    usage_db: Mutex<Option<UsageDb>>,
+    usage_db_error: Option<String>,
 }
 
 impl ManagedState {
-    pub fn new(store: StateStore) -> Self {
+    pub fn new(
+        store: StateStore,
+        usage_db: Option<UsageDb>,
+        usage_db_error: Option<String>,
+    ) -> Self {
         Self {
             store: Mutex::new(store),
             plans: Mutex::new(PlanStore::default()),
             install_plans: Mutex::new(InstallPlanStore::default()),
+            usage_db: Mutex::new(usage_db),
+            usage_db_error,
         }
     }
 
@@ -41,6 +50,18 @@ impl ManagedState {
     fn install_plans(&self) -> AppResult<MutexGuard<'_, InstallPlanStore>> {
         self.install_plans.lock().map_err(|_| AppError::Lock)
     }
+
+    fn usage_db_status(&self) -> AppResult<UsageDbStatus> {
+        let guard = self.usage_db.lock().map_err(|_| AppError::Lock)?;
+        Ok(match guard.as_ref() {
+            Some(db) => db.status(),
+            None => UsageDbStatus::unavailable(
+                self.usage_db_error
+                    .clone()
+                    .unwrap_or_else(|| "Usage database is not available".to_string()),
+            ),
+        })
+    }
 }
 
 fn command_error(error: AppError) -> String {
@@ -49,12 +70,13 @@ fn command_error(error: AppError) -> String {
 
 #[tauri::command]
 pub fn get_dashboard(state: State<'_, ManagedState>) -> Result<DashboardSnapshot, String> {
-    let (state_path, connections, deployments) = {
+    let (state_path, connections, deployments, state_recovery) = {
         let store = state.store().map_err(command_error)?;
         (
             store.path().to_string_lossy().to_string(),
             store.connections().to_vec(),
             store.deployments().to_vec(),
+            store.recovery().map(str::to_string),
         )
     };
     Ok(DashboardSnapshot {
@@ -63,6 +85,8 @@ pub fn get_dashboard(state: State<'_, ManagedState>) -> Result<DashboardSnapshot
         connections,
         clients: adapters::discover_all(),
         deployments,
+        state_recovery: state_recovery.map(|reason| redact::redact_text(&reason)),
+        usage_db: state.usage_db_status().map_err(command_error)?,
     })
 }
 

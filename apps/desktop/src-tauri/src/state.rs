@@ -15,6 +15,10 @@ const MAX_DEPLOYMENT_RECORDS: usize = 200;
 pub struct StateStore {
     path: PathBuf,
     state: PersistentState,
+    /// When set, the primary state file could not be loaded and the store is
+    /// in explicit read-only recovery: reads return empty defaults and writes
+    /// are rejected so the unreadable file is never overwritten.
+    recovery: Option<String>,
 }
 
 impl StateStore {
@@ -22,11 +26,26 @@ impl StateStore {
         let config_dir = dirs::config_dir()
             .ok_or_else(|| AppError::Config("Cannot resolve the user config directory".into()))?
             .join("PilotWeave");
-        Self::open_at(config_dir.join("state.json"))
+        Ok(Self::open_at(config_dir.join("state.json")))
     }
 
-    pub fn open_at(path: PathBuf) -> AppResult<Self> {
-        let mut state = load_state(&path)?;
+    pub fn open_at(path: PathBuf) -> Self {
+        match Self::try_load(&path) {
+            Ok((state, recovery)) => Self {
+                path,
+                state,
+                recovery,
+            },
+            Err(error) => Self {
+                path,
+                state: PersistentState::default(),
+                recovery: Some(error.to_string()),
+            },
+        }
+    }
+
+    fn try_load(path: &Path) -> AppResult<(PersistentState, Option<String>)> {
+        let mut state = load_state(path)?;
         if state.version > STATE_VERSION {
             return Err(AppError::Config(format!(
                 "State version {} is newer than this PilotWeave build supports ({STATE_VERSION})",
@@ -38,7 +57,22 @@ impl StateStore {
             connection.normalize();
             connection.has_secret = secrets::exists(&connection.secret_ref);
         }
-        Ok(Self { path, state })
+        Ok((state, None))
+    }
+
+    /// Reason the store is in read-only recovery, if the primary file could
+    /// not be loaded.
+    pub fn recovery(&self) -> Option<&str> {
+        self.recovery.as_deref()
+    }
+
+    fn ensure_writable(&self) -> AppResult<()> {
+        if let Some(reason) = &self.recovery {
+            return Err(AppError::Unsupported(format!(
+                "PilotWeave state is in read-only recovery ({reason}); fix or remove the state file and restart"
+            )));
+        }
+        Ok(())
     }
 
     pub fn path(&self) -> &Path {
@@ -67,6 +101,7 @@ impl StateStore {
     }
 
     pub fn upsert_connection(&mut self, input: ConnectionInput) -> AppResult<Connection> {
+        self.ensure_writable()?;
         let now = Utc::now();
         let requested_id = input
             .id
@@ -157,6 +192,7 @@ impl StateStore {
     }
 
     pub fn delete_connection(&mut self, id: &str) -> AppResult<()> {
+        self.ensure_writable()?;
         let index = self
             .state
             .connections
@@ -179,6 +215,7 @@ impl StateStore {
     }
 
     pub fn record_deployments(&mut self, records: Vec<DeploymentRecord>) -> AppResult<()> {
+        self.ensure_writable()?;
         self.state.deployments.extend(records);
         self.state
             .deployments
@@ -256,13 +293,70 @@ fn write_state(path: &Path, state: &PersistentState) -> AppResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::ModelSpec;
 
     #[test]
     fn opens_missing_state_as_empty() {
         let directory = tempfile::tempdir().expect("temp directory");
-        let store =
-            StateStore::open_at(directory.path().join("state.json")).expect("open empty store");
+        let store = StateStore::open_at(directory.path().join("state.json"));
         assert!(store.connections().is_empty());
         assert_eq!(store.deployments().len(), 0);
+        assert_eq!(store.recovery(), None);
+    }
+
+    #[test]
+    fn corrupt_state_enters_read_only_recovery_without_overwriting() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let path = directory.path().join("state.json");
+        fs::write(&path, b"{ not valid json").expect("write corrupt state");
+
+        let mut store = StateStore::open_at(path.clone());
+        assert!(store.recovery().is_some());
+        assert!(store.connections().is_empty());
+
+        let input = ConnectionInput {
+            id: None,
+            name: "Blocked".to_string(),
+            base_url: "https://example.invalid/v1".to_string(),
+            provider_kind: crate::domain::ProviderKind::Openai,
+            protocol: crate::domain::ApiProtocol::ChatCompletions,
+            headers: Default::default(),
+            models: vec![ModelSpec {
+                id: "m".to_string(),
+                model_id: "m".to_string(),
+                name: "m".to_string(),
+                enabled: true,
+                capabilities: Default::default(),
+            }],
+            api_key: None,
+            clear_secret: false,
+        };
+        let error = store
+            .upsert_connection(input)
+            .expect_err("writes must be rejected in recovery");
+        assert!(matches!(error, AppError::Unsupported(_)));
+        assert!(store.delete_connection("anything").is_err());
+        assert!(store.record_deployments(Vec::new()).is_err());
+
+        // The unreadable primary file is never overwritten by recovery mode.
+        let bytes = fs::read(&path).expect("state file");
+        assert_eq!(bytes, b"{ not valid json");
+    }
+
+    #[test]
+    fn newer_state_version_enters_read_only_recovery() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let path = directory.path().join("state.json");
+        fs::write(
+            &path,
+            format!(
+                r#"{{"version":{},"connections":[],"deployments":[]}}"#,
+                STATE_VERSION + 1
+            ),
+        )
+        .expect("write newer state");
+
+        let store = StateStore::open_at(path);
+        assert!(store.recovery().expect("recovery reason").contains("newer"));
     }
 }

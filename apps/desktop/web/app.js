@@ -76,6 +76,13 @@
     return {
       version: 1,
       statePath: "Browser preview — no filesystem access",
+      stateRecovery: null,
+      usageDb: {
+        state: "unavailable",
+        detail: "Browser preview has no native usage database",
+        path: null,
+        schemaVersion: null,
+      },
       connections: [
         {
           id: "demo-openrouter",
@@ -397,6 +404,7 @@
       0,
     );
     return `
+      ${storageWarningBanner()}
       <div class="hero">
         <div class="hero-copy">
           <p class="eyebrow">DESIRED STATE, NOT ANOTHER SWITCHER</p>
@@ -519,9 +527,39 @@
         ${settingRow("Runtime", isDesktop ? "Tauri native backend" : "Browser preview", isDesktop ? "Client configuration writes can be applied after preview." : "All deployment applies are simulated and remain inside this tab.")}
         ${settingRow("State file", snapshot.statePath, "Non-secret connections, deployments, and schema version.")}
         ${settingRow("State schema", `v${snapshot.version}`, "Migrations are rejected when state is newer than the running build.")}
+        ${settingRow("State recovery", snapshot.stateRecovery ? "Read-only recovery" : "Healthy", snapshot.stateRecovery ?? "The primary state file loaded successfully; writes are enabled.")}
+        ${settingRow("Usage database", usageDbLabel(), snapshot.usageDb?.detail ?? "Usage storage status was not reported.")}
         ${settingRow("Credential storage", isDesktop ? "Operating-system credential store" : "Simulated has-secret flag", "Secrets are never returned by get_dashboard.")}
         ${settingRow("GitHub Copilot app", "Read-only provider adapter", "Detection is implemented; private provider-store mutation is intentionally disabled.")}
       </div>`;
+  }
+
+  function usageDbLabel() {
+    const db = snapshot.usageDb;
+    if (!db) return "Unknown";
+    return db.state === "available"
+      ? `Ready (schema v${db.schemaVersion})`
+      : "Unavailable";
+  }
+
+  function storageWarningBanner() {
+    const warnings = [];
+    if (snapshot.stateRecovery) {
+      warnings.push(
+        `Connection storage is in read-only recovery: ${snapshot.stateRecovery}`,
+      );
+    }
+    if (snapshot.usageDb && snapshot.usageDb.state !== "available") {
+      warnings.push(`Usage database is unavailable: ${snapshot.usageDb.detail}`);
+    }
+    if (!warnings.length) return "";
+    return `<div class="security-note">
+      <div class="note-icon">⚠</div>
+      <div>
+        <strong>Storage needs attention</strong>
+        ${warnings.map((warning) => `<p>${escapeHtml(warning)}</p>`).join("")}
+      </div>
+    </div>`;
   }
 
   function statCard(label, value) {
