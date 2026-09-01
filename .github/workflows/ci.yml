@@ -49,17 +49,24 @@ jobs:
         with:
           node-version: 22
 
+      - name: Install JavaScript dependencies
+        run: npm ci
+
       - name: Check browser application syntax
-        run: node --check apps/desktop/web/app.js
+        run: npm run check:web
 
       - name: Check Rust formatting
         run: cargo fmt --all -- --check
 
-      - name: Run Rust tests (unit + model-switching integration)
+      - name: Run Rust tests
         run: cargo test --workspace
 
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Build native Tauri application
+        if: runner.os == 'Windows'
+        run: npm run build -- --no-bundle
 
       - name: Check patch whitespace
         if: github.event_name == 'pull_request'
