@@ -26,7 +26,10 @@ pub fn redact_with_secret(input: &str, secret: Option<&str>) -> String {
 
 fn redact_line(line: &str) -> String {
     let lower = line.to_ascii_lowercase();
-    if !SENSITIVE_MARKERS.iter().any(|marker| lower.contains(marker)) {
+    if !SENSITIVE_MARKERS
+        .iter()
+        .any(|marker| lower.contains(marker))
+    {
         return line.to_string();
     }
     if let Some(index) = line.find(':') {
