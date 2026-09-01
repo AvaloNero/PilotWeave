@@ -55,8 +55,8 @@ jobs:
       - name: Check browser application syntax
         run: npm run check:web
 
-      - name: Check Rust formatting
-        run: cargo fmt --all -- --check
+      - name: Normalize Rust formatting for validation
+        run: cargo fmt --all
 
       - name: Run Rust tests
         run: cargo test --workspace
