@@ -124,7 +124,10 @@ pub fn apply_deployment_plan(
     execute_stored_plan(&state, stored).map_err(command_error)
 }
 
-fn execute_stored_plan(state: &State<'_, ManagedState>, stored: StoredPlan) -> AppResult<ApplyResult> {
+fn execute_stored_plan(
+    state: &State<'_, ManagedState>,
+    stored: StoredPlan,
+) -> AppResult<ApplyResult> {
     let (connection, secret, state_path) = {
         let store = state.store()?;
         deployment::ensure_no_pending_journal(store.path())?;
@@ -191,7 +194,8 @@ fn execute_stored_plan(state: &State<'_, ManagedState>, stored: StoredPlan) -> A
                     Err(rollback_error) => {
                         rollback_failed = true;
                         if let Some(last) = records.last_mut() {
-                            last.detail.push_str("; rollback requires recovery review: ");
+                            last.detail
+                                .push_str("; rollback requires recovery review: ");
                             last.detail.push_str(&redact::redact_with_secret(
                                 &rollback_error.to_string(),
                                 secret.as_deref(),
