@@ -1,7 +1,9 @@
 pub mod adapters;
 mod commands;
+mod deployment;
 pub mod domain;
 pub mod error;
+mod redact;
 mod secrets;
 mod state;
 
@@ -21,6 +23,7 @@ pub fn run() {
             commands::delete_connection,
             commands::preview_deployment,
             commands::apply_deployment,
+            commands::apply_deployment_plan,
         ])
         .run(tauri::generate_context!())
         .expect("error while running PilotWeave");
