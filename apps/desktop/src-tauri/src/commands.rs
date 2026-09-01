@@ -1,40 +1,59 @@
 use crate::adapters;
+use crate::deployment::{self, PlanStore, StoredPlan};
 use crate::domain::{
-    ApplyResult, Connection, ConnectionInput, DashboardSnapshot, DeploymentPlan, DeploymentRecord,
-    DeploymentStatus, STATE_VERSION,
+    ApplyResult, Connection, ConnectionInput, DashboardSnapshot, DeploymentOperation,
+    DeploymentPlan, DeploymentRecord, DeploymentStatus, STATE_VERSION,
 };
 use crate::error::{AppError, AppResult};
+use crate::redact;
 use crate::state::StateStore;
 use chrono::Utc;
 use std::sync::{Mutex, MutexGuard};
 use tauri::State;
 use uuid::Uuid;
 
-pub struct ManagedState(pub Mutex<StateStore>);
+pub struct ManagedState {
+    store: Mutex<StateStore>,
+    plans: Mutex<PlanStore>,
+}
 
 impl ManagedState {
     pub fn new(store: StateStore) -> Self {
-        Self(Mutex::new(store))
+        Self {
+            store: Mutex::new(store),
+            plans: Mutex::new(PlanStore::default()),
+        }
     }
 
-    fn lock(&self) -> AppResult<MutexGuard<'_, StateStore>> {
-        self.0.lock().map_err(|_| AppError::Lock)
+    fn store(&self) -> AppResult<MutexGuard<'_, StateStore>> {
+        self.store.lock().map_err(|_| AppError::Lock)
+    }
+
+    fn plans(&self) -> AppResult<MutexGuard<'_, PlanStore>> {
+        self.plans.lock().map_err(|_| AppError::Lock)
     }
 }
 
 fn command_error(error: AppError) -> String {
-    error.to_string()
+    redact::redact_text(&error.to_string())
 }
 
 #[tauri::command]
 pub fn get_dashboard(state: State<'_, ManagedState>) -> Result<DashboardSnapshot, String> {
-    let store = state.lock().map_err(command_error)?;
+    let (state_path, connections, deployments) = {
+        let store = state.store().map_err(command_error)?;
+        (
+            store.path().to_string_lossy().to_string(),
+            store.connections().to_vec(),
+            store.deployments().to_vec(),
+        )
+    };
     Ok(DashboardSnapshot {
         version: STATE_VERSION,
-        state_path: store.path().to_string_lossy().to_string(),
-        connections: store.connections().to_vec(),
+        state_path,
+        connections,
         clients: adapters::discover_all(),
-        deployments: store.deployments().to_vec(),
+        deployments,
     })
 }
 
@@ -43,10 +62,9 @@ pub fn upsert_connection(
     state: State<'_, ManagedState>,
     input: ConnectionInput,
 ) -> Result<Connection, String> {
-    state
-        .lock()
-        .and_then(|mut store| store.upsert_connection(input))
-        .map_err(command_error)
+    let mut store = state.store().map_err(command_error)?;
+    deployment::ensure_no_pending_journal(store.path()).map_err(command_error)?;
+    store.upsert_connection(input).map_err(command_error)
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -54,9 +72,10 @@ pub fn delete_connection(
     state: State<'_, ManagedState>,
     connection_id: String,
 ) -> Result<bool, String> {
-    state
-        .lock()
-        .and_then(|mut store| store.delete_connection(&connection_id))
+    let mut store = state.store().map_err(command_error)?;
+    deployment::ensure_no_pending_journal(store.path()).map_err(command_error)?;
+    store
+        .delete_connection(&connection_id)
         .map(|()| true)
         .map_err(command_error)
 }
@@ -67,11 +86,17 @@ pub fn preview_deployment(
     connection_id: String,
     target_ids: Vec<String>,
 ) -> Result<DeploymentPlan, String> {
-    let connection = state
-        .lock()
-        .and_then(|store| store.connection(&connection_id))
-        .map_err(command_error)?;
-    adapters::preview(&connection, &target_ids).map_err(command_error)
+    let connection = {
+        let store = state.store().map_err(command_error)?;
+        deployment::ensure_no_pending_journal(store.path()).map_err(command_error)?;
+        store.connection(&connection_id).map_err(command_error)?
+    };
+    let plan = adapters::preview(&connection, &target_ids).map_err(command_error)?;
+    let targets = adapters::discover_all();
+    state
+        .plans()
+        .and_then(|mut plans| plans.insert(&connection, plan, &targets))
+        .map_err(command_error)
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -80,34 +105,58 @@ pub fn apply_deployment(
     connection_id: String,
     target_ids: Vec<String>,
 ) -> Result<ApplyResult, String> {
-    let (connection, secret) = {
-        let store = state.lock().map_err(command_error)?;
-        let connection = store.connection(&connection_id).map_err(command_error)?;
-        let secret = store.secret_for(&connection).map_err(command_error)?;
-        (connection, secret)
+    let stored = state
+        .plans()
+        .and_then(|mut plans| plans.consume_matching(&connection_id, &target_ids))
+        .map_err(command_error)?;
+    execute_stored_plan(&state, stored).map_err(command_error)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub fn apply_deployment_plan(
+    state: State<'_, ManagedState>,
+    plan_id: String,
+) -> Result<ApplyResult, String> {
+    let stored = state
+        .plans()
+        .and_then(|mut plans| plans.consume(&plan_id))
+        .map_err(command_error)?;
+    execute_stored_plan(&state, stored).map_err(command_error)
+}
+
+fn execute_stored_plan(state: &State<'_, ManagedState>, stored: StoredPlan) -> AppResult<ApplyResult> {
+    let (connection, secret, state_path) = {
+        let store = state.store()?;
+        deployment::ensure_no_pending_journal(store.path())?;
+        let connection = store.connection(&stored.plan.connection_id)?;
+        let secret = store.secret_for(&connection)?;
+        (connection, secret, store.path().to_path_buf())
     };
 
-    let plan = adapters::preview(&connection, &target_ids).map_err(command_error)?;
     let available = adapters::discover_all();
-    let mut records = Vec::new();
+    deployment::validate_plan(&stored, &connection, &available)?;
+    let mut snapshots = deployment::capture_file_snapshots(&stored.plan, &available)?;
+    let mut journal = deployment::begin_journal(&state_path, &stored, &available, &snapshots)?;
 
-    for operation in &plan.operations {
-        let Some(target) = available
+    let mut operations = stored.plan.operations.iter().collect::<Vec<_>>();
+    operations.sort_by_key(|operation| deployment::operation_rank(operation.target_kind));
+    let mut records = Vec::new();
+    let mut rollback_failed = false;
+
+    for operation in operations {
+        let target = available
             .iter()
             .find(|target| target.id == operation.target_id)
-        else {
-            records.push(record(
-                &plan,
-                operation,
-                DeploymentStatus::Failed,
-                "Target disappeared between preview and apply".to_string(),
-            ));
-            continue;
-        };
+            .ok_or_else(|| {
+                AppError::InvalidInput(format!(
+                    "Target disappeared after preflight: {}",
+                    operation.target_id
+                ))
+            })?;
 
         if !operation.supported {
             records.push(record(
-                &plan,
+                &stored.plan,
                 operation,
                 DeploymentStatus::Skipped,
                 operation.description.clone(),
@@ -116,30 +165,76 @@ pub fn apply_deployment(
         }
 
         match adapters::apply_to_target(&connection, secret.as_deref(), target) {
-            Ok(detail) => records.push(record(&plan, operation, DeploymentStatus::Applied, detail)),
-            Err(error) => records.push(record(
-                &plan,
-                operation,
-                DeploymentStatus::Failed,
-                error.to_string(),
-            )),
+            Ok(detail) => {
+                let after = deployment::fingerprint_target(target)?;
+                if operation.target_kind == crate::domain::ClientKind::VsCodeCopilot {
+                    let _ = deployment::mark_snapshot_applied(&mut snapshots, &target.id)?;
+                }
+                journal.mark_applied(&target.id, after)?;
+                records.push(record(
+                    &stored.plan,
+                    operation,
+                    DeploymentStatus::Applied,
+                    detail,
+                ));
+            }
+            Err(error) => {
+                let detail = redact::redact_with_secret(&error.to_string(), secret.as_deref());
+                records.push(record(
+                    &stored.plan,
+                    operation,
+                    DeploymentStatus::Failed,
+                    detail,
+                ));
+                match deployment::rollback_applied_files(&snapshots) {
+                    Ok(()) => mark_rolled_back(&mut records),
+                    Err(rollback_error) => {
+                        rollback_failed = true;
+                        if let Some(last) = records.last_mut() {
+                            last.detail.push_str("; rollback requires recovery review: ");
+                            last.detail.push_str(&redact::redact_with_secret(
+                                &rollback_error.to_string(),
+                                secret.as_deref(),
+                            ));
+                        }
+                    }
+                }
+                break;
+            }
         }
     }
 
-    state
-        .lock()
-        .and_then(|mut store| store.record_deployments(records.clone()))
-        .map_err(command_error)?;
+    {
+        let mut store = state.store()?;
+        store.record_deployments(records.clone())?;
+    }
+
+    if !rollback_failed {
+        journal.clear()?;
+    }
 
     Ok(ApplyResult {
-        plan_id: plan.id,
+        plan_id: stored.plan.id,
         records,
     })
 }
 
+fn mark_rolled_back(records: &mut [DeploymentRecord]) {
+    for record in records {
+        if record.status == DeploymentStatus::Applied
+            && record.target_kind == crate::domain::ClientKind::VsCodeCopilot
+        {
+            record.status = DeploymentStatus::Failed;
+            record
+                .detail
+                .push_str("; change was restored after a later target failed");
+        }
+    }
+}
+
 fn record(
     plan: &DeploymentPlan,
-    operation: &crate::domain::DeploymentOperation,
+    operation: &DeploymentOperation,
     status: DeploymentStatus,
     detail: String,
 ) -> DeploymentRecord {
@@ -150,7 +245,7 @@ fn record(
         target_id: operation.target_id.clone(),
         target_kind: operation.target_kind,
         status,
-        detail,
+        detail: redact::redact_text(&detail),
         created_at: Utc::now(),
     }
 }
