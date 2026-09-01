@@ -5,6 +5,9 @@ use crate::domain::{
     DeploymentPlan, DeploymentRecord, DeploymentStatus, STATE_VERSION,
 };
 use crate::error::{AppError, AppResult};
+use crate::installer::{
+    self, InstallApplyResult, InstallComponentObservation, InstallPlan, InstallPlanStore,
+};
 use crate::redact;
 use crate::state::StateStore;
 use chrono::Utc;
@@ -15,6 +18,7 @@ use uuid::Uuid;
 pub struct ManagedState {
     store: Mutex<StateStore>,
     plans: Mutex<PlanStore>,
+    install_plans: Mutex<InstallPlanStore>,
 }
 
 impl ManagedState {
@@ -22,6 +26,7 @@ impl ManagedState {
         Self {
             store: Mutex::new(store),
             plans: Mutex::new(PlanStore::default()),
+            install_plans: Mutex::new(InstallPlanStore::default()),
         }
     }
 
@@ -31,6 +36,10 @@ impl ManagedState {
 
     fn plans(&self) -> AppResult<MutexGuard<'_, PlanStore>> {
         self.plans.lock().map_err(|_| AppError::Lock)
+    }
+
+    fn install_plans(&self) -> AppResult<MutexGuard<'_, InstallPlanStore>> {
+        self.install_plans.lock().map_err(|_| AppError::Lock)
     }
 }
 
@@ -55,6 +64,33 @@ pub fn get_dashboard(state: State<'_, ManagedState>) -> Result<DashboardSnapshot
         clients: adapters::discover_all(),
         deployments,
     })
+}
+
+#[tauri::command]
+pub fn get_installation_status() -> Vec<InstallComponentObservation> {
+    installer::discover_components()
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub fn preview_install(
+    state: State<'_, ManagedState>,
+    component_ids: Vec<String>,
+) -> Result<InstallPlan, String> {
+    state
+        .install_plans()
+        .and_then(|mut plans| plans.preview(component_ids))
+        .map_err(command_error)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub fn apply_install_plan(
+    state: State<'_, ManagedState>,
+    plan_id: String,
+) -> Result<InstallApplyResult, String> {
+    state
+        .install_plans()
+        .and_then(|mut plans| installer::apply_plan(&mut plans, &plan_id))
+        .map_err(command_error)
 }
 
 #[tauri::command(rename_all = "camelCase")]
