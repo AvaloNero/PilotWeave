@@ -9,6 +9,7 @@ use std::process::{Command, Output};
 use uuid::Uuid;
 
 const INSTALL_PLAN_TTL_SECONDS: i64 = 15 * 60;
+#[cfg(windows)]
 const COPILOT_EXTENSION_ID: &str = "GitHub.copilot";
 
 pub const COMPONENT_VSCODE: &str = "vscode";
@@ -218,10 +219,7 @@ fn discover_windows_components() -> Vec<InstallComponentObservation> {
     let code = find_code_executable();
     let copilot = find_on_path("copilot.exe").or_else(|| find_on_path("copilot.cmd"));
     let app = github_copilot_app_path();
-    let extension_ready = code
-        .as_deref()
-        .map(extension_installed)
-        .unwrap_or(false);
+    let extension_ready = code.as_deref().map(extension_installed).unwrap_or(false);
 
     vec![
         observation_from_path(COMPONENT_VSCODE, "Visual Studio Code", code),
@@ -344,6 +342,7 @@ fn observation_fingerprint(value: &InstallComponentObservation) -> String {
     )
 }
 
+#[cfg(not(windows))]
 fn unsupported(id: &str, name: &str) -> InstallComponentObservation {
     InstallComponentObservation {
         id: id.to_string(),
@@ -451,8 +450,9 @@ fn apply_windows_plan(
                     results.push(InstallOperationResult {
                         component_id: operation.component_id.clone(),
                         status: InstallResultStatus::SkippedDependencyFailed,
-                        detail: "VS Code is not available, so the Copilot extension was not installed"
-                            .to_string(),
+                        detail:
+                            "VS Code is not available, so the Copilot extension was not installed"
+                                .to_string(),
                     });
                     continue;
                 };
@@ -462,8 +462,8 @@ fn apply_windows_plan(
         .map_err(|error| AppError::Config(format!("Failed to launch installer: {error}")))?;
 
         let after = discover_windows_components();
-        let verified = observation(&after, &operation.component_id)?.status
-            == InstallComponentStatus::Ready;
+        let verified =
+            observation(&after, &operation.component_id)?.status == InstallComponentStatus::Ready;
         let process_ok = output.status.success();
         results.push(InstallOperationResult {
             component_id: operation.component_id.clone(),

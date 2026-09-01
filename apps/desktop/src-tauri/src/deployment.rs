@@ -39,7 +39,9 @@ impl PlanStore {
             let target = targets
                 .iter()
                 .find(|target| target.id == *target_id)
-                .ok_or_else(|| AppError::InvalidInput(format!("Unknown client target: {target_id}")))?;
+                .ok_or_else(|| {
+                    AppError::InvalidInput(format!("Unknown client target: {target_id}"))
+                })?;
             fingerprints.insert(target_id.clone(), fingerprint_target(target)?);
         }
         self.plans.insert(
@@ -125,7 +127,9 @@ pub fn validate_plan(
         let before = stored
             .target_fingerprints
             .get(&operation.target_id)
-            .ok_or_else(|| AppError::Config("Deployment plan is missing a target fingerprint".into()))?;
+            .ok_or_else(|| {
+                AppError::Config("Deployment plan is missing a target fingerprint".into())
+            })?;
         let current = fingerprint_target(target)?;
         if &current != before {
             return Err(AppError::InvalidInput(format!(
@@ -149,10 +153,9 @@ fn preflight_target(connection: &Connection, target: &ClientTarget) -> AppResult
     }
     match target.kind {
         ClientKind::VsCodeCopilot => {
-            let path = target
-                .path
-                .as_deref()
-                .ok_or_else(|| AppError::Config("VS Code target has no configuration path".into()))?;
+            let path = target.path.as_deref().ok_or_else(|| {
+                AppError::Config("VS Code target has no configuration path".into())
+            })?;
             ensure_regular_or_missing(Path::new(path))?;
         }
         ClientKind::CopilotCli => {
@@ -198,12 +201,10 @@ pub fn capture_file_snapshots(
             .iter()
             .find(|target| target.id == operation.target_id)
             .ok_or_else(|| AppError::Config("Prepared target disappeared".into()))?;
-        let path = PathBuf::from(
-            target
-                .path
-                .as_deref()
-                .ok_or_else(|| AppError::Config("VS Code target has no configuration path".into()))?,
-        );
+        let path =
+            PathBuf::from(target.path.as_deref().ok_or_else(|| {
+                AppError::Config("VS Code target has no configuration path".into())
+            })?);
         ensure_regular_or_missing(&path)?;
         let existed = path.exists();
         let bytes = if existed {
@@ -267,8 +268,7 @@ pub fn rollback_applied_files(snapshots: &[FileSnapshot]) -> AppResult<()> {
                 )));
             }
         } else if snapshot.path.exists() {
-            fs::remove_file(&snapshot.path)
-                .map_err(|error| AppError::io(&snapshot.path, error))?;
+            fs::remove_file(&snapshot.path).map_err(|error| AppError::io(&snapshot.path, error))?;
         }
     }
     Ok(())
@@ -496,7 +496,8 @@ fn atomic_write_private(path: &Path, bytes: &[u8]) -> AppResult<()> {
         }
         file.write_all(bytes)
             .map_err(|error| AppError::io(&temp, error))?;
-        file.sync_all().map_err(|error| AppError::io(&temp, error))?;
+        file.sync_all()
+            .map_err(|error| AppError::io(&temp, error))?;
         #[cfg(windows)]
         if path.exists() {
             fs::remove_file(path).map_err(|error| AppError::io(path, error))?;
@@ -513,9 +514,7 @@ fn atomic_write_private(path: &Path, bytes: &[u8]) -> AppResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{
-        ApiProtocol, ClientStatus, ModelCapabilities, ModelSpec, ProviderKind,
-    };
+    use crate::domain::{ApiProtocol, ClientStatus, ModelCapabilities, ModelSpec, ProviderKind};
     use std::collections::BTreeMap;
 
     fn connection() -> Connection {
@@ -616,8 +615,8 @@ mod tests {
         let connection = connection();
         let target = target(&path);
         let plan = plan(&connection, &target);
-        let mut snapshots = capture_file_snapshots(&plan, std::slice::from_ref(&target))
-            .expect("snapshot");
+        let mut snapshots =
+            capture_file_snapshots(&plan, std::slice::from_ref(&target)).expect("snapshot");
         fs::write(&path, b"pilotweave").expect("write");
         mark_snapshot_applied(&mut snapshots, &target.id).expect("mark");
         fs::write(&path, b"external").expect("external");
