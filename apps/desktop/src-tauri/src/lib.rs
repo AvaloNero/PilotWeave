@@ -3,6 +3,7 @@ mod commands;
 mod deployment;
 pub mod domain;
 pub mod error;
+mod installer;
 mod redact;
 mod secrets;
 mod state;
@@ -19,6 +20,9 @@ pub fn run() {
         .manage(ManagedState::new(store))
         .invoke_handler(tauri::generate_handler![
             commands::get_dashboard,
+            commands::get_installation_status,
+            commands::preview_install,
+            commands::apply_install_plan,
             commands::upsert_connection,
             commands::delete_connection,
             commands::preview_deployment,
