@@ -2,13 +2,14 @@ use crate::error::{AppError, AppResult};
 use std::ffi::OsStr;
 use std::fs;
 use std::hash::Hasher;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
 const READ_CHUNK_BYTES: usize = 8 * 1_024;
+const EXECUTABLE_SAMPLE_BYTES: usize = 64 * 1_024;
 const MAX_EXECUTABLE_BYTES: u64 = 512 * 1_024 * 1_024;
 
 /// Authentication and model-provider variables that must not leak into
@@ -94,15 +95,11 @@ pub fn fingerprint_regular_file(path: &Path) -> AppResult<String> {
     }
 
     let mut file = fs::File::open(&canonical).map_err(|error| AppError::io(&canonical, error))?;
-    let mut buffer = [0u8; READ_CHUNK_BYTES];
-    loop {
-        let read = file
-            .read(&mut buffer)
+    hash_sample(&mut file, &mut hasher, EXECUTABLE_SAMPLE_BYTES)?;
+    if metadata.len() > EXECUTABLE_SAMPLE_BYTES as u64 {
+        file.seek(SeekFrom::End(-(EXECUTABLE_SAMPLE_BYTES as i64)))
             .map_err(|error| AppError::io(&canonical, error))?;
-        if read == 0 {
-            break;
-        }
-        hasher.write(&buffer[..read]);
+        hash_sample(&mut file, &mut hasher, EXECUTABLE_SAMPLE_BYTES)?;
     }
     Ok(format!("{:016x}", hasher.finish()))
 }
@@ -153,17 +150,30 @@ pub fn run_capture_bounded(
             .map_err(|error| AppError::io(&executable, error))?
         {
             Some(status) => break status,
-            None if started.elapsed() >= timeout => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = stdout_reader.join();
-                let _ = stderr_reader.join();
-                return Err(AppError::Config(format!(
-                    "Process timed out after {} seconds: {}",
-                    timeout.as_secs(),
-                    executable.display()
-                )));
-            }
+            None if started.elapsed() >= timeout => match child.kill() {
+                Ok(()) => {
+                    let _ = child.wait();
+                    let _ = stdout_reader.join();
+                    let _ = stderr_reader.join();
+                    return Err(AppError::Config(format!(
+                        "Process timed out after {} seconds: {}",
+                        timeout.as_secs(),
+                        executable.display()
+                    )));
+                }
+                Err(kill_error) => match child
+                    .try_wait()
+                    .map_err(|error| AppError::io(&executable, error))?
+                {
+                    Some(status) => break status,
+                    None => {
+                        return Err(AppError::Config(format!(
+                            "Process timed out and could not be terminated: {} ({kill_error})",
+                            executable.display()
+                        )))
+                    }
+                },
+            },
             None => thread::sleep(Duration::from_millis(25)),
         }
     };
@@ -211,6 +221,26 @@ pub fn sanitize_child_environment(command: &mut Command) {
     command.env("NO_COLOR", "1");
 }
 
+fn hash_sample(
+    file: &mut fs::File,
+    hasher: &mut impl Hasher,
+    limit: usize,
+) -> AppResult<()> {
+    let mut remaining = limit;
+    let mut buffer = [0u8; READ_CHUNK_BYTES];
+    while remaining > 0 {
+        let read = file
+            .read(&mut buffer[..remaining.min(READ_CHUNK_BYTES)])
+            .map_err(|error| AppError::Config(format!("Failed to fingerprint file: {error}")))?;
+        if read == 0 {
+            break;
+        }
+        hasher.write(&buffer[..read]);
+        remaining -= read;
+    }
+    Ok(())
+}
+
 fn drain_capped(mut reader: impl Read, limit: usize) -> AppResult<(Vec<u8>, bool)> {
     let mut retained = Vec::with_capacity(limit.min(READ_CHUNK_BYTES));
     let mut buffer = [0u8; READ_CHUNK_BYTES];
@@ -255,5 +285,16 @@ mod tests {
     fn missing_regular_file_is_not_resolved() {
         let directory = tempfile::tempdir().expect("directory");
         assert_eq!(resolve_regular_file(directory.path().join("missing")), None);
+    }
+
+    #[test]
+    fn fingerprint_changes_when_file_samples_change() {
+        let directory = tempfile::tempdir().expect("directory");
+        let path = directory.path().join("executable");
+        fs::write(&path, b"first").expect("write");
+        let before = fingerprint_regular_file(&path).expect("fingerprint");
+        fs::write(&path, b"second").expect("write");
+        let after = fingerprint_regular_file(&path).expect("fingerprint");
+        assert_ne!(before, after);
     }
 }
