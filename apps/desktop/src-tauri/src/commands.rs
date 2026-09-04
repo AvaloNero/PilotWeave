@@ -9,6 +9,9 @@ use crate::domain::{
     DeploymentPlan, DeploymentRecord, DeploymentStatus, UsageDbStatus, STATE_VERSION,
 };
 use crate::error::{AppError, AppResult};
+use crate::github_auth::{
+    self, GithubAuthorizationStatus, GithubAuthorizationStore, GithubValidationOutcome,
+};
 use crate::installer::{
     self, InstallApplyResult, InstallComponentObservation, InstallPlan, InstallPlanStore,
 };
@@ -26,6 +29,7 @@ pub struct ManagedState {
     install_plans: Mutex<InstallPlanStore>,
     login_plans: Mutex<LoginPlanStore>,
     login_store: Mutex<LoginStore>,
+    github_authorization: Mutex<GithubAuthorizationStore>,
     usage_db: Mutex<Option<UsageDb>>,
     usage_db_error: Option<String>,
 }
@@ -34,6 +38,7 @@ impl ManagedState {
     pub fn new(
         store: StateStore,
         login_store: LoginStore,
+        github_authorization: GithubAuthorizationStore,
         usage_db: Option<UsageDb>,
         usage_db_error: Option<String>,
     ) -> Self {
@@ -43,6 +48,7 @@ impl ManagedState {
             install_plans: Mutex::new(InstallPlanStore::default()),
             login_plans: Mutex::new(LoginPlanStore::default()),
             login_store: Mutex::new(login_store),
+            github_authorization: Mutex::new(github_authorization),
             usage_db: Mutex::new(usage_db),
             usage_db_error,
         }
@@ -66,6 +72,12 @@ impl ManagedState {
 
     fn login_store(&self) -> AppResult<MutexGuard<'_, LoginStore>> {
         self.login_store.lock().map_err(|_| AppError::Lock)
+    }
+
+    fn github_authorization(&self) -> AppResult<MutexGuard<'_, GithubAuthorizationStore>> {
+        self.github_authorization
+            .lock()
+            .map_err(|_| AppError::Lock)
     }
 
     fn usage_db_status(&self) -> AppResult<UsageDbStatus> {
@@ -184,6 +196,101 @@ pub fn apply_login_plan(
         run: finished,
         account_status: account::discover_status(runs, recovery),
     })
+}
+
+#[tauri::command]
+pub fn get_github_authorization_status(
+    state: State<'_, ManagedState>,
+) -> Result<GithubAuthorizationStatus, String> {
+    Ok(state
+        .github_authorization()
+        .map_err(command_error)?
+        .status())
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn authorize_github(
+    state: State<'_, ManagedState>,
+    token: String,
+) -> Result<GithubAuthorizationStatus, String> {
+    let existing = state
+        .github_authorization()
+        .map_err(command_error)?
+        .status();
+    let (token, outcome) = validate_github_token(token).await?;
+    match outcome {
+        GithubValidationOutcome::Verified(validation) => state
+            .github_authorization()
+            .and_then(|mut store| store.save_verified(&token, validation))
+            .map_err(command_error),
+        GithubValidationOutcome::Rejected(status) => Ok(merge_rejected_attempt(status, existing)),
+    }
+}
+
+#[tauri::command]
+pub async fn refresh_github_authorization(
+    state: State<'_, ManagedState>,
+) -> Result<GithubAuthorizationStatus, String> {
+    let (token, existing) = {
+        let store = state.github_authorization().map_err(command_error)?;
+        let existing = store.status();
+        let Some(token) = store.secret_for_refresh().map_err(command_error)? else {
+            return Ok(existing);
+        };
+        (token, existing)
+    };
+    let (token, outcome) = validate_github_token(token).await?;
+    match outcome {
+        GithubValidationOutcome::Verified(validation) => state
+            .github_authorization()
+            .and_then(|mut store| store.save_verified(&token, validation))
+            .map_err(command_error),
+        GithubValidationOutcome::Rejected(status) => Ok(merge_rejected_attempt(status, existing)),
+    }
+}
+
+#[tauri::command]
+pub fn clear_github_authorization(
+    state: State<'_, ManagedState>,
+) -> Result<GithubAuthorizationStatus, String> {
+    state
+        .github_authorization()
+        .and_then(|mut store| store.clear())
+        .map_err(command_error)
+}
+
+async fn validate_github_token(
+    token: String,
+) -> Result<(String, GithubValidationOutcome), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let outcome = github_auth::validate_token_native(&token)?;
+        Ok::<_, AppError>((token, outcome))
+    })
+    .await
+    .map_err(|error| {
+        command_error(AppError::Config(format!(
+            "GitHub authorization task failed: {error}"
+        )))
+    })?
+    .map_err(command_error)
+}
+
+fn merge_rejected_attempt(
+    mut rejected: GithubAuthorizationStatus,
+    existing: GithubAuthorizationStatus,
+) -> GithubAuthorizationStatus {
+    if existing.has_secret {
+        rejected.identity = existing.identity;
+        rejected.has_secret = true;
+        rejected.scopes = existing.scopes;
+        rejected.billing_capability = existing.billing_capability;
+        rejected.billing_detail = existing.billing_detail;
+        rejected.validated_at = existing.validated_at;
+        rejected
+            .detail
+            .push_str(" The previously stored authorization was left unchanged.");
+    }
+    rejected
 }
 
 #[tauri::command(rename_all = "camelCase")]
