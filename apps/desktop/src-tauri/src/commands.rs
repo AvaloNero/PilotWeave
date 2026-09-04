@@ -75,9 +75,7 @@ impl ManagedState {
     }
 
     fn github_authorization(&self) -> AppResult<MutexGuard<'_, GithubAuthorizationStore>> {
-        self.github_authorization
-            .lock()
-            .map_err(|_| AppError::Lock)
+        self.github_authorization.lock().map_err(|_| AppError::Lock)
     }
 
     fn usage_db_status(&self) -> AppResult<UsageDbStatus> {
@@ -259,9 +257,7 @@ pub fn clear_github_authorization(
         .map_err(command_error)
 }
 
-async fn validate_github_token(
-    token: String,
-) -> Result<(String, GithubValidationOutcome), String> {
+async fn validate_github_token(token: String) -> Result<(String, GithubValidationOutcome), String> {
     tauri::async_runtime::spawn_blocking(move || {
         let outcome = github_auth::validate_token_native(&token)?;
         Ok::<_, AppError>((token, outcome))

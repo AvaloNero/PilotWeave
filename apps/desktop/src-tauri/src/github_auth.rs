@@ -3,6 +3,7 @@ use crate::redact;
 use crate::secrets;
 use chrono::{DateTime, Datelike, Utc};
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
 use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
@@ -170,7 +171,9 @@ impl GithubAuthorizationStore {
             };
         };
         Self::open_at_with_backend(
-            config_dir.join("PilotWeave").join("github-authorization.json"),
+            config_dir
+                .join("PilotWeave")
+                .join("github-authorization.json"),
             Box::new(NativeSecretBackend),
         )
     }
@@ -235,8 +238,7 @@ impl GithubAuthorizationStore {
                         .as_ref()
                         .map(|record| record.billing_detail.clone())
                         .unwrap_or_else(|| "Billing capability is unknown".to_string()),
-                    detail: "The operating-system credential store could not be read"
-                        .to_string(),
+                    detail: "The operating-system credential store could not be read".to_string(),
                     validated_at: self
                         .state
                         .authorization
@@ -548,8 +550,7 @@ fn probe_personal_billing(
         {
             (
                 GithubBillingCapability::Available,
-                "Personal premium-request Billing is available for this authorization"
-                    .to_string(),
+                "Personal premium-request Billing is available for this authorization".to_string(),
             )
         }
         _ => (
@@ -581,9 +582,9 @@ fn validate_token_input(token: &str) -> AppResult<()> {
             MAX_TOKEN_BYTES / 1_024
         )));
     }
-    if token.trim() != token || token.chars().any(char::is_control) {
+    if token.trim() != token || !token.is_ascii() || token.chars().any(char::is_control) {
         return Err(AppError::InvalidInput(
-            "GitHub authorization token must not contain whitespace padding or control characters"
+            "GitHub authorization token must be ASCII and must not contain whitespace padding or control characters"
                 .to_string(),
         ));
     }
@@ -804,7 +805,7 @@ mod tests {
             Ok(self
                 .values
                 .lock()
-                .expect("memory secrets")
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .get(secret_ref)
                 .cloned())
         }
@@ -812,7 +813,7 @@ mod tests {
         fn set(&self, secret_ref: &str, value: &str) -> AppResult<()> {
             self.values
                 .lock()
-                .expect("memory secrets")
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .insert(secret_ref.to_string(), value.to_string());
             Ok(())
         }
@@ -820,7 +821,7 @@ mod tests {
         fn delete(&self, secret_ref: &str) -> AppResult<()> {
             self.values
                 .lock()
-                .expect("memory secrets")
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .remove(secret_ref);
             Ok(())
         }
@@ -932,6 +933,7 @@ mod tests {
         assert!(validate_token_input(" token").is_err());
         assert!(validate_token_input("token\nvalue").is_err());
         assert!(validate_token_input("github_pat_test").is_ok());
+        assert!(validate_token_input("github_pat_令牌").is_err());
     }
 
     #[test]
