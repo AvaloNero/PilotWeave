@@ -1,0 +1,420 @@
+name: One-shot personal Billing backend integration
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/personal-billing-backend-once.yml
+
+permissions:
+  contents: write
+
+jobs:
+  integrate-test-and-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            curl \
+            file \
+            libayatana-appindicator3-dev \
+            libdbus-1-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            pkg-config \
+            wget
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.88.0
+          components: rustfmt, clippy
+
+      - name: Integrate personal Billing modules
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          def replace_once(text: str, old: str, new: str, label: str) -> str:
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{label}: expected one match, found {count}")
+              return text.replace(old, new, 1)
+
+          # Refine the network adapter before compiling it into the crate.
+          billing_path = Path("apps/desktop/src-tauri/src/github_billing.rs")
+          billing = billing_path.read_text()
+          billing = billing.replace(
+              "    pub fn from_str(value: &str) -> Option<Self> {",
+              "    pub fn parse_db(value: &str) -> Option<Self> {",
+          )
+          if billing.count("pub fn parse_db(value: &str) -> Option<Self>") != 3:
+              raise SystemExit("expected three Billing database parsers")
+          billing = replace_once(
+              billing,
+              '''    pub fn is_success(self) -> bool {
+                  matches!(Self::Available | Self::SuccessfulEmpty, self)
+              }
+          ''',
+              '''    pub fn is_success(self) -> bool {
+                  matches!(self, Self::Available | Self::SuccessfulEmpty)
+              }
+          ''',
+              "Billing success predicate",
+          )
+          item_marker = '''#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+          #[serde(rename_all = "camelCase")]
+          pub struct GithubBillingItem {
+          '''
+          context = '''#[derive(Clone, Copy)]
+          struct SnapshotContext<'a> {
+              identity: &'a GithubAuthorizationIdentity,
+              period: GithubBillingPeriod,
+              family: GithubBillingEndpointFamily,
+              fetched_at: DateTime<Utc>,
+          }
+
+          '''
+          billing = replace_once(
+              billing,
+              item_marker,
+              context + item_marker,
+              "Billing snapshot context insertion",
+          )
+          billing = replace_once(
+              billing,
+              '''    let fetched_at = Utc::now();
+              let url = match endpoint_url(identity, period, family) {
+          ''',
+              '''    let fetched_at = Utc::now();
+              let context = SnapshotContext {
+                  identity,
+                  period,
+                  family,
+                  fetched_at,
+              };
+              let url = match endpoint_url(identity, period, family) {
+          ''',
+              "Billing fetch context",
+          )
+          billing = replace_once(
+              billing,
+              '''        return status_snapshot(identity, period, family, fetched_at, status, response.headers());
+          ''',
+              '''        return status_snapshot(identity, period, family, fetched_at, status, response.headers());
+          ''',
+              "Billing status call presence",
+          )
+          status_context_anchor = '''    headers: &ureq::http::HeaderMap,
+          ) -> GithubBillingSnapshot {
+              match status {
+          '''
+          billing = replace_once(
+              billing,
+              status_context_anchor,
+              '''    headers: &ureq::http::HeaderMap,
+          ) -> GithubBillingSnapshot {
+              let context = SnapshotContext {
+                  identity,
+                  period,
+                  family,
+                  fetched_at,
+              };
+              match status {
+          ''',
+              "Billing status context",
+          )
+          pattern = re.compile(
+              r"error_snapshot\(\n\s*identity,\n\s*period,\n\s*family,\n\s*fetched_at,\n"
+          )
+          billing, replacements = pattern.subn("error_snapshot(\n            context,\n", billing)
+          if replacements < 10:
+              raise SystemExit(
+                  f"expected at least ten Billing error call rewrites, found {replacements}"
+              )
+          old_error_signature = '''fn error_snapshot(
+              identity: &GithubAuthorizationIdentity,
+              period: GithubBillingPeriod,
+              family: GithubBillingEndpointFamily,
+              fetched_at: DateTime<Utc>,
+              status: GithubBillingSnapshotStatus,
+              coverage: GithubBillingCoverage,
+              detail: &str,
+          ) -> GithubBillingSnapshot {
+              GithubBillingSnapshot {
+          '''
+          new_error_signature = '''fn error_snapshot(
+              context: SnapshotContext<'_>,
+              status: GithubBillingSnapshotStatus,
+              coverage: GithubBillingCoverage,
+              detail: &str,
+          ) -> GithubBillingSnapshot {
+              let SnapshotContext {
+                  identity,
+                  period,
+                  family,
+                  fetched_at,
+              } = context;
+              GithubBillingSnapshot {
+          '''
+          billing = replace_once(
+              billing,
+              old_error_signature,
+              new_error_signature,
+              "Billing error snapshot signature",
+          )
+          billing_path.write_text(billing)
+
+          store_path = Path("apps/desktop/src-tauri/src/github_billing_store.rs")
+          store = store_path.read_text()
+          store = store.replace("::from_str(&stored_family)", "::parse_db(&stored_family)")
+          store = store.replace("::from_str(&coverage)", "::parse_db(&coverage)")
+          store = store.replace("::from_str(&status)", "::parse_db(&status)")
+          if "::from_str(" in store:
+              raise SystemExit("stale Billing database parser call remains")
+          store_path.write_text(store)
+
+          usage_path = Path("apps/desktop/src-tauri/src/usage_db.rs")
+          usage = usage_path.read_text()
+          usage = replace_once(
+              usage,
+              "    conn: SqliteConnection,\n",
+              "    pub(crate) conn: SqliteConnection,\n",
+              "Usage database crate-private connection",
+          )
+          usage_path.write_text(usage)
+
+          auth_path = Path("apps/desktop/src-tauri/src/github_auth.rs")
+          auth = auth_path.read_text()
+          credentials_anchor = '''    pub fn save_verified(
+              &mut self,
+              token: &str,
+              validation: GithubAuthorizationValidation,
+          ) -> AppResult<GithubAuthorizationStatus> {
+          '''
+          credentials_method = '''    pub fn personal_usage_credentials(
+              &self,
+          ) -> AppResult<Option<(GithubAuthorizationIdentity, String)>> {
+              if let Some(reason) = &self.recovery {
+                  return Err(AppError::Unsupported(format!(
+                      "GitHub authorization is in read-only recovery ({reason})"
+                  )));
+              }
+              let Some(record) = self.state.authorization.as_ref() else {
+                  return Ok(None);
+              };
+              let Some(token) = self.secrets.get(AUTH_SECRET_REF)? else {
+                  return Ok(None);
+              };
+              validate_token_input(&token)?;
+              Ok(Some((record_identity(record), token)))
+          }
+
+          '''
+          auth = replace_once(
+              auth,
+              credentials_anchor,
+              credentials_method + credentials_anchor,
+              "GitHub personal-usage credential accessor",
+          )
+          metadata_anchor = '''        let metadata = fs::read_to_string(directory.path().join("github-authorization.json"))
+                      .expect("metadata");
+          '''
+          credential_test = '''        let (identity, token) = store
+                      .personal_usage_credentials()
+                      .expect("credentials")
+                      .expect("present");
+                  assert_eq!(identity.login, "octocat");
+                  assert_eq!(token, "github_pat_test");
+          '''
+          auth = replace_once(
+              auth,
+              metadata_anchor,
+              credential_test + metadata_anchor,
+              "GitHub credential accessor regression test",
+          )
+          auth_path.write_text(auth)
+
+          lib_path = Path("apps/desktop/src-tauri/src/lib.rs")
+          lib = lib_path.read_text()
+          lib = replace_once(
+              lib,
+              "mod github_auth;\n",
+              "mod github_auth;\nmod github_billing;\nmod github_billing_store;\n",
+              "Billing module registration",
+          )
+          lib = replace_once(
+              lib,
+              '''            commands::clear_github_authorization,
+                      commands::upsert_connection,
+          ''',
+              '''            commands::clear_github_authorization,
+                      commands::get_personal_billing_status,
+                      commands::refresh_personal_billing,
+                      commands::upsert_connection,
+          ''',
+              "Billing command registration",
+          )
+          lib_path.write_text(lib)
+
+          commands_path = Path("apps/desktop/src-tauri/src/commands.rs")
+          commands = commands_path.read_text()
+          commands = replace_once(
+              commands,
+              '''use crate::github_auth::{
+              self, GithubAuthorizationStatus, GithubAuthorizationStore, GithubValidationOutcome,
+          };
+          ''',
+              '''use crate::github_auth::{
+              self, GithubAuthorizationStatus, GithubAuthorizationStore, GithubValidationOutcome,
+          };
+          use crate::github_billing::{self, GithubBillingOverview, GithubBillingPeriod};
+          use crate::github_billing_store;
+          ''',
+              "Billing command imports",
+          )
+          usage_helper_anchor = '''    fn usage_db_status(&self) -> AppResult<UsageDbStatus> {
+          '''
+          usage_helper = '''    fn usage_db(&self) -> AppResult<MutexGuard<'_, Option<UsageDb>>> {
+              self.usage_db.lock().map_err(|_| AppError::Lock)
+          }
+
+          '''
+          commands = replace_once(
+              commands,
+              usage_helper_anchor,
+              usage_helper + usage_helper_anchor,
+              "Usage database lock helper",
+          )
+          command_anchor = '''async fn validate_github_token(
+              token: String,
+          ) -> Result<(String, GithubValidationOutcome), String> {
+          '''
+          billing_commands = '''#[tauri::command]
+          pub fn get_personal_billing_status(
+              state: State<'_, ManagedState>,
+          ) -> Result<GithubBillingOverview, String> {
+              personal_billing_overview(&state).map_err(command_error)
+          }
+
+          #[tauri::command(rename_all = "camelCase")]
+          pub async fn refresh_personal_billing(
+              state: State<'_, ManagedState>,
+              year: i32,
+              month: u32,
+          ) -> Result<GithubBillingOverview, String> {
+              let period = GithubBillingPeriod::new(year, month).map_err(command_error)?;
+              {
+                  let usage = state.usage_db().map_err(command_error)?;
+                  if usage.is_none() {
+                      return Err(command_error(AppError::Unsupported(
+                          "Usage database is unavailable; personal Billing was not requested"
+                              .to_string(),
+                      )));
+                  }
+              }
+
+              let (authorization, credentials) = {
+                  let store = state.github_authorization().map_err(command_error)?;
+                  (store.status(), store.personal_usage_credentials().map_err(command_error)?)
+              };
+              let Some((identity, token)) = credentials else {
+                  return Err(command_error(AppError::InvalidInput(format!(
+                      "A verified separate PilotWeave GitHub authorization is required before personal Billing refresh: {}",
+                      authorization.detail
+                  ))));
+              };
+
+              let snapshots = tauri::async_runtime::spawn_blocking(move || {
+                  github_billing::fetch_personal_billing(&token, &identity, period)
+              })
+              .await
+              .map_err(|error| {
+                  command_error(AppError::Config(format!(
+                      "Personal Billing task failed: {error}"
+                  )))
+              })?
+              .map_err(command_error)?;
+
+              {
+                  let mut usage = state.usage_db().map_err(command_error)?;
+                  let db = usage.as_mut().ok_or_else(|| {
+                      command_error(AppError::Unsupported(
+                          "Usage database became unavailable before Billing persistence"
+                              .to_string(),
+                      ))
+                  })?;
+                  github_billing_store::insert_snapshots(db, &snapshots)
+                      .map_err(command_error)?;
+              }
+              personal_billing_overview(&state).map_err(command_error)
+          }
+
+          fn personal_billing_overview(
+              state: &State<'_, ManagedState>,
+          ) -> AppResult<GithubBillingOverview> {
+              let authorization = state.github_authorization()?.status();
+              let account = authorization.identity.clone();
+              let storage = state.usage_db_status()?;
+              let families = match account.as_ref() {
+                  Some(identity) => {
+                      let usage = state.usage_db()?;
+                      match usage.as_ref() {
+                          Some(db) => github_billing_store::family_views(db, &identity.login)?,
+                          None => github_billing::empty_family_views(),
+                      }
+                  }
+                  None => github_billing::empty_family_views(),
+              };
+              Ok(GithubBillingOverview {
+                  authorization,
+                  storage,
+                  account,
+                  families,
+                  observed_at: Utc::now(),
+              })
+          }
+
+          '''
+          commands = replace_once(
+              commands,
+              command_anchor,
+              billing_commands + command_anchor,
+              "Personal Billing commands",
+          )
+          commands_path.write_text(commands)
+          PY
+
+      - name: Validate browser syntax
+        run: npm run check:web
+
+      - name: Format and validate Rust
+        run: |
+          cargo fmt --all
+          cargo test --workspace
+          cargo clippy --workspace --all-targets -- -D warnings
+          git diff --check
+
+      - name: Remove workflow and commit
+        shell: bash
+        run: |
+          rm .github/workflows/personal-billing-backend-once.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "feat: sync and persist personal GitHub Billing"
+          git push origin HEAD:main
