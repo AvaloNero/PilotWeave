@@ -6,8 +6,8 @@
   "scripts": {
     "dev": "tauri dev --config apps/desktop/src-tauri/tauri.conf.json",
     "build": "tauri build --config apps/desktop/src-tauri/tauri.conf.json",
-    "test": "node --check apps/desktop/web/app.js && cargo test --workspace",
-    "check:web": "node --check apps/desktop/web/app.js",
+    "test": "npm run check:web && cargo test --workspace",
+    "check:web": "node --check apps/desktop/web/app.js && node --check apps/desktop/web/installer-ui.js",
     "check:rust": "cargo fmt --all -- --check && cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings",
     "check": "npm run check:web && npm run check:rust"
   },
