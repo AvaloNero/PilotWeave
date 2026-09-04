@@ -1,0 +1,274 @@
+name: One-shot account hardening
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/account-hardening-once.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch-test-and-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            curl \
+            file \
+            libayatana-appindicator3-dev \
+            libdbus-1-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            pkg-config \
+            wget
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.88.0
+          components: rustfmt, clippy
+
+      - name: Apply bounded account hardening patch
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("apps/desktop/src-tauri/src/account.rs")
+          text = path.read_text()
+
+          def replace_once(old: str, new: str) -> None:
+              global text
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"expected one match, found {count}: {old[:100]!r}")
+              text = text.replace(old, new, 1)
+
+          replace_once(
+          '''    pub fn consume(&mut self, plan_id: &str) -> AppResult<StoredLoginPlan> {
+              self.purge_expired();
+              let stored = self.plans.remove(plan_id).ok_or_else(|| {
+                  AppError::InvalidInput(
+                      "Sign-in plan is missing, expired, or was already consumed; preview again"
+                          .to_string(),
+                  )
+              })?;
+              if stored.plan.expires_at < Utc::now() {
+                  return Err(AppError::InvalidInput(
+                      "Sign-in plan expired; preview again".to_string(),
+                  ));
+              }
+
+              let status = discover_status(Vec::new(), None);
+              if account_fingerprint(&status) != stored.account_fingerprint {
+                  return Err(AppError::InvalidInput(
+                      "Account or client state changed after sign-in preview; preview again".to_string(),
+                  ));
+              }
+              for operation in stored.executables.values() {
+                  let current = native_process::fingerprint_regular_file(&operation.path)?;
+                  if current != operation.fingerprint {
+                      return Err(AppError::InvalidInput(
+                          "A sign-in executable changed after preview; preview again".to_string(),
+                      ));
+                  }
+              }
+              Ok(stored)
+          }
+
+          fn purge_expired(&mut self) {
+          ''',
+          '''    pub fn consume(&mut self, plan_id: &str) -> AppResult<StoredLoginPlan> {
+              let stored = self.take(plan_id)?;
+              if stored.plan.expires_at < Utc::now() {
+                  return Err(AppError::InvalidInput(
+                      "Sign-in plan expired; preview again".to_string(),
+                  ));
+              }
+
+              let status = discover_status(Vec::new(), None);
+              if account_fingerprint(&status) != stored.account_fingerprint {
+                  return Err(AppError::InvalidInput(
+                      "Account or client state changed after sign-in preview; preview again".to_string(),
+                  ));
+              }
+              for operation in stored.executables.values() {
+                  let current = native_process::fingerprint_regular_file(&operation.path)?;
+                  if current != operation.fingerprint {
+                      return Err(AppError::InvalidInput(
+                          "A sign-in executable changed after preview; preview again".to_string(),
+                      ));
+                  }
+              }
+              Ok(stored)
+          }
+
+          fn take(&mut self, plan_id: &str) -> AppResult<StoredLoginPlan> {
+              self.purge_expired();
+              self.plans.remove(plan_id).ok_or_else(|| {
+                  AppError::InvalidInput(
+                      "Sign-in plan is missing, expired, or was already consumed; preview again"
+                          .to_string(),
+                  )
+              })
+          }
+
+          fn purge_expired(&mut self) {
+          ''')
+
+          replace_once(
+          '''        self.ensure_writable()?;
+              let run = LoginRunRecord {
+          ''',
+          '''        self.ensure_writable()?;
+              let previous = self.state.clone();
+              let run = LoginRunRecord {
+          ''')
+
+          replace_once(
+          '''        if let Err(error) = self.persist() {
+                  self.state.runs.retain(|item| item.id != run.id);
+                  return Err(error);
+              }
+          ''',
+          '''        if let Err(error) = self.persist() {
+                  self.state = previous;
+                  return Err(error);
+              }
+          ''')
+
+          replace_once(
+          '''    for surface in &status.surfaces {
+                  surface.surface.hash(&mut hasher);
+          ''',
+          '''    for surface in &status.surfaces {
+                  surface.surface.as_str().hash(&mut hasher);
+          ''')
+
+          replace_once(
+          '''            native_process::resolve_candidates([
+                      "/Applications/Visual Studio Code.app/Contents/MacOS/Electron",
+                      "/Applications/Visual Studio Code - Insiders.app/Contents/MacOS/Electron",
+                  ])
+          ''',
+          '''            native_process::resolve_candidates([
+                      "/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code",
+                      "/Applications/Visual Studio Code - Insiders.app/Contents/Resources/app/bin/code-insiders",
+                      "/Applications/Visual Studio Code.app/Contents/MacOS/Electron",
+                      "/Applications/Visual Studio Code - Insiders.app/Contents/MacOS/Electron",
+                  ])
+          ''')
+
+          replace_once(
+          '''fn validate_avatar_url(value: String) -> Option<String> {
+              let url = Url::parse(&value).ok()?;
+              (url.scheme() == "https" && url.host_str().is_some()).then_some(value)
+          }
+          ''',
+          '''fn validate_avatar_url(value: String) -> Option<String> {
+              if value.len() > MAX_ACCOUNT_TEXT_BYTES {
+                  return None;
+              }
+              let url = Url::parse(&value).ok()?;
+              (url.scheme() == "https" && url.host_str().is_some()).then_some(value)
+          }
+          ''')
+
+          replace_once(
+          '''    } else {
+                  format!("{}…", &value[..MAX_ACCOUNT_TEXT_BYTES])
+              }
+          }
+          ''',
+          '''    } else {
+                  let mut end = MAX_ACCOUNT_TEXT_BYTES.min(value.len());
+                  while !value.is_char_boundary(end) {
+                      end -= 1;
+                  }
+                  format!("{}…", &value[..end])
+              }
+          }
+          ''')
+
+          replace_once(
+          '''    fn login_plans_are_one_shot() {
+                  let mut store = LoginPlanStore::default();
+                  let plan = store
+                      .preview(vec![LoginSurface::GithubCopilotApp])
+                      .expect("preview");
+                  let _ = store.consume(&plan.id).expect("consume");
+                  assert!(store.consume(&plan.id).is_err());
+              }
+          ''',
+          '''    fn login_plans_are_one_shot_without_live_discovery() {
+                  let mut store = LoginPlanStore::default();
+                  let now = Utc::now();
+                  let plan = LoginPlan {
+                      id: "one-shot".to_string(),
+                      target_identity: None,
+                      requested_surfaces: vec![LoginSurface::GithubCopilotApp],
+                      operations: Vec::new(),
+                      created_at: now,
+                      expires_at: now + ChronoDuration::minutes(15),
+                  };
+                  store.plans.insert(
+                      plan.id.clone(),
+                      StoredLoginPlan {
+                          plan: plan.clone(),
+                          account_fingerprint: "test".to_string(),
+                          executables: BTreeMap::new(),
+                      },
+                  );
+                  let _ = store.take(&plan.id).expect("consume");
+                  assert!(store.take(&plan.id).is_err());
+              }
+          ''')
+
+          marker = '''    #[test]
+              fn invalid_github_logins_are_rejected() {
+          '''
+          addition = '''    #[test]
+              fn bounded_detail_never_splits_utf8() {
+                  let value = "🙂".repeat(MAX_ACCOUNT_TEXT_BYTES);
+                  let detail = bounded_detail(&value);
+                  assert!(detail.ends_with('…'));
+                  assert!(detail.is_char_boundary(detail.len()));
+              }
+
+          '''
+          if text.count(marker) != 1:
+              raise SystemExit("test insertion marker did not match exactly once")
+          text = text.replace(marker, addition + marker, 1)
+
+          path.write_text(text)
+          PY
+
+      - name: Format and validate
+        run: |
+          cargo fmt --all
+          cargo test --workspace
+          cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Remove workflow and commit
+        shell: bash
+        run: |
+          rm .github/workflows/account-hardening-once.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "fix: harden account orchestration lifecycle"
+          git push origin HEAD:main
