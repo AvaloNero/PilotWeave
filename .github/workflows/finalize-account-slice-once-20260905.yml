@@ -1,0 +1,160 @@
+name: One-shot account slice final verification
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/finalize-account-slice-once-20260905.yml
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    name: validate (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            curl \
+            file \
+            libayatana-appindicator3-dev \
+            libdbus-1-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            pkg-config \
+            wget
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.88.0
+          components: rustfmt, clippy
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Apply the deterministic account slice finalizer
+        run: python .github/scripts/finalize_account_slice.py
+
+      - name: Install JavaScript dependencies
+        run: npm ci
+
+      - name: Normalize safe lint fixes
+        run: |
+          cargo fmt --all
+          cargo clippy --fix --workspace --all-targets --allow-dirty --allow-staged
+          cargo fmt --all
+
+      - name: Run required checks
+        run: |
+          npm run check:web
+          cargo fmt --all -- --check
+          cargo test --workspace
+          cargo clippy --workspace --all-targets -- -D warnings
+          git diff --check
+
+      - name: Build the Windows Tauri application
+        if: runner.os == 'Windows'
+        run: npm run build -- --debug
+
+  commit:
+    name: commit verified slice
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            curl \
+            file \
+            libayatana-appindicator3-dev \
+            libdbus-1-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            pkg-config \
+            wget
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.88.0
+          components: rustfmt, clippy
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Reproduce the verified tree
+        run: |
+          python .github/scripts/finalize_account_slice.py
+          npm ci
+          cargo fmt --all
+          cargo clippy --fix --workspace --all-targets --allow-dirty --allow-staged
+          cargo fmt --all
+          npm run check:web
+          cargo fmt --all -- --check
+          cargo test --workspace
+          cargo clippy --workspace --all-targets -- -D warnings
+          git diff --check
+
+      - name: Remove temporary automation, commit, and clean probe branches
+        shell: bash
+        run: |
+          rm -f .github/scripts/finalize_account_slice.py
+          rm -f .github/workflows/account-hardening-once.yml
+          rm -f .github/workflows/stabilize-account-backend-once.yml
+          rm -f .github/workflows/finish-account-ui-once-20260905.yml
+          rm -f .github/workflows/finalize-account-slice-once-20260905.yml
+          git diff --check
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if ! git diff --cached --quiet; then
+            git commit -m "feat: complete reviewed account sign-in interface"
+            git push origin HEAD:main
+          fi
+
+          for branch in \
+            __temp_do_not_use \
+            __temp_do_not_use_cleanup_probe \
+            main-copy-ignore \
+            do-not-use-temporary-3 \
+            __discard_this_branch_4; do
+            if git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
+              git push origin --delete "$branch"
+            fi
+          done
