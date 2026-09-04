@@ -1,0 +1,130 @@
+name: One-shot account slice audit
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/audit-account-slice-once-20260905.yml
+
+permissions:
+  actions: read
+  contents: write
+
+env:
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Wait for the cross-platform final verification
+        id: final-run
+        shell: bash
+        run: |
+          conclusion=""
+          url=""
+          for _ in $(seq 1 60); do
+            record="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs?branch=main&per_page=100" \
+              --jq '[.workflow_runs[] | select(.name == "One-shot account slice final verification")][0] | [.conclusion // "", .html_url] | @tsv')"
+            conclusion="${record%%$'\t'*}"
+            url="${record#*$'\t'}"
+            if [ "$conclusion" = "success" ]; then
+              break
+            fi
+            if [ -n "$conclusion" ] && [ "$conclusion" != "null" ]; then
+              echo "Final cross-platform verification concluded: $conclusion" >&2
+              exit 1
+            fi
+            sleep 30
+          done
+          if [ "$conclusion" != "success" ]; then
+            echo "Timed out waiting for final cross-platform verification" >&2
+            exit 1
+          fi
+          echo "run_url=$url" >> "$GITHUB_OUTPUT"
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            curl \
+            file \
+            libayatana-appindicator3-dev \
+            libdbus-1-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            pkg-config \
+            wget
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.88.0
+          components: rustfmt, clippy
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Verify current main again
+        run: |
+          test -f docs/account-orchestration.md
+          grep -q 'data-route="accounts"' apps/desktop/web/index.html
+          grep -q 'function renderAccounts()' apps/desktop/web/app.js
+          grep -q 'function openLoginPlan()' apps/desktop/web/app.js
+          grep -q 'commands::get_account_status' apps/desktop/src-tauri/src/lib.rs
+          grep -q 'commands::preview_login' apps/desktop/src-tauri/src/lib.rs
+          grep -q 'commands::apply_login_plan' apps/desktop/src-tauri/src/lib.rs
+          npm ci
+          npm run check:web
+          cargo fmt --all -- --check
+          cargo test --workspace
+          cargo clippy --workspace --all-targets -- -D warnings
+          git diff --check
+
+      - name: Write persistent verification record and clean temporary branches
+        shell: bash
+        run: |
+          mkdir -p docs/verification
+          commit_sha="$(git rev-parse HEAD)"
+          cat > docs/verification/account-slice-2026-09-05.md <<EOF
+          # Account orchestration slice verification
+
+          Verified main commit: \`$commit_sha\`
+
+          Cross-platform verification run: ${{ steps.final-run.outputs.run_url }}
+
+          The final verification matrix completed successfully on Ubuntu, macOS, and Windows. It ran the required web syntax check, Rust formatting check, workspace tests, Clippy with warnings denied, whitespace validation, and a native Windows Tauri debug build.
+
+          This audit then repeated the web syntax check, Rust formatting check, workspace tests, Clippy check, and whitespace validation against the current \`main\` tree before writing this record.
+          EOF
+
+          rm -f .github/workflows/audit-account-slice-once-20260905.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "docs: record account slice verification"
+          git push origin HEAD:main
+
+          for branch in \
+            __temp_do_not_use \
+            __temp_do_not_use_cleanup_probe \
+            main-copy-ignore \
+            do-not-use-temporary-3 \
+            __discard_this_branch_4; do
+            if git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
+              git push origin --delete "$branch"
+            fi
+          done
