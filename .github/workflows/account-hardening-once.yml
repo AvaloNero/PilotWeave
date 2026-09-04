@@ -204,6 +204,14 @@ jobs:
           )
 
           path.write_text(text)
+
+          validation_path = Path("apps/desktop/src-tauri/src/validation.rs")
+          validation = validation_path.read_text()
+          old_limit = "const MAX_CONNECTION_JSON_BYTES: usize = 1 * 1_024 * 1_024;"
+          new_limit = "const MAX_CONNECTION_JSON_BYTES: usize = 1_024 * 1_024;"
+          if validation.count(old_limit) != 1:
+              raise SystemExit("connection JSON limit: expected one identity operation")
+          validation_path.write_text(validation.replace(old_limit, new_limit, 1))
           PY
 
       - name: Format and validate
