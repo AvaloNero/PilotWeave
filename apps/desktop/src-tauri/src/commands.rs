@@ -1,3 +1,7 @@
+use crate::account::{
+    self, AccountStatusSnapshot, LoginApplyResult, LoginPlan, LoginPlanStore, LoginStore,
+    LoginSurface,
+};
 use crate::adapters;
 use crate::deployment::{self, PlanStore, StoredPlan};
 use crate::domain::{
@@ -20,6 +24,8 @@ pub struct ManagedState {
     store: Mutex<StateStore>,
     plans: Mutex<PlanStore>,
     install_plans: Mutex<InstallPlanStore>,
+    login_plans: Mutex<LoginPlanStore>,
+    login_store: Mutex<LoginStore>,
     usage_db: Mutex<Option<UsageDb>>,
     usage_db_error: Option<String>,
 }
@@ -27,6 +33,7 @@ pub struct ManagedState {
 impl ManagedState {
     pub fn new(
         store: StateStore,
+        login_store: LoginStore,
         usage_db: Option<UsageDb>,
         usage_db_error: Option<String>,
     ) -> Self {
@@ -34,6 +41,8 @@ impl ManagedState {
             store: Mutex::new(store),
             plans: Mutex::new(PlanStore::default()),
             install_plans: Mutex::new(InstallPlanStore::default()),
+            login_plans: Mutex::new(LoginPlanStore::default()),
+            login_store: Mutex::new(login_store),
             usage_db: Mutex::new(usage_db),
             usage_db_error,
         }
@@ -49,6 +58,14 @@ impl ManagedState {
 
     fn install_plans(&self) -> AppResult<MutexGuard<'_, InstallPlanStore>> {
         self.install_plans.lock().map_err(|_| AppError::Lock)
+    }
+
+    fn login_plans(&self) -> AppResult<MutexGuard<'_, LoginPlanStore>> {
+        self.login_plans.lock().map_err(|_| AppError::Lock)
+    }
+
+    fn login_store(&self) -> AppResult<MutexGuard<'_, LoginStore>> {
+        self.login_store.lock().map_err(|_| AppError::Lock)
     }
 
     fn usage_db_status(&self) -> AppResult<UsageDbStatus> {
@@ -115,6 +132,60 @@ pub fn apply_install_plan(
         .install_plans()
         .and_then(|mut plans| installer::apply_plan(&mut plans, &plan_id))
         .map_err(command_error)
+}
+
+#[tauri::command]
+pub fn get_account_status(
+    state: State<'_, ManagedState>,
+) -> Result<AccountStatusSnapshot, String> {
+    let (runs, recovery) = {
+        let store = state.login_store().map_err(command_error)?;
+        (store.runs(), store.recovery())
+    };
+    Ok(account::discover_status(runs, recovery))
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub fn preview_login(
+    state: State<'_, ManagedState>,
+    surfaces: Vec<LoginSurface>,
+) -> Result<LoginPlan, String> {
+    state
+        .login_plans()
+        .and_then(|mut plans| plans.preview(surfaces))
+        .map_err(command_error)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub fn apply_login_plan(
+    state: State<'_, ManagedState>,
+    plan_id: String,
+) -> Result<LoginApplyResult, String> {
+    let stored = {
+        let mut plans = state.login_plans().map_err(command_error)?;
+        plans.consume(&plan_id).map_err(command_error)?
+    };
+    let run = {
+        let mut history = state.login_store().map_err(command_error)?;
+        history.begin_run(&stored.plan).map_err(command_error)?
+    };
+    let finished = account::execute_plan(&stored, run);
+    {
+        let mut history = state.login_store().map_err(command_error)?;
+        if let Err(error) = history.finish_run(finished.clone()) {
+            return Err(command_error(AppError::Config(format!(
+                "Official sign-in clients may have been launched, but the final local run summary could not be persisted; the prepared history entry remains interrupted: {error}"
+            ))));
+        }
+    }
+    let (runs, recovery) = {
+        let history = state.login_store().map_err(command_error)?;
+        (history.runs(), history.recovery())
+    };
+    Ok(LoginApplyResult {
+        run: finished,
+        account_status: account::discover_status(runs, recovery),
+    })
 }
 
 #[tauri::command(rename_all = "camelCase")]
