@@ -221,11 +221,7 @@ pub fn sanitize_child_environment(command: &mut Command) {
     command.env("NO_COLOR", "1");
 }
 
-fn hash_sample(
-    file: &mut fs::File,
-    hasher: &mut impl Hasher,
-    limit: usize,
-) -> AppResult<()> {
+fn hash_sample(file: &mut fs::File, hasher: &mut impl Hasher, limit: usize) -> AppResult<()> {
     let mut remaining = limit;
     let mut buffer = [0u8; READ_CHUNK_BYTES];
     while remaining > 0 {

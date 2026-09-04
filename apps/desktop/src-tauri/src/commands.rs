@@ -135,9 +135,7 @@ pub fn apply_install_plan(
 }
 
 #[tauri::command]
-pub fn get_account_status(
-    state: State<'_, ManagedState>,
-) -> Result<AccountStatusSnapshot, String> {
+pub fn get_account_status(state: State<'_, ManagedState>) -> Result<AccountStatusSnapshot, String> {
     let (runs, recovery) = {
         let store = state.login_store().map_err(command_error)?;
         (store.runs(), store.recovery())

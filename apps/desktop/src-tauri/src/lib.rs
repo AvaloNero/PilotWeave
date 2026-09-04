@@ -1,5 +1,5 @@
-pub mod adapters;
 mod account;
+pub mod adapters;
 mod commands;
 pub mod decimal;
 mod deployment;

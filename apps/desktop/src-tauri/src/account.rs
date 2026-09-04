@@ -527,7 +527,11 @@ pub fn execute_plan(stored: &StoredLoginPlan, mut run: LoginRunRecord) -> LoginR
                 }
             }
             None => {
-                let status = if operation.description.to_ascii_lowercase().contains("install") {
+                let status = if operation
+                    .description
+                    .to_ascii_lowercase()
+                    .contains("install")
+                {
                     LoginStepStatus::SkippedNotInstalled
                 } else {
                     LoginStepStatus::Unsupported
@@ -928,9 +932,7 @@ fn find_copilot_app_executable() -> Option<PathBuf> {
     {
         let mut candidates = Vec::new();
         if let Some(root) = std::env::var_os("LOCALAPPDATA") {
-            candidates.push(
-                PathBuf::from(root).join("Programs/GitHub Copilot/GitHub Copilot.exe"),
-            );
+            candidates.push(PathBuf::from(root).join("Programs/GitHub Copilot/GitHub Copilot.exe"));
         }
         for variable in ["PROGRAMFILES", "PROGRAMFILES(X86)"] {
             if let Some(root) = std::env::var_os(variable) {
@@ -1066,7 +1068,9 @@ fn write_history(path: &Path, state: &LoginHistoryState) -> AppResult<()> {
     let result = (|| -> AppResult<()> {
         let mut options = fs::OpenOptions::new();
         options.create_new(true).write(true);
-        let mut file = options.open(&temp).map_err(|error| AppError::io(&temp, error))?;
+        let mut file = options
+            .open(&temp)
+            .map_err(|error| AppError::io(&temp, error))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
