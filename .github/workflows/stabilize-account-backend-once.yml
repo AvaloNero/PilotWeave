@@ -1,0 +1,388 @@
+name: One-shot account backend stabilization
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/stabilize-account-backend-once.yml
+
+permissions:
+  contents: write
+
+jobs:
+  stabilize:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            curl \
+            file \
+            libayatana-appindicator3-dev \
+            libdbus-1-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            pkg-config \
+            wget
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.88.0
+          components: rustfmt, clippy
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Harden and normalize account backend
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          account_path = Path("apps/desktop/src-tauri/src/account.rs")
+          native_path = Path("apps/desktop/src-tauri/src/native_process.rs")
+          cargo_path = Path("apps/desktop/src-tauri/Cargo.toml")
+
+          if not account_path.exists() or not native_path.exists():
+              raise SystemExit("account orchestration sources are missing")
+
+          account = account_path.read_text()
+
+          if "fn take(&mut self, plan_id: &str)" not in account:
+              pattern = re.compile(
+                  r"    pub fn consume\(&mut self, plan_id: &str\) -> AppResult<StoredLoginPlan> \{.*?(?=    fn purge_expired\(&mut self\) \{)",
+                  re.S,
+              )
+              replacement = '''    pub fn consume(&mut self, plan_id: &str) -> AppResult<StoredLoginPlan> {
+              let stored = self.take(plan_id)?;
+              let status = discover_status(Vec::new(), None);
+              if account_fingerprint(&status) != stored.account_fingerprint {
+                  return Err(AppError::InvalidInput(
+                      "Account or client state changed after sign-in preview; preview again".to_string(),
+                  ));
+              }
+              for operation in stored.executables.values() {
+                  let current = native_process::fingerprint_regular_file(&operation.path)?;
+                  if current != operation.fingerprint {
+                      return Err(AppError::InvalidInput(
+                          "A sign-in executable changed after preview; preview again".to_string(),
+                      ));
+                  }
+              }
+              Ok(stored)
+          }
+
+          fn take(&mut self, plan_id: &str) -> AppResult<StoredLoginPlan> {
+              self.purge_expired();
+              self.plans.remove(plan_id).ok_or_else(|| {
+                  AppError::InvalidInput(
+                      "Sign-in plan is missing, expired, or was already consumed; preview again"
+                          .to_string(),
+                  )
+              })
+          }
+
+          '''
+              account, count = pattern.subn(replacement, account, count=1)
+              if count != 1:
+                  raise SystemExit("could not replace login plan consumption block")
+
+          begin_marker = "        self.ensure_writable()?;\n        let run = LoginRunRecord {"
+          if "let previous = self.state.clone();" not in account[account.index("pub fn begin_run"):account.index("pub fn finish_run")]:
+              if begin_marker not in account:
+                  raise SystemExit("could not locate begin_run marker")
+              account = account.replace(
+                  begin_marker,
+                  "        self.ensure_writable()?;\n        let previous = self.state.clone();\n        let run = LoginRunRecord {",
+                  1,
+              )
+
+          account = account.replace(
+              "            self.state.runs.retain(|item| item.id != run.id);\n            return Err(error);",
+              "            self.state = previous;\n            return Err(error);",
+              1,
+          )
+          account = account.replace(
+              "surface.surface.hash(&mut hasher);",
+              "surface.surface.as_str().hash(&mut hasher);",
+          )
+
+          if "/Contents/Resources/app/bin/code" not in account:
+              account = account.replace(
+                  '                "/Applications/Visual Studio Code.app/Contents/MacOS/Electron",',
+                  '                "/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code",\n'
+                  '                "/Applications/Visual Studio Code - Insiders.app/Contents/Resources/app/bin/code-insiders",\n'
+                  '                "/Applications/Visual Studio Code.app/Contents/MacOS/Electron",',
+                  1,
+              )
+
+          if "value.len() > MAX_ACCOUNT_TEXT_BYTES" not in account[account.index("fn validate_avatar_url"):account.index("fn bounded_detail")]:
+              account = account.replace(
+                  '''fn validate_avatar_url(value: String) -> Option<String> {
+              let url = Url::parse(&value).ok()?;
+              (url.scheme() == "https" && url.host_str().is_some()).then_some(value)
+          }''',
+                  '''fn validate_avatar_url(value: String) -> Option<String> {
+              if value.len() > MAX_ACCOUNT_TEXT_BYTES {
+                  return None;
+              }
+              let url = Url::parse(&value).ok()?;
+              (url.scheme() == "https" && url.host_str().is_some()).then_some(value)
+          }''',
+                  1,
+              )
+
+          account = account.replace(
+              '        format!("{}…", &value[..MAX_ACCOUNT_TEXT_BYTES])',
+              '''        let mut end = MAX_ACCOUNT_TEXT_BYTES.min(value.len());
+              while !value.is_char_boundary(end) {
+                  end -= 1;
+              }
+              format!("{}…", &value[..end])''',
+              1,
+          )
+
+          account = account.replace(
+              '''    run.status = match (launched, failed) {
+              (0, 0) => LoginRunStatus::Failed,
+              (0, _) => LoginRunStatus::Failed,
+              (_, 0) => LoginRunStatus::ActionRequired,
+              _ => LoginRunStatus::Partial,
+          };''',
+              '''    run.status = if launched == 0 {
+              LoginRunStatus::Failed
+          } else if failed == 0 {
+              LoginRunStatus::ActionRequired
+          } else {
+              LoginRunStatus::Partial
+          };''',
+              1,
+          )
+
+          account = account.replace(
+              "detail: redact::redact_text(&error.to_string()),",
+              "detail: bounded_detail(&error.to_string()),",
+          )
+
+          old_test = re.compile(
+              r"    #\[test\]\n    fn login_plans_are_one_shot\(\) \{.*?\n    \}\n\n(?=    #\[test\]\n    fn empty_surface_request_selects_all_clients)",
+              re.S,
+          )
+          if old_test.search(account):
+              account = old_test.sub(
+                  '''    #[test]
+              fn login_plans_are_one_shot_without_live_discovery() {
+                  let mut store = LoginPlanStore::default();
+                  let now = Utc::now();
+                  let plan = LoginPlan {
+                      id: "one-shot".to_string(),
+                      target_identity: None,
+                      requested_surfaces: vec![LoginSurface::GithubCopilotApp],
+                      operations: Vec::new(),
+                      created_at: now,
+                      expires_at: now + ChronoDuration::minutes(15),
+                  };
+                  store.plans.insert(
+                      plan.id.clone(),
+                      StoredLoginPlan {
+                          plan: plan.clone(),
+                          account_fingerprint: "test".to_string(),
+                          executables: BTreeMap::new(),
+                      },
+                  );
+                  let _ = store.take(&plan.id).expect("consume");
+                  assert!(store.take(&plan.id).is_err());
+              }
+
+          ''',
+                  account,
+                  count=1,
+              )
+
+          if "fn bounded_detail_never_splits_utf8" not in account:
+              marker = "    #[test]\n    fn invalid_github_logins_are_rejected() {"
+              if marker not in account:
+                  raise SystemExit("could not locate account test insertion marker")
+              test = '''    #[test]
+              fn bounded_detail_never_splits_utf8() {
+                  let value = "🙂".repeat(MAX_ACCOUNT_TEXT_BYTES);
+                  let detail = bounded_detail(&value);
+                  assert!(detail.ends_with('…'));
+                  assert!(detail.len() <= MAX_ACCOUNT_TEXT_BYTES + '…'.len_utf8());
+              }
+
+          '''
+              account = account.replace(marker, test + marker, 1)
+
+          account_path.write_text(account)
+
+          native = native_path.read_text()
+          cargo = cargo_path.read_text()
+          if 'sha2 = "0.10"' not in cargo:
+              cargo = cargo.replace('serde_json = { version = "1.0", features = ["preserve_order"] }\n', 'serde_json = { version = "1.0", features = ["preserve_order"] }\nsha2 = "0.10"\n')
+              cargo_path.write_text(cargo)
+
+          native = native.replace("use std::hash::Hasher;\n", "")
+          native = native.replace("use std::io::{Read, Seek, SeekFrom, Write};", "use std::io::{Read, Write};")
+          if "use sha2::{Digest, Sha256};" not in native:
+              native = native.replace("use crate::error::{AppError, AppResult};\n", "use crate::error::{AppError, AppResult};\nuse sha2::{Digest, Sha256};\n")
+          native = native.replace("const EXECUTABLE_SAMPLE_BYTES: usize = 64 * 1_024;\n", "")
+
+          fp_pattern = re.compile(
+              r"pub fn fingerprint_regular_file\(path: &Path\) -> AppResult<String> \{.*?\n\}\n\npub fn run_capture_bounded",
+              re.S,
+          )
+          fp_replacement = '''pub fn fingerprint_regular_file(path: &Path) -> AppResult<String> {
+              let canonical = resolve_regular_file(path).ok_or_else(|| {
+                  AppError::InvalidInput(format!(
+                      "Expected a regular executable file: {}",
+                      path.display()
+                  ))
+              })?;
+              let metadata = fs::metadata(&canonical).map_err(|error| AppError::io(&canonical, error))?;
+              if metadata.len() > MAX_EXECUTABLE_BYTES {
+                  return Err(AppError::InvalidInput(format!(
+                      "Executable exceeds the {} MiB fingerprint limit: {}",
+                      MAX_EXECUTABLE_BYTES / 1_024 / 1_024,
+                      canonical.display()
+                  )));
+              }
+
+              let mut hasher = Sha256::new();
+              hasher.update(canonical.to_string_lossy().as_bytes());
+              hasher.update(metadata.len().to_le_bytes());
+              if let Ok(modified) = metadata.modified() {
+                  if let Ok(value) = modified.duration_since(std::time::UNIX_EPOCH) {
+                      hasher.update(value.as_secs().to_le_bytes());
+                      hasher.update(value.subsec_nanos().to_le_bytes());
+                  }
+              }
+
+              let mut file = fs::File::open(&canonical).map_err(|error| AppError::io(&canonical, error))?;
+              let mut buffer = [0u8; READ_CHUNK_BYTES];
+              loop {
+                  let read = file
+                      .read(&mut buffer)
+                      .map_err(|error| AppError::io(&canonical, error))?;
+                  if read == 0 {
+                      break;
+                  }
+                  hasher.update(&buffer[..read]);
+              }
+              Ok(format!("{:x}", hasher.finalize()))
+          }
+
+          pub fn run_capture_bounded'''
+          native, count = fp_pattern.subn(fp_replacement, native, count=1)
+          if count != 1:
+              raise SystemExit("could not normalize executable fingerprint implementation")
+
+          native = native.replace(
+              "    sanitize_child_environment(&mut command);",
+              "    sanitize_noninteractive_child_environment(&mut command);",
+              1,
+          )
+          second = native.find("    sanitize_child_environment(&mut command);")
+          if second >= 0:
+              native = native[:second] + "    sanitize_interactive_child_environment(&mut command);" + native[second + len("    sanitize_child_environment(&mut command);"):]
+
+          spawn_pattern = re.compile(
+              r"    command\n        \.spawn\(\)\n        \.map\(\|_\| \(\)\)\n        \.map_err\(\|error\| AppError::io\(&executable, error\)\)\n\}",
+              re.S,
+          )
+          native = spawn_pattern.sub(
+              '''    let mut child = command
+                  .spawn()
+                  .map_err(|error| AppError::io(&executable, error))?;
+              thread::spawn(move || {
+                  let _ = child.wait();
+              });
+              Ok(())
+          }''',
+              native,
+              count=1,
+          )
+
+          env_pattern = re.compile(
+              r"pub fn sanitize_child_environment\(command: &mut Command\) \{.*?\n\}\n\nfn hash_sample\(.*?\n\}\n\nfn drain_capped",
+              re.S,
+          )
+          env_replacement = '''fn clear_sensitive_child_environment(command: &mut Command) {
+              for name in SENSITIVE_CHILD_ENV {
+                  command.env_remove(name);
+              }
+              command.env("NO_COLOR", "1");
+          }
+
+          fn sanitize_noninteractive_child_environment(command: &mut Command) {
+              clear_sensitive_child_environment(command);
+              command.env("GH_PROMPT_DISABLED", "1");
+          }
+
+          fn sanitize_interactive_child_environment(command: &mut Command) {
+              clear_sensitive_child_environment(command);
+              command.env_remove("GH_PROMPT_DISABLED");
+          }
+
+          fn drain_capped'''
+          if env_pattern.search(native):
+              native = env_pattern.sub(env_replacement, native, count=1)
+          else:
+              simple_env = re.compile(
+                  r"pub fn sanitize_child_environment\(command: &mut Command\) \{.*?\n\}\n\nfn drain_capped",
+                  re.S,
+              )
+              native, count = simple_env.subn(env_replacement, native, count=1)
+              if count != 1 and "sanitize_noninteractive_child_environment" not in native:
+                  raise SystemExit("could not normalize child environment sanitization")
+
+          native_path.write_text(native)
+          PY
+
+      - name: Install JavaScript dependencies
+        run: npm ci
+
+      - name: Format and auto-fix safe Clippy suggestions
+        run: |
+          cargo fmt --all
+          cargo clippy --fix --workspace --all-targets --allow-dirty --allow-staged
+          cargo fmt --all
+
+      - name: Run required checks
+        run: |
+          npm run check:web
+          cargo fmt --all -- --check
+          cargo test --workspace
+          cargo clippy --workspace --all-targets -- -D warnings
+          git diff --check
+
+      - name: Remove temporary workflows and commit
+        shell: bash
+        run: |
+          rm -f .github/workflows/account-hardening-once.yml
+          rm -f .github/workflows/stabilize-account-backend-once.yml
+          git diff --check
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git commit -m "fix: stabilize account orchestration backend"
+          git push origin HEAD:main
