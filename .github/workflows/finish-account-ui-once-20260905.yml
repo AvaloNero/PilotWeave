@@ -1,0 +1,715 @@
+name: One-shot account orchestration UI
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/finish-account-ui-once-20260905.yml
+
+permissions:
+  contents: write
+
+jobs:
+  implement-test-and-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            curl \
+            file \
+            libayatana-appindicator3-dev \
+            libdbus-1-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            pkg-config \
+            wget
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.88.0
+          components: rustfmt, clippy
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Add the account orchestration interface
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          from textwrap import dedent
+
+          index_path = Path("apps/desktop/web/index.html")
+          app_path = Path("apps/desktop/web/app.js")
+          styles_path = Path("apps/desktop/web/styles.css")
+          commands_path = Path("apps/desktop/src-tauri/src/commands.rs")
+          lib_path = Path("apps/desktop/src-tauri/src/lib.rs")
+
+          for path in [index_path, app_path, styles_path, commands_path, lib_path]:
+              if not path.exists():
+                  raise SystemExit(f"missing required source: {path}")
+
+          commands = commands_path.read_text()
+          lib = lib_path.read_text()
+          for symbol in ["get_account_status", "preview_login", "apply_login_plan"]:
+              if symbol not in commands or f"commands::{symbol}" not in lib:
+                  raise SystemExit(f"account backend command is not registered: {symbol}")
+
+          index = index_path.read_text()
+          if 'data-route="accounts"' not in index:
+              marker = '''          <button class="nav-item" data-route="resources">
+          '''
+              addition = '''          <button class="nav-item" data-route="accounts">
+            <span class="nav-icon">◎</span><span>Accounts</span>
+          </button>
+          '''
+              if marker not in index:
+                  raise SystemExit("could not locate account navigation insertion point")
+              index = index.replace(marker, addition + marker, 1)
+              index_path.write_text(index)
+
+          app = app_path.read_text()
+
+          def replace_once(old: str, new: str, label: str) -> None:
+              global app
+              count = app.count(old)
+              if count != 1:
+                  raise SystemExit(f"{label}: expected one match, found {count}")
+              app = app.replace(old, new, 1)
+
+          if "    accounts: {" not in app:
+              marker = '''    resources: {
+              title: "Resources",
+          '''
+              addition = '''    accounts: {
+              title: "Accounts",
+              subtitle: "Official sign-in orchestration without copying credentials.",
+              add: false,
+          },
+          '''
+              if marker not in app:
+                  raise SystemExit("could not locate account route insertion point")
+              app = app.replace(marker, addition + marker, 1)
+
+          if "let accountSnapshot = null;" not in app:
+              replace_once(
+                  "  let snapshot = null;\n",
+                  "  let snapshot = null;\n  let accountSnapshot = null;\n",
+                  "account snapshot state",
+              )
+
+          if "function createDemoAccountSnapshot()" not in app:
+              marker = "  function loadDemoState() {\n"
+              addition = dedent(
+                  '''
+                    function createDemoAccountSnapshot(detail = "Browser preview cannot inspect native client accounts") {
+                      const observedAt = nowIso();
+                      const surfaces = ["vsCodeCopilot", "copilotCli", "githubCopilotApp"].map(
+                        (surface) => ({
+                          surface,
+                          state: "unknown",
+                          identity: null,
+                          evidence: "Browser preview",
+                          detail,
+                          observedAt,
+                        }),
+                      );
+                      return {
+                        anchor: {
+                          state: "unknown",
+                          identity: null,
+                          evidence: "Browser preview",
+                          detail,
+                          observedAt,
+                        },
+                        surfaces,
+                        observedAt,
+                        loginRuns: [],
+                        historyRecovery: null,
+                      };
+                    }
+
+                  '''
+              )
+              if marker not in app:
+                  raise SystemExit("could not locate demo account insertion point")
+              app = app.replace(marker, addition + marker, 1)
+
+          if "const demoLoginPlans = new Map();" not in app:
+              replace_once(
+                  "  let demoState = loadDemoState();\n",
+                  "  let demoState = loadDemoState();\n  let demoAccountState = createDemoAccountSnapshot();\n  const demoLoginPlans = new Map();\n",
+                  "demo account state",
+              )
+
+          if 'case "get_account_status":' not in app:
+              marker = '''      case "upsert_connection": {
+          '''
+              addition = dedent(
+                  '''
+                        case "get_account_status":
+                          return structuredClone(demoAccountState);
+                        case "preview_login": {
+                          const requested = Array.isArray(args.surfaces) && args.surfaces.length
+                            ? [...new Set(args.surfaces)]
+                            : ["vsCodeCopilot", "copilotCli", "githubCopilotApp"];
+                          const createdAt = nowIso();
+                          const expiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString();
+                          const plan = {
+                            id: crypto.randomUUID(),
+                            targetIdentity: null,
+                            requestedSurfaces: requested,
+                            operations: requested.map((surface) => ({
+                              surface,
+                              title: `Sign in to ${loginSurfaceLabel(surface)}`,
+                              description:
+                                "Browser preview cannot launch native official sign-in flows",
+                              supported: false,
+                            })),
+                            createdAt,
+                            expiresAt,
+                          };
+                          demoLoginPlans.set(plan.id, plan);
+                          return structuredClone(plan);
+                        }
+                        case "apply_login_plan": {
+                          const plan = demoLoginPlans.get(args.planId);
+                          if (!plan) throw new Error("Sign-in plan is missing or was already consumed");
+                          demoLoginPlans.delete(plan.id);
+                          const finishedAt = nowIso();
+                          const run = {
+                            id: crypto.randomUUID(),
+                            planId: plan.id,
+                            targetIdentity: null,
+                            requestedSurfaces: plan.requestedSurfaces,
+                            status: "failed",
+                            steps: plan.requestedSurfaces.map((surface) => ({
+                              surface,
+                              status: "unsupported",
+                              detail: "Browser preview did not launch or modify a native client",
+                            })),
+                            summary: "No native sign-in flow is available in browser preview",
+                            startedAt: finishedAt,
+                            finishedAt,
+                          };
+                          demoAccountState.loginRuns.unshift(run);
+                          demoAccountState.loginRuns = demoAccountState.loginRuns.slice(0, 100);
+                          return {
+                            run: structuredClone(run),
+                            accountStatus: structuredClone(demoAccountState),
+                          };
+                        }
+                  '''
+              )
+              if marker not in app:
+                  raise SystemExit("could not locate browser mock insertion point")
+              app = app.replace(marker, addition + marker, 1)
+
+          if 'accountSnapshot = await invoke("get_account_status")' not in app:
+              replace_once(
+                  '''      snapshot = await invoke("get_dashboard");
+              setRuntimeState();
+          ''',
+                  '''      snapshot = await invoke("get_dashboard");
+              try {
+                accountSnapshot = await invoke("get_account_status");
+              } catch (error) {
+                accountSnapshot = createDemoAccountSnapshot(
+                  error?.message ?? String(error),
+                );
+                accountSnapshot.historyRecovery = error?.message ?? String(error);
+              }
+              setRuntimeState();
+          ''',
+                  "account refresh",
+              )
+
+          if "      accounts: renderAccounts," not in app:
+              replace_once(
+                  "      clients: renderClients,\n",
+                  "      clients: renderClients,\n      accounts: renderAccounts,\n",
+                  "account renderer registration",
+              )
+
+          if "function renderAccounts()" not in app:
+              marker = "  function renderResources() {\n"
+              addition = dedent(
+                  '''
+                    function accountStateLabel(state) {
+                      return {
+                        verified: "Verified",
+                        inferred: "Inferred",
+                        actionRequired: "Action required",
+                        unknown: "Unknown",
+                        unsupported: "Unsupported",
+                        notInstalled: "Not installed",
+                        conflict: "Conflict",
+                      }[state] ?? state ?? "Unknown";
+                    }
+
+                    function accountStateClass(state) {
+                      return {
+                        verified: "available",
+                        inferred: "read-only",
+                        actionRequired: "not-installed",
+                        unknown: "read-only",
+                        unsupported: "read-only",
+                        notInstalled: "not-installed",
+                        conflict: "failed",
+                      }[state] ?? "read-only";
+                    }
+
+                    function loginSurfaceLabel(surface) {
+                      return {
+                        vsCodeCopilot: "VS Code Copilot",
+                        copilotCli: "GitHub Copilot CLI",
+                        githubCopilotApp: "GitHub Copilot app",
+                      }[surface] ?? surface;
+                    }
+
+                    function loginRunStatusLabel(status) {
+                      return {
+                        inProgress: "In progress",
+                        actionRequired: "Action required",
+                        partial: "Partial",
+                        failed: "Failed",
+                        completed: "Completed",
+                        interrupted: "Interrupted",
+                      }[status] ?? status;
+                    }
+
+                    function loginRunStatusClass(status) {
+                      return {
+                        completed: "available",
+                        actionRequired: "not-installed",
+                        partial: "read-only",
+                        inProgress: "read-only",
+                        failed: "failed",
+                        interrupted: "failed",
+                      }[status] ?? "read-only";
+                    }
+
+                    function renderAccounts() {
+                      const status = accountSnapshot ?? createDemoAccountSnapshot(
+                        "Account status has not been loaded",
+                      );
+                      const anchor = status.anchor ?? {};
+                      const identity = anchor.identity;
+                      const launchable = (status.surfaces ?? []).some(
+                        (surface) =>
+                          surface.state !== "notInstalled" && surface.state !== "unsupported",
+                      );
+                      const recovery = status.historyRecovery
+                        ? `<div class="security-note"><div class="note-icon">⚠</div><div><strong>Sign-in history is read-only</strong><p>${escapeHtml(status.historyRecovery)}</p></div></div>`
+                        : "";
+                      const anchorTitle = identity
+                        ? `@${escapeHtml(identity.login)}`
+                        : "No verified GitHub account anchor";
+                      const anchorMeta = identity
+                        ? `${escapeHtml(identity.host)}${identity.userId ? ` · user ${escapeHtml(identity.userId)}` : ""}`
+                        : "PilotWeave does not manufacture an identity from private client stores.";
+                      const runs = status.loginRuns ?? [];
+                      return `
+                        ${recovery}
+                        <div class="account-hero">
+                          <div>
+                            <p class="eyebrow">OFFICIAL FLOWS ONLY</p>
+                            <h2>${anchorTitle}</h2>
+                            <p>${anchorMeta}</p>
+                            <div class="account-evidence">
+                              <span class="status-pill ${accountStateClass(anchor.state)}">${escapeHtml(accountStateLabel(anchor.state))}</span>
+                              <span>${escapeHtml(anchor.evidence ?? "No account evidence")}</span>
+                            </div>
+                            <p class="muted account-detail">${escapeHtml(anchor.detail ?? "Account status is unavailable")}</p>
+                          </div>
+                          <div class="account-actions">
+                            <button class="button primary" data-action="preview-login" ${launchable ? "" : "disabled"}>Sign in and sync</button>
+                            <button class="button ghost" data-action="refresh">Refresh status</button>
+                          </div>
+                        </div>
+                        <div class="security-note">
+                          <div class="note-icon">◆</div>
+                          <div>
+                            <strong>No authentication material is copied</strong>
+                            <p>PilotWeave launches backend-owned official client flows. It does not read VS Code SecretStorage, browser cookies, Copilot CLI OAuth tokens, or private Copilot app databases.</p>
+                          </div>
+                        </div>
+                        <div class="section-heading">
+                          <div><h2>Client accounts</h2><p class="section-copy">Verified, inferred, and unknown states remain distinct.</p></div>
+                        </div>
+                        <div class="account-grid">${(status.surfaces ?? []).map(accountSurfaceCard).join("")}</div>
+                        <div class="section-heading">
+                          <div><h2>Sign-in runs</h2><p class="section-copy">Local, secret-free orchestration history.</p></div>
+                        </div>
+                        ${runs.length ? `<div class="login-history">${runs.slice(0, 20).map(loginRunCard).join("")}</div>` : `<div class="empty-state compact"><div class="empty-icon">◎</div><h2>No sign-in runs yet</h2><p>Preview a reviewed plan before any official client is launched.</p></div>`}
+                      `;
+                    }
+
+                    function accountSurfaceCard(surface) {
+                      const identity = surface.identity
+                        ? `@${escapeHtml(surface.identity.login)}`
+                        : "Identity not verified";
+                      return `<article class="account-card">
+                        <div class="card-header">
+                          <div><p class="eyebrow">${escapeHtml(loginSurfaceLabel(surface.surface))}</p><h3>${identity}</h3></div>
+                          <span class="status-pill ${accountStateClass(surface.state)}">${escapeHtml(accountStateLabel(surface.state))}</span>
+                        </div>
+                        <p>${escapeHtml(surface.detail ?? "No detail")}</p>
+                        <div class="account-evidence"><span>Evidence</span><strong>${escapeHtml(surface.evidence ?? "Unavailable")}</strong></div>
+                        <small>${escapeHtml(formatDate(surface.observedAt))}</small>
+                      </article>`;
+                    }
+
+                    function loginRunCard(run) {
+                      const stepSummary = (run.steps ?? [])
+                        .map(
+                          (step) => `<li><strong>${escapeHtml(loginSurfaceLabel(step.surface))}</strong><span>${escapeHtml(accountStateLabel(step.status))}: ${escapeHtml(step.detail)}</span></li>`,
+                        )
+                        .join("");
+                      return `<article class="run-card">
+                        <div class="card-header">
+                          <div><h3>${escapeHtml(run.summary)}</h3><p>${escapeHtml(formatDate(run.startedAt))}</p></div>
+                          <span class="status-pill ${loginRunStatusClass(run.status)}">${escapeHtml(loginRunStatusLabel(run.status))}</span>
+                        </div>
+                        <ul>${stepSummary}</ul>
+                      </article>`;
+                    }
+
+                  '''
+              )
+              if marker not in app:
+                  raise SystemExit("could not locate account renderer insertion point")
+              app = app.replace(marker, addition + marker, 1)
+
+          if "function openLoginPlan()" not in app:
+              marker = "  function openConnectionForm(connection = null) {\n"
+              addition = dedent(
+                  '''
+                    function openLoginPlan() {
+                      const status = accountSnapshot ?? createDemoAccountSnapshot();
+                      const selectable = (status.surfaces ?? []).filter(
+                        (surface) =>
+                          surface.state !== "notInstalled" && surface.state !== "unsupported",
+                      );
+                      openModal({
+                        title: "Sign in and sync",
+                        wide: true,
+                        body: `
+                          <div class="security-note">
+                            <div class="note-icon">◆</div>
+                            <div><strong>Reviewed official launch plan</strong><p>Select installed surfaces. The backend owns executable paths and arguments; the UI submits only a one-shot plan ID.</p></div>
+                          </div>
+                          <div class="target-list">
+                            ${(status.surfaces ?? [])
+                              .map(
+                                (surface) => `<div class="target-option">
+                                  <input id="login-${escapeHtml(surface.surface)}" type="checkbox" name="login-surface" value="${escapeHtml(surface.surface)}" ${selectable.includes(surface) ? "checked" : "disabled"} />
+                                  <label for="login-${escapeHtml(surface.surface)}"><strong>${escapeHtml(loginSurfaceLabel(surface.surface))}</strong><small>${escapeHtml(accountStateLabel(surface.state))} · ${escapeHtml(surface.detail)}</small></label>
+                                  <span class="status-pill ${accountStateClass(surface.state)}">${escapeHtml(accountStateLabel(surface.state))}</span>
+                                </div>`,
+                              )
+                              .join("")}
+                          </div>
+                          <hr class="preview-separator" />
+                          <div id="login-preview"><p class="muted" style="font-size:11px">No client will be launched until a reviewed plan is applied.</p></div>`,
+                        footer: `<button class="button ghost" data-modal-close>Cancel</button><button class="button primary" id="preview-login-plan">Preview official flows</button>`,
+                        onOpen(root) {
+                          root.querySelectorAll("[data-modal-close]").forEach((button) =>
+                            button.addEventListener("click", closeModal),
+                          );
+                          const actionButton = root.querySelector("#preview-login-plan");
+                          let plan = null;
+                          actionButton.addEventListener("click", async () => {
+                            try {
+                              if (!plan) {
+                                const surfaces = Array.from(
+                                  root.querySelectorAll('input[name="login-surface"]:checked'),
+                                ).map((input) => input.value);
+                                if (!surfaces.length) {
+                                  showToast("Select at least one installed client", "error");
+                                  return;
+                                }
+                                plan = await invoke("preview_login", { surfaces });
+                                const supported = plan.operations.some((operation) => operation.supported);
+                                root.querySelector("#login-preview").innerHTML = `
+                                  <div class="plan-meta"><span>Plan expires ${escapeHtml(formatDate(plan.expiresAt))}</span>${plan.targetIdentity ? `<span>Anchor @${escapeHtml(plan.targetIdentity.login)}</span>` : `<span>No verified target anchor</span>`}</div>
+                                  <div class="operation-list">${plan.operations.map(loginOperationCard).join("")}</div>`;
+                                actionButton.textContent = supported
+                                  ? "Launch official sign-in flows"
+                                  : "No native flow available";
+                                actionButton.disabled = !supported;
+                              } else {
+                                actionButton.disabled = true;
+                                const result = await invoke("apply_login_plan", {
+                                  planId: plan.id,
+                                });
+                                accountSnapshot = result.accountStatus;
+                                closeModal();
+                                const failed = ["failed", "partial"].includes(result.run.status);
+                                showToast(result.run.summary, failed ? "error" : "success");
+                                render();
+                              }
+                            } catch (error) {
+                              actionButton.disabled = false;
+                              showToast(error?.message ?? String(error), "error");
+                            }
+                          });
+                        },
+                      });
+                    }
+
+                    function loginOperationCard(operation) {
+                      return `<article class="operation-card">
+                        <div class="card-header"><div><strong>${escapeHtml(operation.title)}</strong><p>${escapeHtml(operation.description)}</p></div><span class="status-pill ${operation.supported ? "available" : "read-only"}">${operation.supported ? "Will launch" : "Unavailable"}</span></div>
+                        <ul><li>Surface: ${escapeHtml(loginSurfaceLabel(operation.surface))}</li><li>No credential values are read, copied, or returned to this UI.</li></ul>
+                      </article>`;
+                    }
+
+                  '''
+              )
+              if marker not in app:
+                  raise SystemExit("could not locate login modal insertion point")
+              app = app.replace(marker, addition + marker, 1)
+
+          if 'case "preview-login":' not in app:
+              marker = '''      case "add-connection":
+              openConnectionForm();
+              break;
+          '''
+              addition = '''      case "preview-login":
+              openLoginPlan();
+              break;
+          '''
+              if marker not in app:
+                  raise SystemExit("could not locate account action insertion point")
+              app = app.replace(marker, addition + marker, 1)
+
+          app_path.write_text(app)
+
+          styles = styles_path.read_text()
+          if "/* Account orchestration */" not in styles:
+              styles += dedent(
+                  '''
+
+                    /* Account orchestration */
+                    .account-hero {
+                      display: flex;
+                      align-items: flex-start;
+                      justify-content: space-between;
+                      gap: 28px;
+                      padding: 28px;
+                      margin-bottom: 18px;
+                      border: 1px solid var(--border);
+                      border-radius: 18px;
+                      background: linear-gradient(145deg, rgba(124, 140, 255, 0.12), rgba(16, 19, 27, 0.94));
+                    }
+
+                    .account-hero h2 {
+                      margin: 4px 0 8px;
+                      font-size: 25px;
+                    }
+
+                    .account-hero > div:first-child > p:not(.eyebrow):not(.account-detail) {
+                      margin: 0;
+                      color: var(--muted);
+                    }
+
+                    .account-actions {
+                      display: flex;
+                      flex-wrap: wrap;
+                      justify-content: flex-end;
+                      gap: 9px;
+                    }
+
+                    .account-detail {
+                      max-width: 760px;
+                      margin: 14px 0 0;
+                      line-height: 1.65;
+                    }
+
+                    .account-grid {
+                      display: grid;
+                      grid-template-columns: repeat(auto-fit, minmax(270px, 1fr));
+                      gap: 14px;
+                    }
+
+                    .account-card,
+                    .run-card {
+                      padding: 20px;
+                      border: 1px solid var(--border);
+                      border-radius: 15px;
+                      background: var(--panel);
+                    }
+
+                    .account-card h3,
+                    .run-card h3 {
+                      margin: 4px 0 0;
+                    }
+
+                    .account-card > p {
+                      min-height: 50px;
+                      color: var(--muted);
+                      line-height: 1.55;
+                    }
+
+                    .account-card > small {
+                      display: block;
+                      margin-top: 13px;
+                      color: var(--subtle);
+                    }
+
+                    .account-evidence {
+                      display: flex;
+                      align-items: center;
+                      flex-wrap: wrap;
+                      gap: 9px;
+                      color: var(--muted);
+                      font-size: 11px;
+                    }
+
+                    .account-card .account-evidence {
+                      align-items: flex-start;
+                      justify-content: space-between;
+                      padding-top: 12px;
+                      border-top: 1px solid var(--border-soft);
+                    }
+
+                    .account-card .account-evidence strong {
+                      max-width: 68%;
+                      color: var(--text);
+                      text-align: right;
+                      overflow-wrap: anywhere;
+                    }
+
+                    .login-history {
+                      display: grid;
+                      gap: 11px;
+                    }
+
+                    .run-card ul {
+                      display: grid;
+                      gap: 8px;
+                      margin: 15px 0 0;
+                      padding: 0;
+                      list-style: none;
+                    }
+
+                    .run-card li {
+                      display: grid;
+                      grid-template-columns: minmax(150px, 0.35fr) 1fr;
+                      gap: 14px;
+                      padding-top: 8px;
+                      border-top: 1px solid var(--border-soft);
+                      color: var(--muted);
+                      font-size: 11px;
+                    }
+
+                    .run-card li strong {
+                      color: var(--text);
+                    }
+
+                    .plan-meta {
+                      display: flex;
+                      justify-content: space-between;
+                      gap: 12px;
+                      margin-bottom: 12px;
+                      color: var(--subtle);
+                      font-size: 10px;
+                    }
+
+                    .empty-state.compact {
+                      min-height: 230px;
+                      padding: 28px;
+                    }
+
+                    @media (max-width: 980px) {
+                      .account-hero {
+                        flex-direction: column;
+                      }
+
+                      .account-actions {
+                        justify-content: flex-start;
+                      }
+                    }
+                  '''
+              )
+              styles_path.write_text(styles)
+
+          docs_path = Path("docs/account-orchestration.md")
+          docs_path.write_text(
+              dedent(
+                  '''
+                    # Account orchestration
+
+                    PilotWeave's **Sign in and sync** flow coordinates official client sign-in surfaces. It does not copy authentication material between applications.
+
+                    ## Account evidence
+
+                    - A successful `gh api user --hostname github.com` response is a verified GitHub account anchor.
+                    - Copilot CLI may be shown as inferred from that anchor only when no known authentication override environment variable is present. The UI keeps inferred and verified states distinct.
+                    - VS Code Copilot and the GitHub Copilot app remain action-required until the user confirms the account inside the official client UI. PilotWeave does not inspect their private credential stores.
+                    - Missing, inaccessible, conflicting, and unsupported states are never converted to a successful or empty account.
+
+                    ## Apply contract
+
+                    1. The frontend requests a preview for a bounded set of known surfaces.
+                    2. The backend resolves allowlisted native launchers and arguments, fingerprints the executable, and stores a 15-minute one-shot plan in memory.
+                    3. Apply accepts only the backend-generated plan ID and rejects stale account or executable state.
+                    4. The backend launches only official flows and writes a bounded, secret-free local run record.
+                    5. A restart during an in-progress run records the run as interrupted rather than completed.
+
+                    ## Data deliberately not read
+
+                    PilotWeave does not read VS Code SecretStorage, browser cookies or databases, Copilot CLI OAuth/refresh tokens, private Copilot app authentication databases, passwords, passkeys, device secrets, session cookies, or provider authorization headers.
+
+                    The current verified anchor uses the user's existing GitHub CLI authorization. A separate least-privilege PilotWeave GitHub authorization remains required before personal Billing synchronization is implemented.
+                  '''
+              ).lstrip()
+          )
+          PY
+
+      - name: Install JavaScript dependencies
+        run: npm ci
+
+      - name: Normalize and validate
+        run: |
+          cargo fmt --all
+          cargo clippy --fix --workspace --all-targets --allow-dirty --allow-staged
+          cargo fmt --all
+          npm run check:web
+          cargo fmt --all -- --check
+          cargo test --workspace
+          cargo clippy --workspace --all-targets -- -D warnings
+          git diff --check
+
+      - name: Remove one-shot workflows and commit
+        shell: bash
+        run: |
+          rm -f .github/workflows/account-hardening-once.yml
+          rm -f .github/workflows/stabilize-account-backend-once.yml
+          rm -f .github/workflows/finish-account-ui-once-20260905.yml
+          git diff --check
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git commit -m "feat: complete reviewed account sign-in interface"
+          git push origin HEAD:main
