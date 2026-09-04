@@ -433,10 +433,7 @@ mod tests {
         .expect("write state");
 
         let store = StateStore::open_at(path);
-        assert!(store
-            .recovery()
-            .expect("recovery")
-            .contains("loopback"));
+        assert!(store.recovery().expect("recovery").contains("loopback"));
     }
 
     #[test]
