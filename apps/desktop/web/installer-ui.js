@@ -403,12 +403,13 @@
       showToast("Installation run completed");
       markChanged();
     } catch (error) {
-      showToast(error?.message ?? String(error), "error");
-      if (confirm) {
-        confirm.disabled = false;
-        confirm.textContent = "Install and verify";
-      }
-    }
+    closeModal();
+    showToast(
+      `${error?.message ?? String(error)} Generate a new preview before retrying.`,
+      "error",
+    );
+  }
+
   }
 
   function showResultModal(result) {

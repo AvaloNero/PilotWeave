@@ -152,7 +152,7 @@
         </div>
         <div class="account-panel-actions">
           <button class="button ghost small" data-account-action="refresh" ${loading ? "disabled" : ""}>${loading ? "Checking…" : "Refresh accounts"}</button>
-          <button class="button primary small" data-account-action="preview" ${loading || selectable.length === 0 ? "disabled" : ""}>Sign in and sync${selectable.length ? ` (${selectable.length})` : ""}</button>
+          <button class="button primary small" data-account-action="preview" ${loading || selectable.length === 0 || status?.historyRecovery ? "disabled" : ""}>Sign in and sync${selectable.length ? ` (${selectable.length})` : ""}</button>
         </div>
       </div>
       ${status?.historyRecovery ? renderRecovery(status.historyRecovery) : ""}
@@ -359,6 +359,13 @@
 
   async function previewLogin() {
     if (loading || !accountStatus) return;
+    if (accountStatus.historyRecovery) {
+      showToast(
+        "Resolve the read-only sign-in history before starting a new run",
+        "error",
+      );
+      return;
+    }
     const surfaces = Array.from(
       content.querySelectorAll('input[name="account-surface"]:checked'),
     ).map((input) => input.value);
@@ -455,18 +462,20 @@
     }
     try {
       const result = await invoke("apply_login_plan", { planId: plan.id });
+      validateStatus(result.accountStatus);
       currentPlan = null;
       accountStatus = result.accountStatus;
       showResultModal(result.run);
       showToast("Official sign-in launch completed");
       markChanged();
     } catch (error) {
-      showToast(error?.message ?? String(error), "error");
-      if (confirm) {
-        confirm.disabled = false;
-        confirm.textContent = "Open official sign-in flows";
-      }
-    }
+    closeModal();
+    showToast(
+      `${error?.message ?? String(error)} Generate a new preview before retrying.`,
+      "error",
+    );
+  }
+
   }
 
   function showResultModal(run) {
