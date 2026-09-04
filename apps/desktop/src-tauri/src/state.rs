@@ -3,6 +3,7 @@ use crate::domain::{
 };
 use crate::error::{AppError, AppResult};
 use crate::secrets;
+use crate::validation;
 use chrono::Utc;
 use std::fs;
 use std::io::Write;
@@ -52,9 +53,14 @@ impl StateStore {
                 state.version
             )));
         }
+        validation::validate_persisted_identities(&state)?;
         state.version = STATE_VERSION;
         for connection in &mut state.connections {
             connection.normalize();
+            validation::validate_connection(connection)?;
+        }
+        validation::validate_persistent_state(&state)?;
+        for connection in &mut state.connections {
             connection.has_secret = secrets::exists(&connection.secret_ref);
         }
         Ok((state, None))
@@ -102,6 +108,8 @@ impl StateStore {
 
     pub fn upsert_connection(&mut self, input: ConnectionInput) -> AppResult<Connection> {
         self.ensure_writable()?;
+        validation::validate_api_key(input.api_key.as_deref())?;
+
         let now = Utc::now();
         let requested_id = input
             .id
@@ -116,6 +124,19 @@ impl StateStore {
                 .find(|connection| connection.id == id)
                 .cloned()
         });
+        if let Some(id) = requested_id.as_deref() {
+            if existing.is_none() {
+                return Err(AppError::InvalidInput(format!(
+                    "Cannot update an unknown connection id: {id}"
+                )));
+            }
+        }
+        if existing.is_none() && self.state.connections.len() >= validation::MAX_CONNECTIONS {
+            return Err(AppError::InvalidInput(format!(
+                "PilotWeave supports at most {} connections",
+                validation::MAX_CONNECTIONS
+            )));
+        }
 
         let id = requested_id.unwrap_or_else(|| Uuid::new_v4().to_string());
         let secret_ref = existing
@@ -141,7 +162,25 @@ impl StateStore {
             updated_at: now,
         };
         connection.normalize();
-        connection.validate()?;
+        validation::validate_connection(&connection)?;
+
+        let mut next_state = self.state.clone();
+        if let Some(index) = next_state
+            .connections
+            .iter()
+            .position(|candidate| candidate.id == connection.id)
+        {
+            next_state.connections[index] = connection.clone();
+        } else {
+            next_state.connections.push(connection.clone());
+        }
+        next_state.connections.sort_by(|left, right| {
+            left.name
+                .to_ascii_lowercase()
+                .cmp(&right.name.to_ascii_lowercase())
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        validation::validate_persistent_state(&next_state)?;
 
         let old_secret = secrets::get(&connection.secret_ref)?;
         let new_secret = input
@@ -155,25 +194,15 @@ impl StateStore {
             secrets::set(&connection.secret_ref, value)?;
         }
         connection.has_secret = secrets::exists(&connection.secret_ref);
-
-        let old_state = self.state.clone();
-        if let Some(index) = self
-            .state
+        if let Some(index) = next_state
             .connections
             .iter()
             .position(|candidate| candidate.id == connection.id)
         {
-            self.state.connections[index] = connection.clone();
-        } else {
-            self.state.connections.push(connection.clone());
+            next_state.connections[index].has_secret = connection.has_secret;
         }
-        self.state.connections.sort_by(|left, right| {
-            left.name
-                .to_ascii_lowercase()
-                .cmp(&right.name.to_ascii_lowercase())
-                .then_with(|| left.id.cmp(&right.id))
-        });
 
+        let old_state = std::mem::replace(&mut self.state, next_state);
         if let Err(error) = self.persist() {
             self.state = old_state;
             let rollback = match old_secret {
@@ -200,12 +229,15 @@ impl StateStore {
             .position(|connection| connection.id == id)
             .ok_or_else(|| AppError::InvalidInput(format!("Unknown connection: {id}")))?;
         let connection = self.state.connections[index].clone();
-        let old_state = self.state.clone();
+        let mut next_state = self.state.clone();
 
-        self.state.connections.remove(index);
-        self.state
+        next_state.connections.remove(index);
+        next_state
             .deployments
             .retain(|record| record.connection_id != id);
+        validation::validate_persistent_state(&next_state)?;
+
+        let old_state = std::mem::replace(&mut self.state, next_state);
         if let Err(error) = self.persist() {
             self.state = old_state;
             return Err(error);
@@ -216,12 +248,20 @@ impl StateStore {
 
     pub fn record_deployments(&mut self, records: Vec<DeploymentRecord>) -> AppResult<()> {
         self.ensure_writable()?;
-        self.state.deployments.extend(records);
-        self.state
+        let mut next_state = self.state.clone();
+        next_state.deployments.extend(records);
+        next_state
             .deployments
             .sort_by_key(|record| std::cmp::Reverse(record.created_at));
-        self.state.deployments.truncate(MAX_DEPLOYMENT_RECORDS);
-        self.persist()
+        next_state.deployments.truncate(MAX_DEPLOYMENT_RECORDS);
+        validation::validate_persistent_state(&next_state)?;
+
+        let old_state = std::mem::replace(&mut self.state, next_state);
+        if let Err(error) = self.persist() {
+            self.state = old_state;
+            return Err(error);
+        }
+        Ok(())
     }
 
     fn persist(&self) -> AppResult<()> {
@@ -358,5 +398,71 @@ mod tests {
 
         let store = StateStore::open_at(path);
         assert!(store.recovery().expect("recovery reason").contains("newer"));
+    }
+
+    #[test]
+    fn semantically_invalid_state_enters_recovery() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let path = directory.path().join("state.json");
+        fs::write(
+            &path,
+            r#"{
+              "version": 1,
+              "connections": [{
+                "id": "one",
+                "name": "One",
+                "baseUrl": "http://example.com/v1",
+                "providerKind": "openai",
+                "protocol": "chat-completions",
+                "headers": {},
+                "models": [{
+                  "id": "model",
+                  "modelId": "vendor/model",
+                  "name": "Model",
+                  "enabled": true,
+                  "capabilities": {}
+                }],
+                "secretRef": "connection:one",
+                "hasSecret": false,
+                "createdAt": "2026-01-01T00:00:00Z",
+                "updatedAt": "2026-01-01T00:00:00Z"
+              }],
+              "deployments": []
+            }"#,
+        )
+        .expect("write state");
+
+        let store = StateStore::open_at(path);
+        assert!(store
+            .recovery()
+            .expect("recovery")
+            .contains("loopback"));
+    }
+
+    #[test]
+    fn update_cannot_inject_an_unknown_connection_id() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let mut store = StateStore::open_at(directory.path().join("state.json"));
+        let input = ConnectionInput {
+            id: Some("attacker-controlled".to_string()),
+            name: "Blocked".to_string(),
+            base_url: "https://example.invalid/v1".to_string(),
+            provider_kind: crate::domain::ProviderKind::Openai,
+            protocol: crate::domain::ApiProtocol::ChatCompletions,
+            headers: Default::default(),
+            models: vec![ModelSpec {
+                id: "m".to_string(),
+                model_id: "m".to_string(),
+                name: "m".to_string(),
+                enabled: true,
+                capabilities: Default::default(),
+            }],
+            api_key: None,
+            clear_secret: false,
+        };
+        let error = store
+            .upsert_connection(input)
+            .expect_err("unknown update id must fail before keyring access");
+        assert!(matches!(error, AppError::InvalidInput(_)));
     }
 }
