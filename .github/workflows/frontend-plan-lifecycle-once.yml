@@ -42,82 +42,60 @@ jobs:
           )
           account = replace_once(
               account,
-              '''  async function previewLogin() {
-              if (loading || !accountStatus) return;
-          ''',
-              '''  async function previewLogin() {
-              if (loading || !accountStatus) return;
-              if (accountStatus.historyRecovery) {
-                showToast("Resolve the read-only sign-in history before starting a new run", "error");
-                return;
-              }
-          ''',
+              '  async function previewLogin() {\n    if (loading || !accountStatus) return;\n',
+              '  async function previewLogin() {\n    if (loading || !accountStatus) return;\n    if (accountStatus.historyRecovery) {\n      showToast(\n        "Resolve the read-only sign-in history before starting a new run",\n        "error",\n      );\n      return;\n    }\n',
               "read-only history command guard",
           )
           account = replace_once(
               account,
-              '''      const result = await invoke("apply_login_plan", { planId: plan.id });
-              currentPlan = null;
-              accountStatus = result.accountStatus;
-          ''',
-              '''      const result = await invoke("apply_login_plan", { planId: plan.id });
-              validateStatus(result.accountStatus);
-              currentPlan = null;
-              accountStatus = result.accountStatus;
-          ''',
+              '      const result = await invoke("apply_login_plan", { planId: plan.id });\n      currentPlan = null;\n',
+              '      const result = await invoke("apply_login_plan", { planId: plan.id });\n      validateStatus(result.accountStatus);\n      currentPlan = null;\n',
               "apply response validation",
           )
-          account = replace_once(
-              account,
-              '''    } catch (error) {
-              showToast(error?.message ?? String(error), "error");
-              if (confirm) {
-                confirm.disabled = false;
-                confirm.textContent = "Open official sign-in flows";
-              }
-            }
-          }
 
-          function showResultModal(run)''',
-              '''    } catch (error) {
+          account_apply_start = account.index("  async function applyPlan(plan) {")
+          account_catch_start = account.index("    } catch (error) {", account_apply_start)
+          account_catch_end = account.index(
+              "  }\n\n  function showResultModal(run)", account_catch_start
+          )
+          account_catch = '''    } catch (error) {
               closeModal();
               showToast(
                 `${error?.message ?? String(error)} Generate a new preview before retrying.`,
                 "error",
               );
             }
-          }
-
-          function showResultModal(run)''',
-              "account consumed-plan retry guard",
+          
+          '''
+          account = (
+              account[:account_catch_start]
+              + account_catch
+              + account[account_catch_end:]
           )
           account_path.write_text(account)
 
           installer_path = Path("apps/desktop/web/installer-ui.js")
           installer = installer_path.read_text()
-          installer = replace_once(
-              installer,
-              '''    } catch (error) {
-              showToast(error?.message ?? String(error), "error");
-              if (confirm) {
-                confirm.disabled = false;
-                confirm.textContent = "Install and verify";
-              }
-            }
-          }
-
-          function showResultModal(result)''',
-              '''    } catch (error) {
+          installer_apply_start = installer.index("  async function applyPlan(plan) {")
+          installer_catch_start = installer.index(
+              "    } catch (error) {", installer_apply_start
+          )
+          installer_catch_end = installer.index(
+              "  }\n\n  function showResultModal(result)", installer_catch_start
+          )
+          installer_catch = '''    } catch (error) {
               closeModal();
               showToast(
                 `${error?.message ?? String(error)} Generate a new preview before retrying.`,
                 "error",
               );
             }
-          }
-
-          function showResultModal(result)''',
-              "installer consumed-plan retry guard",
+          
+          '''
+          installer = (
+              installer[:installer_catch_start]
+              + installer_catch
+              + installer[installer_catch_end:]
           )
           installer_path.write_text(installer)
           PY
