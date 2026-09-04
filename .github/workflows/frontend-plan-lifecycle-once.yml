@@ -1,0 +1,136 @@
+name: One-shot frontend plan lifecycle hardening
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/frontend-plan-lifecycle-once.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch-check-and-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Harden consumed-plan handling
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace_once(text: str, old: str, new: str, label: str) -> str:
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{label}: expected one match, found {count}")
+              return text.replace(old, new, 1)
+
+          account_path = Path("apps/desktop/web/account-ui.js")
+          account = account_path.read_text()
+          account = replace_once(
+              account,
+              '${loading || selectable.length === 0 ? "disabled" : ""}>Sign in and sync',
+              '${loading || selectable.length === 0 || status?.historyRecovery ? "disabled" : ""}>Sign in and sync',
+              "read-only history button guard",
+          )
+          account = replace_once(
+              account,
+              '''  async function previewLogin() {
+              if (loading || !accountStatus) return;
+          ''',
+              '''  async function previewLogin() {
+              if (loading || !accountStatus) return;
+              if (accountStatus.historyRecovery) {
+                showToast("Resolve the read-only sign-in history before starting a new run", "error");
+                return;
+              }
+          ''',
+              "read-only history command guard",
+          )
+          account = replace_once(
+              account,
+              '''      const result = await invoke("apply_login_plan", { planId: plan.id });
+              currentPlan = null;
+              accountStatus = result.accountStatus;
+          ''',
+              '''      const result = await invoke("apply_login_plan", { planId: plan.id });
+              validateStatus(result.accountStatus);
+              currentPlan = null;
+              accountStatus = result.accountStatus;
+          ''',
+              "apply response validation",
+          )
+          account = replace_once(
+              account,
+              '''    } catch (error) {
+              showToast(error?.message ?? String(error), "error");
+              if (confirm) {
+                confirm.disabled = false;
+                confirm.textContent = "Open official sign-in flows";
+              }
+            }
+          }
+
+          function showResultModal(run)''',
+              '''    } catch (error) {
+              closeModal();
+              showToast(
+                `${error?.message ?? String(error)} Generate a new preview before retrying.`,
+                "error",
+              );
+            }
+          }
+
+          function showResultModal(run)''',
+              "account consumed-plan retry guard",
+          )
+          account_path.write_text(account)
+
+          installer_path = Path("apps/desktop/web/installer-ui.js")
+          installer = installer_path.read_text()
+          installer = replace_once(
+              installer,
+              '''    } catch (error) {
+              showToast(error?.message ?? String(error), "error");
+              if (confirm) {
+                confirm.disabled = false;
+                confirm.textContent = "Install and verify";
+              }
+            }
+          }
+
+          function showResultModal(result)''',
+              '''    } catch (error) {
+              closeModal();
+              showToast(
+                `${error?.message ?? String(error)} Generate a new preview before retrying.`,
+                "error",
+              );
+            }
+          }
+
+          function showResultModal(result)''',
+              "installer consumed-plan retry guard",
+          )
+          installer_path.write_text(installer)
+          PY
+
+      - name: Validate browser application syntax
+        run: npm run check:web
+
+      - name: Remove one-shot workflow and commit
+        shell: bash
+        run: |
+          rm .github/workflows/frontend-plan-lifecycle-once.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "fix: require fresh previews after consumed plan failures"
+          git push origin HEAD:main
