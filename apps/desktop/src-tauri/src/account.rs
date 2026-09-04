@@ -278,13 +278,7 @@ impl LoginPlanStore {
     }
 
     pub fn consume(&mut self, plan_id: &str) -> AppResult<StoredLoginPlan> {
-        self.purge_expired();
-        let stored = self.plans.remove(plan_id).ok_or_else(|| {
-            AppError::InvalidInput(
-                "Sign-in plan is missing, expired, or was already consumed; preview again"
-                    .to_string(),
-            )
-        })?;
+        let stored = self.take(plan_id)?;
         if stored.plan.expires_at < Utc::now() {
             return Err(AppError::InvalidInput(
                 "Sign-in plan expired; preview again".to_string(),
@@ -306,6 +300,16 @@ impl LoginPlanStore {
             }
         }
         Ok(stored)
+    }
+
+    fn take(&mut self, plan_id: &str) -> AppResult<StoredLoginPlan> {
+        self.purge_expired();
+        self.plans.remove(plan_id).ok_or_else(|| {
+            AppError::InvalidInput(
+                "Sign-in plan is missing, expired, or was already consumed; preview again"
+                    .to_string(),
+            )
+        })
     }
 
     fn purge_expired(&mut self) {
@@ -399,6 +403,7 @@ impl LoginStore {
 
     pub fn begin_run(&mut self, plan: &LoginPlan) -> AppResult<LoginRunRecord> {
         self.ensure_writable()?;
+        let previous = self.state.clone();
         let run = LoginRunRecord {
             id: Uuid::new_v4().to_string(),
             plan_id: plan.id.clone(),
@@ -421,7 +426,7 @@ impl LoginStore {
         self.state.runs.insert(0, run.clone());
         self.state.runs.truncate(MAX_LOGIN_RUNS);
         if let Err(error) = self.persist() {
-            self.state.runs.retain(|item| item.id != run.id);
+            self.state = previous;
             return Err(error);
         }
         Ok(run)
@@ -865,7 +870,7 @@ fn account_fingerprint(status: &AccountStatusSnapshot) -> String {
     status.anchor.state.hash(&mut hasher);
     status.anchor.identity.hash(&mut hasher);
     for surface in &status.surfaces {
-        surface.surface.hash(&mut hasher);
+        surface.surface.as_str().hash(&mut hasher);
         surface.state.hash(&mut hasher);
         surface.identity.hash(&mut hasher);
         surface.evidence.hash(&mut hasher);
@@ -916,6 +921,8 @@ fn find_vscode_executable() -> Option<PathBuf> {
     {
         native_process::resolve_on_path(&["code", "code-insiders"]).or_else(|| {
             native_process::resolve_candidates([
+                "/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code",
+                "/Applications/Visual Studio Code - Insiders.app/Contents/Resources/app/bin/code-insiders",
                 "/Applications/Visual Studio Code.app/Contents/MacOS/Electron",
                 "/Applications/Visual Studio Code - Insiders.app/Contents/MacOS/Electron",
             ])
@@ -973,6 +980,9 @@ fn valid_login(value: &str) -> bool {
 }
 
 fn validate_avatar_url(value: String) -> Option<String> {
+    if value.len() > MAX_ACCOUNT_TEXT_BYTES {
+        return None;
+    }
     let url = Url::parse(&value).ok()?;
     (url.scheme() == "https" && url.host_str().is_some()).then_some(value)
 }
@@ -982,7 +992,11 @@ fn bounded_detail(value: &str) -> String {
     if value.len() <= MAX_ACCOUNT_TEXT_BYTES {
         value
     } else {
-        format!("{}…", &value[..MAX_ACCOUNT_TEXT_BYTES])
+        let mut end = MAX_ACCOUNT_TEXT_BYTES.min(value.len());
+        while !value.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}…", &value[..end])
     }
 }
 
@@ -1099,13 +1113,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn login_plans_are_one_shot() {
+    fn login_plans_are_one_shot_without_live_discovery() {
         let mut store = LoginPlanStore::default();
-        let plan = store
-            .preview(vec![LoginSurface::GithubCopilotApp])
-            .expect("preview");
-        let _ = store.consume(&plan.id).expect("consume");
-        assert!(store.consume(&plan.id).is_err());
+        let now = Utc::now();
+        let plan = LoginPlan {
+            id: "one-shot".to_string(),
+            target_identity: None,
+            requested_surfaces: vec![LoginSurface::GithubCopilotApp],
+            operations: Vec::new(),
+            created_at: now,
+            expires_at: now + ChronoDuration::minutes(15),
+        };
+        store.plans.insert(
+            plan.id.clone(),
+            StoredLoginPlan {
+                plan: plan.clone(),
+                account_fingerprint: "test".to_string(),
+                executables: BTreeMap::new(),
+            },
+        );
+        let _ = store.take(&plan.id).expect("consume");
+        assert!(store.take(&plan.id).is_err());
     }
 
     #[test]
@@ -1115,6 +1143,14 @@ mod tests {
         assert!(values.contains(&LoginSurface::VsCodeCopilot));
         assert!(values.contains(&LoginSurface::CopilotCli));
         assert!(values.contains(&LoginSurface::GithubCopilotApp));
+    }
+
+    #[test]
+    fn bounded_detail_never_splits_utf8() {
+        let value = "🙂".repeat(MAX_ACCOUNT_TEXT_BYTES);
+        let detail = bounded_detail(&value);
+        assert!(detail.ends_with('…'));
+        assert!(detail.is_char_boundary(detail.len()));
     }
 
     #[test]
