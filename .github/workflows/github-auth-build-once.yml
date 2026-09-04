@@ -1,0 +1,59 @@
+name: One-shot GitHub authorization validation
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/github-auth-build-once.yml
+
+permissions:
+  contents: write
+
+jobs:
+  format-test-and-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            curl \
+            file \
+            libayatana-appindicator3-dev \
+            libdbus-1-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            pkg-config \
+            wget
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.88.0
+          components: rustfmt, clippy
+
+      - name: Format and validate
+        run: |
+          cargo fmt --all
+          cargo test --workspace
+          cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Remove workflow and commit
+        shell: bash
+        run: |
+          rm .github/workflows/github-auth-build-once.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "feat: complete separate GitHub authorization core"
+          git push origin HEAD:main
