@@ -1,0 +1,38 @@
+name: One-shot temporary branch cleanup
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/cleanup-temp-branch-once.yml
+
+permissions:
+  contents: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Delete accidental branch
+        shell: bash
+        run: |
+          if git ls-remote --exit-code --heads origin refs/heads/__temp_do_not_use >/dev/null 2>&1; then
+            git push origin --delete __temp_do_not_use
+          fi
+
+      - name: Remove one-shot workflow and commit
+        shell: bash
+        run: |
+          rm .github/workflows/cleanup-temp-branch-once.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "chore: finish temporary branch cleanup"
+          git push origin HEAD:main
