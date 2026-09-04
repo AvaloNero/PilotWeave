@@ -64,7 +64,10 @@ pub fn validate_connection(connection: &Connection) -> AppResult<()> {
         validate_required_text("Model display name", &model.name, MAX_MODEL_NAME_BYTES)?;
         for (name, value) in [
             ("Model context window", model.capabilities.context_window),
-            ("Model maximum output tokens", model.capabilities.max_output_tokens),
+            (
+                "Model maximum output tokens",
+                model.capabilities.max_output_tokens,
+            ),
         ] {
             if let Some(value) = value {
                 if value == 0 || value > MAX_TOKEN_LIMIT {
@@ -96,8 +99,7 @@ pub fn validate_connection(connection: &Connection) -> AppResult<()> {
                 "Duplicate header name ignoring case: {name}"
             )));
         }
-        if AUTHENTICATION_HEADERS.contains(&canonical_name.as_str())
-            && !value.contains("${apiKey}")
+        if AUTHENTICATION_HEADERS.contains(&canonical_name.as_str()) && !value.contains("${apiKey}")
         {
             return Err(AppError::InvalidInput(format!(
                 "Authentication header {name} must use the ${{apiKey}} placeholder instead of a persisted literal credential"
@@ -149,7 +151,11 @@ pub fn validate_persisted_identities(state: &PersistentState) -> AppResult<()> {
         )));
     }
     for connection in &state.connections {
-        validate_required_text("Persisted connection id", &connection.id, MAX_CONNECTION_ID_BYTES)?;
+        validate_required_text(
+            "Persisted connection id",
+            &connection.id,
+            MAX_CONNECTION_ID_BYTES,
+        )?;
         validate_required_text(
             "Persisted credential reference",
             &connection.secret_ref,
@@ -215,13 +221,21 @@ pub fn validate_persistent_state(state: &PersistentState) -> AppResult<()> {
 
 fn validate_deployment_record(record: &DeploymentRecord) -> AppResult<()> {
     validate_required_text("Deployment record id", &record.id, MAX_RECORD_FIELD_BYTES)?;
-    validate_required_text("Deployment plan id", &record.plan_id, MAX_RECORD_FIELD_BYTES)?;
+    validate_required_text(
+        "Deployment plan id",
+        &record.plan_id,
+        MAX_RECORD_FIELD_BYTES,
+    )?;
     validate_required_text(
         "Deployment connection id",
         &record.connection_id,
         MAX_RECORD_FIELD_BYTES,
     )?;
-    validate_required_text("Deployment target id", &record.target_id, MAX_RECORD_FIELD_BYTES)?;
+    validate_required_text(
+        "Deployment target id",
+        &record.target_id,
+        MAX_RECORD_FIELD_BYTES,
+    )?;
     validate_bounded_text("Deployment detail", &record.detail, MAX_RECORD_DETAIL_BYTES)?;
     Ok(())
 }
@@ -264,9 +278,7 @@ fn is_loopback(url: &Url) -> bool {
         Some(Host::Domain(domain)) => {
             let domain = domain.trim_end_matches('.');
             domain.eq_ignore_ascii_case("localhost")
-                || domain
-                    .to_ascii_lowercase()
-                    .ends_with(".localhost")
+                || domain.to_ascii_lowercase().ends_with(".localhost")
         }
         None => false,
     }
@@ -274,9 +286,10 @@ fn is_loopback(url: &Url) -> bool {
 
 fn validate_header_name(name: &str) -> AppResult<()> {
     validate_required_text("Header name", name, MAX_HEADER_NAME_BYTES)?;
-    if !name.bytes().all(|byte| {
-        byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
-    }) {
+    if !name
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte))
+    {
         return Err(AppError::InvalidInput(format!(
             "Invalid HTTP header name: {name}"
         )));
@@ -297,9 +310,11 @@ fn validate_bounded_text(label: &str, value: &str, max_bytes: usize) -> AppResul
             "{label} exceeds the {max_bytes}-byte limit"
         )));
     }
-    if value.contains('\0') || value.chars().any(|character| {
-        character.is_control() && !matches!(character, '\t' | '\r' | '\n')
-    }) {
+    if value.contains('\0')
+        || value
+            .chars()
+            .any(|character| character.is_control() && !matches!(character, '\t' | '\r' | '\n'))
+    {
         return Err(AppError::InvalidInput(format!(
             "{label} contains unsupported control characters"
         )));
@@ -360,10 +375,9 @@ mod tests {
             .headers
             .insert("Authorization".to_string(), "Bearer literal".to_string());
         assert!(validate_connection(&value).is_err());
-        value.headers.insert(
-            "Authorization".to_string(),
-            "Bearer ${apiKey}".to_string(),
-        );
+        value
+            .headers
+            .insert("Authorization".to_string(), "Bearer ${apiKey}".to_string());
         assert!(validate_connection(&value).is_ok());
     }
 
