@@ -1,0 +1,296 @@
+.install-panel {
+  margin-bottom: 24px;
+  padding: 22px;
+  border: 1px solid rgba(124, 140, 255, 0.28);
+  border-radius: 18px;
+  background:
+    radial-gradient(circle at 92% 0%, rgba(124, 140, 255, 0.13), transparent 38%),
+    linear-gradient(160deg, rgba(21, 25, 37, 0.98), rgba(13, 16, 24, 0.98));
+  box-shadow: 0 22px 60px rgba(0, 0, 0, 0.24);
+}
+
+.install-panel-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 28px;
+}
+
+.install-panel-header h2 {
+  margin: 4px 0 7px;
+  font-size: 20px;
+}
+
+.install-copy {
+  max-width: 720px;
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.65;
+}
+
+.install-panel-actions {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 9px;
+}
+
+.install-panel button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.install-summary {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  margin-top: 18px;
+  padding: 12px 14px;
+  border: 1px solid var(--border-soft);
+  border-radius: 12px;
+  background: rgba(8, 10, 16, 0.45);
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.install-summary strong {
+  color: var(--text);
+  font-size: 14px;
+}
+
+.install-runtime {
+  margin-left: auto;
+  color: var(--subtle);
+}
+
+.install-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 14px;
+}
+
+.install-card {
+  display: flex;
+  min-width: 0;
+  min-height: 178px;
+  flex-direction: column;
+  padding: 15px;
+  border: 1px solid var(--border-soft);
+  border-radius: 14px;
+  background: rgba(11, 14, 21, 0.72);
+}
+
+.install-card-heading,
+.install-card-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.install-component-icon {
+  display: grid;
+  width: 32px;
+  height: 32px;
+  place-items: center;
+  border: 1px solid rgba(167, 176, 255, 0.24);
+  border-radius: 10px;
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+}
+
+.install-card h3 {
+  margin: 14px 0 6px;
+  font-size: 13px;
+}
+
+.install-card p {
+  display: -webkit-box;
+  overflow: hidden;
+  margin: 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.55;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+}
+
+.install-card-footer {
+  margin-top: auto;
+  padding-top: 14px;
+  color: var(--subtle);
+  font-size: 10px;
+}
+
+.install-status {
+  display: inline-flex;
+  align-items: center;
+  min-height: 22px;
+  padding: 3px 8px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  white-space: nowrap;
+}
+
+.install-status.ready {
+  border-color: rgba(85, 214, 162, 0.26);
+  background: rgba(85, 214, 162, 0.1);
+  color: var(--success);
+}
+
+.install-status.missing {
+  border-color: rgba(247, 199, 107, 0.25);
+  background: rgba(247, 199, 107, 0.1);
+  color: var(--warning);
+}
+
+.install-status.broken {
+  border-color: rgba(255, 123, 143, 0.24);
+  background: rgba(255, 123, 143, 0.1);
+  color: var(--danger);
+}
+
+.install-status.unsupported {
+  border-color: var(--border);
+  background: rgba(111, 122, 144, 0.08);
+  color: var(--subtle);
+}
+
+.install-loading {
+  margin-top: 14px;
+  padding: 24px;
+  border: 1px dashed var(--border);
+  border-radius: 14px;
+  color: var(--muted);
+  font-size: 12px;
+  text-align: center;
+}
+
+.install-result-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-top: 14px;
+  padding: 12px 14px;
+  border: 1px solid var(--border-soft);
+  border-radius: 12px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.install-result-summary > div:first-child {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.install-result-summary strong {
+  color: var(--text);
+}
+
+.install-plan-security {
+  margin-bottom: 14px;
+  padding: 12px 14px;
+  border: 1px solid rgba(85, 214, 162, 0.22);
+  border-radius: 12px;
+  background: rgba(85, 214, 162, 0.07);
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.55;
+}
+
+.install-plan-list,
+.install-result-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.install-plan-operation {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(220px, 0.75fr);
+  gap: 18px;
+  padding: 14px;
+  border: 1px solid var(--border-soft);
+  border-radius: 12px;
+  background: var(--panel);
+}
+
+.install-plan-operation strong,
+.install-plan-operation span,
+.install-plan-meta span {
+  display: block;
+}
+
+.install-plan-operation strong {
+  margin-bottom: 5px;
+  font-size: 12px;
+}
+
+.install-plan-operation span,
+.install-plan-meta {
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.55;
+}
+
+.install-plan-meta {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 5px;
+  padding-left: 16px;
+  border-left: 1px solid var(--border-soft);
+}
+
+.install-plan-empty {
+  padding: 28px;
+  border: 1px dashed var(--border);
+  border-radius: 12px;
+  color: var(--muted);
+  text-align: center;
+}
+
+.install-result-row {
+  display: grid;
+  grid-template-columns: 150px minmax(0, 1fr);
+  align-items: start;
+  gap: 14px;
+  padding: 14px;
+  border: 1px solid var(--border-soft);
+  border-radius: 12px;
+  background: var(--panel);
+}
+
+.install-result-row strong {
+  font-size: 12px;
+}
+
+.install-result-row p {
+  margin: 5px 0 0;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.55;
+}
+
+@media (max-width: 1180px) {
+  .install-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .install-panel-header {
+    flex-direction: column;
+  }
+
+  .install-runtime {
+    display: none;
+  }
+}
