@@ -5,6 +5,7 @@ pub mod decimal;
 mod deployment;
 pub mod domain;
 pub mod error;
+mod github_auth;
 mod installer;
 mod native_process;
 mod redact;
@@ -15,6 +16,7 @@ mod validation;
 
 use account::LoginStore;
 use commands::ManagedState;
+use github_auth::GithubAuthorizationStore;
 use redact::redact_text;
 use state::StateStore;
 use usage_db::UsageDb;
@@ -23,6 +25,7 @@ use usage_db::UsageDb;
 pub fn run() {
     let store = StateStore::open().expect("failed to initialize PilotWeave state");
     let login_store = LoginStore::open();
+    let github_authorization = GithubAuthorizationStore::open();
     // The usage database is isolated from connection management: when it
     // cannot be opened the app still runs and reports the unavailable state.
     let (usage_db, usage_db_error) = match UsageDb::open() {
@@ -35,6 +38,7 @@ pub fn run() {
         .manage(ManagedState::new(
             store,
             login_store,
+            github_authorization,
             usage_db,
             usage_db_error,
         ))
@@ -46,6 +50,10 @@ pub fn run() {
             commands::get_account_status,
             commands::preview_login,
             commands::apply_login_plan,
+            commands::get_github_authorization_status,
+            commands::authorize_github,
+            commands::refresh_github_authorization,
+            commands::clear_github_authorization,
             commands::upsert_connection,
             commands::delete_connection,
             commands::preview_deployment,
