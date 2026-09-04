@@ -9,6 +9,7 @@ mod redact;
 mod secrets;
 mod state;
 pub mod usage_db;
+mod validation;
 
 use commands::ManagedState;
 use redact::redact_text;
