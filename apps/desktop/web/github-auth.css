@@ -1,0 +1,276 @@
+.github-authorization-panel {
+  display: grid;
+  gap: 16px;
+  margin-bottom: 24px;
+  padding: 22px;
+  border: 1px solid var(--border);
+  border-radius: 18px;
+  background:
+    linear-gradient(145deg, rgba(85, 214, 162, 0.07), transparent 45%),
+    var(--panel);
+  box-shadow: var(--shadow);
+}
+
+.github-auth-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 24px;
+}
+
+.github-auth-header h2 {
+  margin: 5px 0 0;
+  font-size: 19px;
+}
+
+.github-auth-header > div:first-child > p:last-child {
+  max-width: 760px;
+  margin: 9px 0 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.62;
+}
+
+.github-auth-actions {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 8px;
+}
+
+.github-auth-loading {
+  padding: 18px;
+  border: 1px dashed var(--border);
+  border-radius: 12px;
+  color: var(--muted);
+  font-size: 11px;
+  text-align: center;
+}
+
+.github-auth-warning {
+  display: grid;
+  gap: 4px;
+  padding: 12px 14px;
+  border: 1px solid rgba(247, 199, 107, 0.3);
+  border-radius: 11px;
+  background: rgba(247, 199, 107, 0.08);
+  color: var(--warning);
+  font-size: 10px;
+}
+
+.github-auth-warning.danger {
+  border-color: rgba(255, 123, 143, 0.32);
+  background: rgba(255, 123, 143, 0.08);
+  color: var(--danger);
+}
+
+.github-auth-warning span {
+  color: var(--muted);
+  line-height: 1.5;
+}
+
+.github-auth-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.github-auth-identity,
+.github-auth-billing {
+  display: grid;
+  align-content: start;
+  gap: 10px;
+  min-width: 0;
+  padding: 16px;
+  border: 1px solid var(--border-soft);
+  border-radius: 14px;
+  background: var(--panel-2);
+}
+
+.github-auth-identity > strong,
+.github-auth-billing > strong {
+  overflow-wrap: anywhere;
+  font-size: 14px;
+}
+
+.github-auth-identity > p,
+.github-auth-billing > p,
+.github-auth-boundary,
+.github-auth-modal-copy {
+  margin: 0;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.58;
+}
+
+.github-auth-card-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--subtle);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.github-auth-state {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 23px;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  letter-spacing: normal;
+  text-transform: none;
+  white-space: nowrap;
+  font-size: 9px;
+}
+
+.github-auth-state.verified {
+  border-color: rgba(85, 214, 162, 0.3);
+  background: rgba(85, 214, 162, 0.1);
+  color: var(--success);
+}
+
+.github-auth-state.warning {
+  border-color: rgba(247, 199, 107, 0.32);
+  background: rgba(247, 199, 107, 0.1);
+  color: var(--warning);
+}
+
+.github-auth-state.danger {
+  border-color: rgba(255, 123, 143, 0.32);
+  background: rgba(255, 123, 143, 0.1);
+  color: var(--danger);
+}
+
+.github-auth-state.neutral {
+  background: rgba(111, 122, 144, 0.08);
+  color: var(--muted);
+}
+
+.github-auth-meta {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 7px;
+  color: var(--subtle);
+  font-size: 9px;
+}
+
+.github-auth-permission {
+  padding: 9px 10px;
+  border-radius: 9px;
+  background: rgba(9, 11, 17, 0.45);
+  color: var(--muted);
+  font-size: 9px;
+  line-height: 1.45;
+}
+
+.github-auth-permission strong {
+  color: var(--text);
+}
+
+.github-auth-scopes {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 13px 14px;
+  border: 1px solid var(--border-soft);
+  border-radius: 12px;
+  background: rgba(9, 11, 17, 0.4);
+}
+
+.github-auth-scopes > div:first-child {
+  display: grid;
+  gap: 4px;
+  max-width: 520px;
+}
+
+.github-auth-scopes strong {
+  font-size: 10px;
+}
+
+.github-auth-scopes > div:first-child span {
+  color: var(--subtle);
+  font-size: 9px;
+  line-height: 1.45;
+}
+
+.github-auth-scope-list {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.github-auth-scope-list > span {
+  padding: 4px 7px;
+  border: 1px solid rgba(124, 140, 255, 0.25);
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+  font-size: 8px;
+}
+
+.github-auth-scope-list > .muted-scope {
+  border-color: var(--border);
+  background: rgba(111, 122, 144, 0.08);
+  color: var(--muted);
+}
+
+.github-auth-boundary {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  align-items: start;
+  gap: 10px;
+  padding-top: 2px;
+}
+
+.github-auth-boundary strong {
+  color: var(--success);
+  font-size: 9px;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+}
+
+.github-auth-modal-copy {
+  padding: 13px 14px;
+  border: 1px solid var(--border-soft);
+  border-radius: 11px;
+  background: rgba(9, 11, 17, 0.48);
+}
+
+.github-auth-modal-copy strong,
+.github-auth-modal-copy code {
+  color: var(--text);
+}
+
+@media (max-width: 1120px) {
+  .github-auth-header {
+    flex-direction: column;
+  }
+
+  .github-auth-actions {
+    width: 100%;
+  }
+
+  .github-auth-actions .button {
+    flex: 1;
+  }
+
+  .github-auth-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .github-auth-scopes {
+    flex-direction: column;
+  }
+
+  .github-auth-scope-list {
+    justify-content: flex-start;
+  }
+}
