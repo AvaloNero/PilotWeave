@@ -1,0 +1,200 @@
+name: Validate immutable source snapshot
+
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/validate-source-snapshot.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    permissions:
+      contents: write
+    env:
+      SNAPSHOT: dd91cd827aa0606b21d1e6e1d484dea6645d7ca9
+      BASE: 7ffd2e882c6b9bb5f986c3bed228751870324ab3
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 7ffd2e882c6b9bb5f986c3bed228751870324ab3
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Restore exact content-addressed source snapshot
+        shell: bash
+        env:
+          TRANSFER_TOKEN: ${{ github.token }}
+        run: |
+          python - <<'PY'
+          import base64, concurrent.futures, hashlib, json, os, pathlib, subprocess, urllib.request
+          shas = '''fe99688dca31a025148181a1bd295a5fdec97de0
+          d4f533ac032a34311898d743e2317c69fb6ad2b8
+          b76a4fffb006a18f7564055546925d0eb3860512
+          5a7b9af9fb248dd2eb2cadeb9b9f4bdf02a94b32
+          217501e21bbaca45b95a0fbc3874b2dcf5229948
+          8ff761de59ac784a4d9a636658df104b1031bfdd
+          73a5bd939e510523d4497d554f951e65a307c6c2
+          adb2cc496806aa791c01d34f5a3da955fe77601d
+          a0b065d2249495d0808f0bc1b759c6a645a57b97
+          bf9015e8549d5ecdeb788ec372a6e730819f8cb6
+          42e08454bd0d96b3d8d3252111a96750c66285cd
+          5b11e13c68c18f89daaddf104229eb336e479c3b
+          e1e808e82796d7168d924ea1bf0dfe1208fe0105
+          4262899264cc42d3427f0ee448bafe05893b1a69
+          2f6f476e823aede53df6becb450590a2dd8b6824
+          dd3c2c310f4262f6753b107722b3e168682fe8d8
+          f11b5fccee9487509994efebbd35d067d8a4c4f5
+          2b350b81ea5eafdaeb7604dc13ef19d3c7f0aca6
+          d152c99be7d67c123a2995596c00b232109b7b11
+          e1bf615ee0d369a116c458aa85b0ba869d28fd69
+          3c01939e9b00d9c32bd19d8caf0e35ff791a73c0
+          3030240b0606f862965be6fdb20d4d96d7a3ff65
+          17eb91e77779345a5c274072a926679a19b0295d
+          d3b41916a96e9740beb5c7a93ba421cd00ca451c
+          42e5de9b6daff7b9eacb2b0543a1ef689b762886
+          d0f1fe74306b8631918bebf4ccb34e9a2c43d7d9
+          6c70c4ac94994b18c84634d17d176862745d99d1
+          478a2356840671efbb82ee2d876d7b33b6ee09ef
+          cbfcaa78d67601ee6515d5ee196360aeec0eef74
+          150e6da5d9f1f661d590753eef55ed7fa9094527
+          42c3d806dbcb93725394c5d4fcc1aacc578ae217
+          01d30f646f56ced1be161901f80ec7e4c2c1beda
+          7a3deccbe76c558500a84891611e92a55b67966d
+          5762bb91da490e921c7234eec1aafa7e9ccfdd61
+          2b9b8c0887f9c323780e5f5d7b7bcdb73a492cf2
+          a6393ca12368f1bf991650ca119f4fd5d3e039df'''.split()
+          def download(sha):
+              url = f'https://api.github.com/repos/{os.environ["GITHUB_REPOSITORY"]}/git/blobs/{sha}'
+              req = urllib.request.Request(url, headers={'Authorization': 'Bearer ' + os.environ['TRANSFER_TOKEN'], 'Accept': 'application/vnd.github+json'})
+              with urllib.request.urlopen(req, timeout=30) as response:
+                  data = json.load(response)
+              payload = base64.b64decode(data['content'])
+              actual = hashlib.sha1(b'blob ' + str(len(payload)).encode() + b'\0' + payload).hexdigest()
+              assert actual == sha, (sha, actual)
+              return payload
+          with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+              payload = b''.join(pool.map(download, shas))
+          assert hashlib.sha256(payload).hexdigest() == 'f6182fbc80c6abcf3a646aa9beef62b3a1f0548be780004bddf019c4e4bdab15'
+          bundle = pathlib.Path(os.environ['RUNNER_TEMP']) / 'source.bundle'
+          bundle.write_bytes(payload)
+          subprocess.run(['git', 'bundle', 'verify', str(bundle)], check=True)
+          subprocess.run(['git', 'fetch', '--no-tags', str(bundle), 'HEAD'], check=True)
+          subprocess.run(['git', 'checkout', '--detach', os.environ['SNAPSHOT']], check=True)
+          tree = subprocess.check_output(['git', 'rev-parse', 'HEAD^{tree}'], text=True).strip()
+          assert tree == '59c64d02c84ef28f7d79a57654fe3738b8ee8caa', tree
+          PY
+      - name: Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libayatana-appindicator3-dev libdbus-1-dev librsvg2-dev libssl-dev libwebkit2gtk-4.1-dev libxdo-dev pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.88.0
+          components: rustfmt, clippy
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install JS dependencies
+        run: npm ci
+      - name: Web syntax and behavior tests
+        run: npm run check:web
+      - name: Check source formatting
+        id: fmt
+        continue-on-error: true
+        run: cargo fmt --all -- --check
+      - name: Rust tests
+        id: test
+        continue-on-error: true
+        run: cargo test --workspace --locked
+      - name: Strict Clippy
+        id: clippy
+        continue-on-error: true
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Windows native build
+        id: native
+        if: runner.os == 'Windows' && steps.test.outcome == 'success' && steps.clippy.outcome == 'success'
+        run: npm run build -- --no-bundle
+      - name: Create formatter diagnostics only
+        if: always() && steps.fmt.outcome == 'failure'
+        shell: bash
+        run: |
+          cargo fmt --all
+          git diff --binary HEAD > "$RUNNER_TEMP/rustfmt.patch"
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.fmt.outcome == 'failure'
+        with:
+          name: snapshot-format-${{ matrix.os }}
+          path: ${{ runner.temp }}/rustfmt.patch
+          if-no-files-found: error
+      - name: Retain unreferenced source objects for explicit maintainer commit
+        if: always() && runner.os == 'Linux'
+        shell: bash
+        env:
+          TRANSFER_TOKEN: ${{ github.token }}
+          FORMAT_OUTCOME: ${{ steps.fmt.outcome }}
+          TEST_OUTCOME: ${{ steps.test.outcome }}
+          CLIPPY_OUTCOME: ${{ steps.clippy.outcome }}
+        run: |
+          python - <<'PY'
+          import base64, hashlib, json, os, pathlib, subprocess, urllib.request
+          repo = os.environ['GITHUB_REPOSITORY']
+          def git(*args):
+              return subprocess.check_output(['git', *args])
+          def post(path, data):
+              request = urllib.request.Request(f'https://api.github.com/repos/{repo}/{path}', data=json.dumps(data).encode(), headers={'Authorization': 'Bearer ' + os.environ['TRANSFER_TOKEN'], 'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json'}, method='POST')
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  return json.load(response)
+          # Upload only Git objects. Never create/update a branch or commit here.
+          subprocess.run(['git', 'add', '-u'], check=True)
+          expected = git('write-tree').decode().strip()
+          current = {}
+          for line in git('ls-tree', '-r', expected).decode().splitlines():
+              metadata, path = line.split('\t', 1)
+              mode, kind, sha = metadata.split()
+              current[path] = (mode, kind, sha)
+          changed = git('diff', '--name-only', '-z', os.environ['BASE'], expected).decode().split('\0')
+          entries = []
+          for path in filter(None, changed):
+              if path not in current:
+                  entries.append({'path': path, 'mode': '100644', 'type': 'blob', 'sha': None})
+                  continue
+              mode, kind, sha = current[path]
+              assert kind == 'blob' and mode == '100644'
+              data = git('cat-file', 'blob', sha)
+              assert len(data) < 2_000_000
+              uploaded = post('git/blobs', {'content': base64.b64encode(data).decode(), 'encoding': 'base64'})
+              assert uploaded['sha'] == sha
+              entries.append({'path': path, 'mode': mode, 'type': kind, 'sha': sha})
+          base_tree = git('rev-parse', os.environ['BASE'] + '^{tree}').decode().strip()
+          result = post('git/trees', {'base_tree': base_tree, 'tree': entries})
+          assert result['sha'] == expected, (result['sha'], expected)
+          output = {'snapshot': os.environ['SNAPSHOT'], 'base': os.environ['BASE'], 'tree': expected, 'checks': {key: os.environ[key] for key in ['FORMAT_OUTCOME', 'TEST_OUTCOME', 'CLIPPY_OUTCOME']}, 'entries': entries}
+          pathlib.Path(os.environ['RUNNER_TEMP'], 'source-objects.json').write_text(json.dumps(output, indent=2))
+          print('Unreferenced source tree:', expected)
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always() && runner.os == 'Linux'
+        with:
+          name: snapshot-source-objects
+          path: ${{ runner.temp }}/source-objects.json
+          if-no-files-found: error
+      - name: Enforce checks
+        if: always()
+        shell: bash
+        env:
+          FORMAT_OUTCOME: ${{ steps.fmt.outcome }}
+          TEST_OUTCOME: ${{ steps.test.outcome }}
+          CLIPPY_OUTCOME: ${{ steps.clippy.outcome }}
+        run: |
+          test "$FORMAT_OUTCOME" = success
+          test "$TEST_OUTCOME" = success
+          test "$CLIPPY_OUTCOME" = success
