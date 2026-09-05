@@ -2,73 +2,107 @@ name: CI
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
+  source:
+    name: Exact source snapshot
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Archive the exact commit being checked
+        shell: bash
+        run: git archive --format=tar HEAD > "$RUNNER_TEMP/pilotweave-source.tar"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: source-${{ github.sha }}
+          path: ${{ runner.temp }}/pilotweave-source.tar
+          retention-days: 7
+          if-no-files-found: error
+
   checks:
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
-
+    timeout-minutes: 35
     steps:
       - name: Check out source
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
+          persist-credentials: false
       - name: Install Linux build dependencies
         if: runner.os == 'Linux'
         shell: bash
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            build-essential \
-            curl \
-            file \
-            libayatana-appindicator3-dev \
-            libdbus-1-dev \
-            librsvg2-dev \
-            libssl-dev \
-            libwebkit2gtk-4.1-dev \
-            libxdo-dev \
-            pkg-config \
-            wget
-
+          sudo apt-get install -y build-essential libayatana-appindicator3-dev libdbus-1-dev librsvg2-dev libssl-dev libwebkit2gtk-4.1-dev libxdo-dev pkg-config
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.88.0
           components: rustfmt, clippy
-
       - name: Install Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 22
-
       - name: Install JavaScript dependencies
         run: npm ci
-
-      - name: Check browser application syntax
+      - name: Check browser application
         run: npm run check:web
-
       - name: Check Rust formatting
+        id: formatting
+        continue-on-error: true
         run: cargo fmt --all -- --check
-
       - name: Run Rust tests
-        run: cargo test --workspace
-
+        id: tests
+        continue-on-error: true
+        run: cargo test --workspace --locked
       - name: Run Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
+        id: clippy
+        continue-on-error: true
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Build native Tauri application
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && steps.tests.outcome == 'success' && steps.clippy.outcome == 'success'
         run: npm run build -- --no-bundle
-
       - name: Check patch whitespace
-        if: github.event_name == 'pull_request'
         shell: bash
-        run: git diff --check "origin/${{ github.base_ref }}...HEAD"
+        run: git show --format= --check HEAD
+      - name: Retain formatting diagnostic without changing the repository
+        if: always() && steps.formatting.outcome == 'failure'
+        shell: bash
+        run: |
+          cargo fmt --all
+          git diff --binary > "$RUNNER_TEMP/rustfmt.patch"
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.formatting.outcome == 'failure'
+        with:
+          name: formatting-${{ matrix.os }}-${{ github.sha }}
+          path: ${{ runner.temp }}/rustfmt.patch
+          retention-days: 7
+          if-no-files-found: error
+      - name: Enforce every required check
+        if: always()
+        shell: bash
+        env:
+          FORMAT_RESULT: ${{ steps.formatting.outcome }}
+          TEST_RESULT: ${{ steps.tests.outcome }}
+          CLIPPY_RESULT: ${{ steps.clippy.outcome }}
+        run: |
+          test "$FORMAT_RESULT" = success
+          test "$TEST_RESULT" = success
+          test "$CLIPPY_RESULT" = success
