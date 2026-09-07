@@ -349,6 +349,20 @@ impl UsageDbStatus {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum CredentialState {
+    Stored,
+    Missing,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialObservation {
+    pub state: CredentialState,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DashboardSnapshot {
@@ -360,6 +374,10 @@ pub struct DashboardSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state_recovery: Option<String>,
     pub usage_db: UsageDbStatus,
+    #[serde(default)]
+    pub credential_statuses: BTreeMap<String, CredentialObservation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployment_recovery: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

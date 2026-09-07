@@ -307,7 +307,7 @@ pub struct PriceRow {
 
 #[derive(Debug)]
 pub struct UsageDb {
-    conn: SqliteConnection,
+    pub(crate) conn: SqliteConnection,
     path: PathBuf,
 }
 

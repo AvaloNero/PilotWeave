@@ -10,7 +10,6 @@ use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsStr;
 use std::fs;
 use std::hash::{Hash, Hasher};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use url::Url;
@@ -212,6 +211,11 @@ pub struct LoginPlanStore {
 impl LoginPlanStore {
     pub fn preview(&mut self, requested_surfaces: Vec<LoginSurface>) -> AppResult<LoginPlan> {
         self.purge_expired();
+        if self.plans.len() >= 16 {
+            return Err(AppError::InvalidInput(
+                "Too many pending plans; wait for expiry or apply an existing plan".into(),
+            ));
+        }
         let surfaces = canonical_surfaces(&requested_surfaces)?;
         let status = discover_status(Vec::new(), None);
         let mut operations = Vec::new();
@@ -812,13 +816,13 @@ fn executable_operation(surface: LoginSurface) -> AppResult<ExecutableLoginOpera
 fn operation_description(surface: LoginSurface) -> &'static str {
     match surface {
         LoginSurface::VsCodeCopilot => {
-            "Launch the verified VS Code application; complete sign-in through its official Accounts interface"
+            "Launch the discovered VS Code application; complete sign-in through its official Accounts interface"
         }
         LoginSurface::CopilotCli => {
-            "Launch the verified Copilot CLI with its official github.com browser sign-in flow"
+            "Launch the discovered Copilot CLI with its official github.com browser sign-in flow"
         }
         LoginSurface::GithubCopilotApp => {
-            "Launch the verified GitHub Copilot application; use its official Sign in to GitHub control"
+            "Launch the discovered GitHub Copilot application; use its official Sign in to GitHub control"
         }
     }
 }
@@ -1066,46 +1070,14 @@ fn load_history(path: &Path) -> AppResult<LoginHistoryState> {
 }
 
 fn write_history(path: &Path, state: &LoginHistoryState) -> AppResult<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| AppError::Config("Sign-in history path has no parent".to_string()))?;
-    fs::create_dir_all(parent).map_err(|error| AppError::io(parent, error))?;
-    let bytes = serde_json::to_vec_pretty(state).map_err(|error| {
-        AppError::Config(format!("Failed to serialize sign-in history: {error}"))
-    })?;
+    let bytes = serde_json::to_vec_pretty(state)
+        .map_err(|error| AppError::Config(format!("Cannot serialize sign-in history: {error}")))?;
     if bytes.len() as u64 > MAX_LOGIN_HISTORY_BYTES {
         return Err(AppError::InvalidInput(
-            "Sign-in history exceeds its storage limit".to_string(),
+            "sign-in history exceeds its storage limit".into(),
         ));
     }
-    let temp = parent.join(format!(".login-runs-{}.tmp", Uuid::new_v4()));
-    let result = (|| -> AppResult<()> {
-        let mut options = fs::OpenOptions::new();
-        options.create_new(true).write(true);
-        let mut file = options
-            .open(&temp)
-            .map_err(|error| AppError::io(&temp, error))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            file.set_permissions(fs::Permissions::from_mode(0o600))
-                .map_err(|error| AppError::io(&temp, error))?;
-        }
-        file.write_all(&bytes)
-            .map_err(|error| AppError::io(&temp, error))?;
-        file.sync_all()
-            .map_err(|error| AppError::io(&temp, error))?;
-        #[cfg(windows)]
-        if path.exists() {
-            fs::remove_file(path).map_err(|error| AppError::io(path, error))?;
-        }
-        fs::rename(&temp, path).map_err(|error| AppError::io(path, error))?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temp);
-    }
-    result
+    crate::safe_io::write_private(path, &bytes)
 }
 
 #[cfg(test)]

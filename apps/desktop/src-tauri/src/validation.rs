@@ -29,6 +29,7 @@ const AUTHENTICATION_HEADERS: &[&str] = &[
     "anthropic-api-key",
     "openai-api-key",
     "azure-openai-api-key",
+    "x-goog-api-key",
 ];
 
 pub fn validate_connection(connection: &Connection) -> AppResult<()> {
@@ -46,16 +47,23 @@ pub fn validate_connection(connection: &Connection) -> AppResult<()> {
         MAX_SECRET_REF_BYTES,
     )?;
     validate_endpoint(&connection.base_url)?;
+    if connection.secret_ref != format!("connection:{}", connection.id) {
+        return Err(AppError::InvalidInput(
+            "Provider credential reference has the wrong owner or purpose".into(),
+        ));
+    }
+    if connection.provider_kind == crate::domain::ProviderKind::Azure
+        && connection.protocol == crate::domain::ApiProtocol::Messages
+    {
+        return Err(AppError::InvalidInput(
+            "Azure cannot use the Anthropic Messages protocol".into(),
+        ));
+    }
 
     if connection.models.len() > MAX_MODELS_PER_CONNECTION {
         return Err(AppError::InvalidInput(format!(
             "A connection may define at most {MAX_MODELS_PER_CONNECTION} models"
         )));
-    }
-    if !connection.models.iter().any(|model| model.enabled) {
-        return Err(AppError::InvalidInput(
-            "A connection requires at least one enabled model".to_string(),
-        ));
     }
 
     for model in &connection.models {
@@ -99,7 +107,8 @@ pub fn validate_connection(connection: &Connection) -> AppResult<()> {
                 "Duplicate header name ignoring case: {name}"
             )));
         }
-        if AUTHENTICATION_HEADERS.contains(&canonical_name.as_str()) && !value.contains("${apiKey}")
+        if AUTHENTICATION_HEADERS.contains(&canonical_name.as_str())
+            && !valid_auth_template(&canonical_name, value)
         {
             return Err(AppError::InvalidInput(format!(
                 "Authentication header {name} must use the ${{apiKey}} placeholder instead of a persisted literal credential"
@@ -117,6 +126,21 @@ pub fn validate_connection(connection: &Connection) -> AppResult<()> {
         )));
     }
     Ok(())
+}
+
+fn valid_auth_template(name: &str, value: &str) -> bool {
+    if value == "${apiKey}" {
+        return true;
+    }
+    if !matches!(name, "authorization" | "proxy-authorization") {
+        return false;
+    }
+    let parts = value.split_whitespace().collect::<Vec<_>>();
+    parts.len() == 2
+        && parts[1] == "${apiKey}"
+        && ["bearer", "basic", "token"]
+            .iter()
+            .any(|scheme| parts[0].eq_ignore_ascii_case(scheme))
 }
 
 pub fn validate_api_key(value: Option<&str>) -> AppResult<()> {
@@ -400,11 +424,11 @@ mod tests {
     }
 
     #[test]
-    fn requires_an_enabled_model_and_bounds_token_limits() {
+    fn allows_disabled_models_and_bounds_token_limits() {
         let mut value = connection("https://example.com/v1");
         value.models[0].enabled = false;
-        assert!(validate_connection(&value).is_err());
-        value.models[0].enabled = true;
+        assert!(validate_connection(&value).is_ok());
+
         value.models[0].capabilities.context_window = Some(MAX_TOKEN_LIMIT + 1);
         assert!(validate_connection(&value).is_err());
     }
@@ -440,5 +464,25 @@ mod tests {
         assert!(validate_api_key(Some("line-one\nline-two")).is_err());
         assert!(validate_api_key(Some(&"x".repeat(MAX_API_KEY_BYTES + 1))).is_err());
         assert!(validate_api_key(Some("secret")).is_ok());
+    }
+    #[test]
+    fn provider_cannot_reference_the_github_authorization_secret() {
+        let mut value = connection("https://example.com/v1");
+        value.secret_ref = "github:personal-usage".to_string();
+        assert!(validate_connection(&value).is_err());
+    }
+
+    #[test]
+    fn google_auth_header_and_embedded_literal_are_rejected() {
+        let mut value = connection("https://example.com/v1");
+        value
+            .headers
+            .insert("x-goog-api-key".into(), "literal".into());
+        assert!(validate_connection(&value).is_err());
+        value.headers.clear();
+        value
+            .headers
+            .insert("Authorization".into(), "Bearer literal ${apiKey}".into());
+        assert!(validate_connection(&value).is_err());
     }
 }

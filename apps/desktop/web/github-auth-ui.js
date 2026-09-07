@@ -370,6 +370,7 @@
       unauthorized: "Unauthorized",
       forbidden: "Forbidden",
       networkError: "Network error",
+      credentialUnavailable: "Credential store unavailable",
       schemaError: "Schema error",
       conflict: "Conflict",
       readOnlyRecovery: "Read-only recovery",

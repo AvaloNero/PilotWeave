@@ -1,7 +1,7 @@
 use crate::decimal::ExactDecimal;
+use crate::domain::UsageDbStatus;
 use crate::error::{AppError, AppResult};
 use crate::github_auth::{GithubAuthorizationIdentity, GithubAuthorizationStatus};
-use crate::domain::UsageDbStatus;
 use chrono::{DateTime, Datelike, Months, NaiveDate, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -40,7 +40,7 @@ impl GithubBillingEndpointFamily {
         }
     }
 
-    pub fn from_str(value: &str) -> Option<Self> {
+    pub fn parse(value: &str) -> Option<Self> {
         match value {
             "ai-credit" => Some(Self::AiCredit),
             "premium-request" => Some(Self::PremiumRequest),
@@ -78,7 +78,7 @@ impl GithubBillingSnapshotStatus {
         }
     }
 
-    pub fn from_str(value: &str) -> Option<Self> {
+    pub fn parse(value: &str) -> Option<Self> {
         match value {
             "available" => Some(Self::Available),
             "successful-empty" => Some(Self::SuccessfulEmpty),
@@ -94,7 +94,7 @@ impl GithubBillingSnapshotStatus {
     }
 
     pub fn is_success(self) -> bool {
-        matches!(Self::Available | Self::SuccessfulEmpty, self)
+        matches!(self, Self::Available | Self::SuccessfulEmpty)
     }
 }
 
@@ -115,7 +115,7 @@ impl GithubBillingCoverage {
         }
     }
 
-    pub fn from_str(value: &str) -> Option<Self> {
+    pub fn parse(value: &str) -> Option<Self> {
         match value {
             "personal-account-only" => Some(Self::PersonalAccountOnly),
             "not-covered" => Some(Self::NotCovered),
@@ -147,9 +147,9 @@ impl GithubBillingPeriod {
         let current_now = Utc::now();
         let current = NaiveDate::from_ymd_opt(current_now.year(), current_now.month(), 1)
             .ok_or_else(|| AppError::Config("Cannot construct the current month".to_string()))?;
-        let oldest = current
-            .checked_sub_months(Months::new(23))
-            .ok_or_else(|| AppError::Config("Cannot construct the Billing history window".to_string()))?;
+        let oldest = current.checked_sub_months(Months::new(23)).ok_or_else(|| {
+            AppError::Config("Cannot construct the Billing history window".to_string())
+        })?;
         if first < oldest || first > current {
             return Err(AppError::InvalidInput(
                 "Personal GitHub Billing is limited to the current month and the previous 23 months"
@@ -243,6 +243,15 @@ pub struct GithubBillingOverview {
     pub observed_at: DateTime<Utc>,
 }
 
+/// User IDs survive login renames; never use display names as storage ownership.
+pub fn account_key(identity: &GithubAuthorizationIdentity) -> String {
+    format!(
+        "{}:user:{}",
+        identity.host.to_ascii_lowercase(),
+        identity.user_id
+    )
+}
+
 pub fn empty_family_views() -> Vec<GithubBillingFamilyView> {
     GithubBillingEndpointFamily::ALL
         .into_iter()
@@ -321,7 +330,14 @@ fn fetch_family(
 
     let status = response.status().as_u16();
     if status != 200 {
-        return status_snapshot(identity, period, family, fetched_at, status, response.headers());
+        return status_snapshot(
+            identity,
+            period,
+            family,
+            fetched_at,
+            status,
+            response.headers(),
+        );
     }
 
     let bytes = match response
@@ -518,9 +534,7 @@ fn parse_report(
         let _discount_quantity = item
             .discount_quantity
             .into_non_negative("discount quantity")?;
-        let discount_amount = item
-            .discount_amount
-            .into_non_negative("discount amount")?;
+        let discount_amount = item.discount_amount.into_non_negative("discount amount")?;
         let _net_quantity = item.net_quantity.into_non_negative("net quantity")?;
         let net_amount = item.net_amount.into_non_negative("net amount")?;
         items.push(GithubBillingItem {
@@ -546,7 +560,7 @@ fn parse_report(
     };
     Ok(GithubBillingSnapshot {
         id: Uuid::new_v4().to_string(),
-        account_hint: identity.login.clone(),
+        account_hint: account_key(identity),
         endpoint_family: family,
         api_version: GITHUB_BILLING_API_VERSION.to_string(),
         period_start: period.start,
@@ -616,7 +630,7 @@ fn error_snapshot(
 ) -> GithubBillingSnapshot {
     GithubBillingSnapshot {
         id: Uuid::new_v4().to_string(),
-        account_hint: identity.login.clone(),
+        account_hint: account_key(identity),
         endpoint_family: family,
         api_version: GITHUB_BILLING_API_VERSION.to_string(),
         period_start: period.start,
@@ -768,7 +782,10 @@ mod tests {
             snapshot.status,
             GithubBillingSnapshotStatus::SuccessfulEmpty
         );
-        assert_eq!(snapshot.coverage, GithubBillingCoverage::PersonalAccountOnly);
+        assert_eq!(
+            snapshot.coverage,
+            GithubBillingCoverage::PersonalAccountOnly
+        );
         assert!(snapshot.items.is_empty());
     }
 

@@ -26,8 +26,14 @@ pub fn get(secret_ref: &str) -> AppResult<Option<String>> {
     }
 }
 
-pub fn exists(secret_ref: &str) -> bool {
-    matches!(get(secret_ref), Ok(Some(_)))
+pub fn observe(connection_id: &str) -> crate::domain::CredentialObservation {
+    use crate::domain::{CredentialObservation, CredentialState};
+    let state = match get(&format!("connection:{connection_id}")) {
+        Ok(Some(_)) => CredentialState::Stored,
+        Ok(None) => CredentialState::Missing,
+        Err(_) => CredentialState::Unavailable,
+    };
+    CredentialObservation { state }
 }
 
 pub fn delete(secret_ref: &str) -> AppResult<()> {

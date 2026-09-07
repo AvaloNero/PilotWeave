@@ -21,6 +21,8 @@ dirs = "5.0"
 json5 = "0.4"
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
 log = "0.4"
+libc = "0.2"
+sha2 = "0.10"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 rust_decimal = "1.42.1"
 serde = { version = "1.0", features = ["derive"] }
@@ -35,7 +37,7 @@ uuid = { version = "1.11", features = ["v4", "serde"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 winreg = "0.52"
-windows-sys = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging", "Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
 [dev-dependencies]
 tempfile = "3"

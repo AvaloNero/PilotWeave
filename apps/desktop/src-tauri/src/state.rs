@@ -5,13 +5,20 @@ use crate::error::{AppError, AppResult};
 use crate::secrets;
 use crate::validation;
 use chrono::Utc;
+#[cfg(test)]
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 const MAX_STATE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_DEPLOYMENT_RECORDS: usize = 200;
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteConnectionResult {
+    pub deleted: bool,
+    pub credential_cleanup_warning: Option<String>,
+}
 
 pub struct StateStore {
     path: PathBuf,
@@ -20,6 +27,7 @@ pub struct StateStore {
     /// in explicit read-only recovery: reads return empty defaults and writes
     /// are rejected so the unreadable file is never overwritten.
     recovery: Option<String>,
+    observed_bytes: Option<Vec<u8>>,
 }
 
 impl StateStore {
@@ -31,39 +39,45 @@ impl StateStore {
     }
 
     pub fn open_at(path: PathBuf) -> Self {
+        let observed_bytes = crate::safe_io::read_optional(&path, MAX_STATE_BYTES)
+            .ok()
+            .flatten();
         match Self::try_load(&path) {
             Ok((state, recovery)) => Self {
                 path,
                 state,
                 recovery,
+                observed_bytes,
             },
             Err(error) => Self {
                 path,
                 state: PersistentState::default(),
                 recovery: Some(error.to_string()),
+                observed_bytes,
             },
         }
     }
 
     fn try_load(path: &Path) -> AppResult<(PersistentState, Option<String>)> {
-        let mut state = load_state(path)?;
-        if state.version > STATE_VERSION {
-            return Err(AppError::Config(format!(
-                "State version {} is newer than this PilotWeave build supports ({STATE_VERSION})",
-                state.version
-            )));
+        let backup = crate::safe_io::sibling(path, ".last-good");
+        let primary = if !path.exists() && backup.exists() {
+            Err(AppError::Config("Primary state is missing".to_string()))
+        } else {
+            load_validated_state(path)
+        };
+        match primary {
+            Ok(state) => Ok((state, None)),
+            Err(error) => {
+                if backup.exists() {
+                    if let Ok(state) = load_validated_state(&backup) {
+                        return Ok((state, Some(format!(
+                            "{error}; showing the validated last-known-good snapshot read-only; primary state was not overwritten"
+                        ))));
+                    }
+                }
+                Err(error)
+            }
         }
-        validation::validate_persisted_identities(&state)?;
-        state.version = STATE_VERSION;
-        for connection in &mut state.connections {
-            connection.normalize();
-            validation::validate_connection(connection)?;
-        }
-        validation::validate_persistent_state(&state)?;
-        for connection in &mut state.connections {
-            connection.has_secret = secrets::exists(&connection.secret_ref);
-        }
-        Ok((state, None))
     }
 
     /// Reason the store is in read-only recovery, if the primary file could
@@ -72,7 +86,7 @@ impl StateStore {
         self.recovery.as_deref()
     }
 
-    fn ensure_writable(&self) -> AppResult<()> {
+    pub fn ensure_writable(&self) -> AppResult<()> {
         if let Some(reason) = &self.recovery {
             return Err(AppError::Unsupported(format!(
                 "PilotWeave state is in read-only recovery ({reason}); fix or remove the state file and restart"
@@ -103,12 +117,23 @@ impl StateStore {
     }
 
     pub fn secret_for(&self, connection: &Connection) -> AppResult<Option<String>> {
-        secrets::get(&connection.secret_ref)
+        validation::validate_connection(connection)?;
+        secrets::get(&format!("connection:{}", connection.id))
     }
 
     pub fn upsert_connection(&mut self, input: ConnectionInput) -> AppResult<Connection> {
         self.ensure_writable()?;
         validation::validate_api_key(input.api_key.as_deref())?;
+        if input.clear_secret
+            && input
+                .api_key
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+        {
+            return Err(AppError::InvalidInput(
+                "Cannot set and clear a credential together".into(),
+            ));
+        }
 
         let now = Utc::now();
         let requested_id = input
@@ -180,7 +205,7 @@ impl StateStore {
                 .cmp(&right.name.to_ascii_lowercase())
                 .then_with(|| left.id.cmp(&right.id))
         });
-        validation::validate_persistent_state(&next_state)?;
+        serialized_state(&next_state)?;
 
         let old_secret = secrets::get(&connection.secret_ref)?;
         let new_secret = input
@@ -193,7 +218,8 @@ impl StateStore {
         } else if let Some(value) = new_secret {
             secrets::set(&connection.secret_ref, value)?;
         }
-        connection.has_secret = secrets::exists(&connection.secret_ref);
+        connection.has_secret =
+            !input.clear_secret && new_secret.or(old_secret.as_deref()).is_some();
         if let Some(index) = next_state
             .connections
             .iter()
@@ -220,7 +246,7 @@ impl StateStore {
         Ok(connection)
     }
 
-    pub fn delete_connection(&mut self, id: &str) -> AppResult<()> {
+    pub fn delete_connection(&mut self, id: &str) -> AppResult<DeleteConnectionResult> {
         self.ensure_writable()?;
         let index = self
             .state
@@ -243,7 +269,16 @@ impl StateStore {
             return Err(error);
         }
 
-        secrets::delete(&connection.secret_ref)
+        let credential_cleanup_warning = secrets::delete(&format!("connection:{}", connection.id))
+            .err()
+            .map(|_| {
+                "Connection deletion completed, but its OS credential could not be removed"
+                    .to_string()
+            });
+        Ok(DeleteConnectionResult {
+            deleted: true,
+            credential_cleanup_warning,
+        })
     }
 
     pub fn record_deployments(&mut self, records: Vec<DeploymentRecord>) -> AppResult<()> {
@@ -264,76 +299,97 @@ impl StateStore {
         Ok(())
     }
 
-    fn persist(&self) -> AppResult<()> {
-        write_state(&self.path, &self.state)
+    fn persist(&mut self) -> AppResult<()> {
+        let bytes = serialized_state(&self.state)?;
+        if crate::safe_io::read_optional(&self.path, MAX_STATE_BYTES)? != self.observed_bytes {
+            return Err(AppError::Config(
+                "State changed outside this process; reload before writing".into(),
+            ));
+        }
+        write_state(&self.path, &self.state)?;
+        self.observed_bytes = Some(bytes);
+        Ok(())
     }
 }
 
 fn load_state(path: &Path) -> AppResult<PersistentState> {
-    if !path.exists() {
+    let Some(bytes) = crate::safe_io::read_optional(path, MAX_STATE_BYTES)? else {
         return Ok(PersistentState::default());
-    }
-    let metadata = fs::symlink_metadata(path).map_err(|error| AppError::io(path, error))?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(AppError::InvalidInput(format!(
-            "PilotWeave state must be a regular file: {}",
-            path.display()
-        )));
-    }
-    if metadata.len() > MAX_STATE_BYTES {
-        return Err(AppError::InvalidInput(format!(
-            "PilotWeave state exceeds {} MiB",
-            MAX_STATE_BYTES / 1024 / 1024
-        )));
-    }
-    let bytes = fs::read(path).map_err(|error| AppError::io(path, error))?;
+    };
     serde_json::from_slice(&bytes).map_err(|error| AppError::json(path, error))
 }
 
-fn write_state(path: &Path, state: &PersistentState) -> AppResult<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| AppError::Config("State path has no parent directory".into()))?;
-    fs::create_dir_all(parent).map_err(|error| AppError::io(parent, error))?;
+fn load_validated_state(path: &Path) -> AppResult<PersistentState> {
+    let mut state = load_state(path)?;
+    if state.version > STATE_VERSION {
+        return Err(AppError::Config(
+            "State version is newer than this build supports".into(),
+        ));
+    }
+    validation::validate_persisted_identities(&state)?;
+    state.version = STATE_VERSION;
+    for connection in &mut state.connections {
+        connection.normalize();
+    }
+    validation::validate_persistent_state(&state)?;
+    Ok(state)
+}
+
+fn serialized_state(state: &PersistentState) -> AppResult<Vec<u8>> {
+    validation::validate_persistent_state(state)?;
     let bytes = serde_json::to_vec_pretty(state)
         .map_err(|error| AppError::Config(format!("Failed to serialize state: {error}")))?;
-    let temp_path = parent.join(format!(".state-{}.tmp", Uuid::new_v4()));
-
-    let result = (|| -> AppResult<()> {
-        let mut options = fs::OpenOptions::new();
-        options.create_new(true).write(true);
-        let mut file = options
-            .open(&temp_path)
-            .map_err(|error| AppError::io(&temp_path, error))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            file.set_permissions(fs::Permissions::from_mode(0o600))
-                .map_err(|error| AppError::io(&temp_path, error))?;
-        }
-        file.write_all(&bytes)
-            .map_err(|error| AppError::io(&temp_path, error))?;
-        file.sync_all()
-            .map_err(|error| AppError::io(&temp_path, error))?;
-
-        #[cfg(windows)]
-        if path.exists() {
-            fs::remove_file(path).map_err(|error| AppError::io(path, error))?;
-        }
-        fs::rename(&temp_path, path).map_err(|error| AppError::io(path, error))?;
-        Ok(())
-    })();
-
-    if result.is_err() {
-        let _ = fs::remove_file(&temp_path);
+    if bytes.len() as u64 > MAX_STATE_BYTES {
+        return Err(AppError::InvalidInput(
+            "Complete state exceeds the 8 MiB reload limit".into(),
+        ));
     }
-    result
+    Ok(bytes)
+}
+
+fn write_state(path: &Path, state: &PersistentState) -> AppResult<()> {
+    let bytes = serialized_state(state)?;
+    if let Some(previous) = crate::safe_io::read_optional(path, MAX_STATE_BYTES)? {
+        load_validated_state(path)?;
+        crate::safe_io::write_private(&crate::safe_io::sibling(path, ".last-good"), &previous)?;
+    }
+    crate::safe_io::write_private(path, &bytes)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::domain::ModelSpec;
+
+    #[test]
+    fn full_state_reload_limit_is_checked_before_any_write() {
+        let mut state = PersistentState::default();
+        for n in 0..40 {
+            state.connections.push(Connection {
+                id: format!("connection-{n}"),
+                name: format!("Connection {n}"),
+                base_url: "https://example.invalid/v1".into(),
+                provider_kind: crate::domain::ProviderKind::Openai,
+                protocol: crate::domain::ApiProtocol::ChatCompletions,
+                headers: (0..32)
+                    .map(|h| (format!("X-Test-{h}"), "x".repeat(8192)))
+                    .collect(),
+                models: vec![ModelSpec {
+                    id: "m".into(),
+                    model_id: "m".into(),
+                    name: "M".into(),
+                    enabled: true,
+                    capabilities: Default::default(),
+                }],
+                secret_ref: format!("connection:connection-{n}"),
+                has_secret: false,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            });
+        }
+        assert!(validation::validate_persistent_state(&state).is_ok());
+        assert!(serialized_state(&state).is_err());
+    }
 
     #[test]
     fn opens_missing_state_as_empty() {
@@ -461,5 +517,30 @@ mod tests {
             .upsert_connection(input)
             .expect_err("unknown update id must fail before keyring access");
         assert!(matches!(error, AppError::InvalidInput(_)));
+    }
+    #[test]
+    fn corrupt_primary_uses_last_good_read_only() {
+        let directory = tempfile::tempdir().expect("temp");
+        let path = directory.path().join("state.json");
+        let bytes = serialized_state(&PersistentState::default()).expect("serialize");
+        fs::write(crate::safe_io::sibling(&path, ".last-good"), bytes).expect("backup");
+        fs::write(&path, b"invalid").expect("corrupt");
+        let mut store = StateStore::open_at(path.clone());
+        assert!(store
+            .recovery()
+            .expect("recovery")
+            .contains("last-known-good"));
+        assert!(store.record_deployments(Vec::new()).is_err());
+        assert_eq!(fs::read(&path).expect("read"), b"invalid");
+    }
+
+    #[test]
+    fn external_state_edit_is_not_overwritten() {
+        let directory = tempfile::tempdir().expect("temp");
+        let path = directory.path().join("state.json");
+        let mut store = StateStore::open_at(path.clone());
+        fs::write(&path, b"external").expect("external");
+        assert!(store.record_deployments(Vec::new()).is_err());
+        assert_eq!(fs::read(&path).expect("read"), b"external");
     }
 }

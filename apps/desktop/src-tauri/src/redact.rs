@@ -6,6 +6,12 @@ const SENSITIVE_MARKERS: &[&str] = &[
     "anthropic-api-key",
     "copilot_provider_api_key",
     "bearer ",
+    "github_token",
+    "gh_token",
+    "refresh_token",
+    "access_token",
+    "cookie",
+    "x-goog-api-key",
 ];
 
 pub fn redact_text(input: &str) -> String {
@@ -32,18 +38,37 @@ fn redact_line(line: &str) -> String {
     {
         return line.to_string();
     }
-    if let Some(index) = line.find(':') {
-        return format!("{}: [REDACTED]", &line[..index]);
+    let trimmed = line.trim_start();
+    for separator in [':', '='] {
+        if let Some(index) = trimmed.find(separator) {
+            let label = &trimmed[..index];
+            if !label.is_empty()
+                && label.len() <= 128
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            {
+                return if separator == ':' {
+                    format!("{label}: [REDACTED]")
+                } else {
+                    format!("{label}=[REDACTED]")
+                };
+            }
+        }
     }
-    if let Some(index) = line.find('=') {
-        return format!("{}=[REDACTED]", &line[..index]);
-    }
-    "[REDACTED]".to_string()
+    "[REDACTED]".into()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn does_not_keep_credentials_in_prefix_before_a_colon() {
+        let value = redact_text("Bearer literal-secret: upstream error");
+        assert!(!value.contains("literal-secret"));
+        assert!(!redact_text("GITHUB_TOKEN=secret").contains("=secret"));
+    }
 
     #[test]
     fn redacts_common_credential_lines() {

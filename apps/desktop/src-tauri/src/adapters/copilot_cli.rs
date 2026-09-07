@@ -8,10 +8,6 @@ use std::env;
 #[cfg(windows)]
 use std::ffi::OsString;
 #[cfg(unix)]
-use std::fs;
-#[cfg(unix)]
-use std::io::Write;
-#[cfg(unix)]
 use std::path::Path;
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -84,6 +80,7 @@ pub fn apply(
     secret: Option<&str>,
     _target: &ClientTarget,
 ) -> AppResult<String> {
+    crate::validation::validate_connection(connection)?;
     let values = desired_environment(connection, secret)?;
     #[cfg(windows)]
     apply_windows(&values)?;
@@ -119,7 +116,11 @@ pub fn desired_environment(
         Some(match connection.protocol {
             ApiProtocol::Responses => "responses".to_string(),
             ApiProtocol::ChatCompletions => "completions".to_string(),
-            ApiProtocol::Messages => unreachable!("messages uses the anthropic provider type"),
+            ApiProtocol::Messages => {
+                return Err(AppError::InvalidInput(
+                    "Provider does not support Messages".into(),
+                ))
+            }
         })
     };
 
@@ -160,6 +161,143 @@ pub fn desired_environment(
             .map(|value| value.to_string()),
     );
     Ok(values)
+}
+
+pub(crate) fn prepare(
+    connection: &Connection,
+    secret: Option<&str>,
+) -> AppResult<Vec<crate::transaction::PreparedWrite>> {
+    let values = desired_environment(connection, secret)?;
+    #[cfg(windows)]
+    {
+        use winreg::types::ToRegValue;
+        values
+            .into_iter()
+            .map(|(name, value)| {
+                let resource = crate::transaction::Resource::UserEnvironment(name);
+                let before = resource.read()?;
+                if let Some(bytes) = &before {
+                    if bytes.len() < 4
+                        || !matches!(
+                            u32::from_le_bytes(
+                                bytes[..4].try_into().map_err(|_| AppError::Config(
+                                    "Invalid registry value".into()
+                                ))?
+                            ),
+                            1 | 2
+                        )
+                    {
+                        return Err(AppError::Unsupported(
+                            "Non-string provider environment requires manual review".into(),
+                        ));
+                    }
+                }
+                let after = value.map(|value| {
+                    let raw = value.to_reg_value();
+                    let mut bytes = (raw.vtype as u32).to_le_bytes().to_vec();
+                    bytes.extend(raw.bytes);
+                    bytes
+                });
+                Ok(crate::transaction::PreparedWrite {
+                    resource,
+                    before,
+                    after,
+                    restore_mode: None,
+                    write_mode: None,
+                })
+            })
+            .collect()
+    }
+    #[cfg(unix)]
+    {
+        let home =
+            dirs::home_dir().ok_or_else(|| AppError::Config("Cannot resolve home".into()))?;
+        prepare_unix_at(&home, &values)
+    }
+}
+
+pub(crate) fn observed_resources() -> AppResult<Vec<crate::transaction::Resource>> {
+    #[cfg(windows)]
+    {
+        Ok(MANAGED_VARIABLES
+            .iter()
+            .map(|name| crate::transaction::Resource::UserEnvironment((*name).into()))
+            .collect())
+    }
+    #[cfg(unix)]
+    {
+        let home =
+            dirs::home_dir().ok_or_else(|| AppError::Config("Cannot resolve home".into()))?;
+        unix_paths(&home)
+            .into_iter()
+            .map(|path| {
+                Ok(crate::transaction::Resource::File(
+                    crate::safe_io::resource_path(&path)?,
+                ))
+            })
+            .collect()
+    }
+}
+
+pub(crate) fn notify_environment() -> Option<String> {
+    #[cfg(windows)]
+    if broadcast_environment_change().is_err() {
+        return Some("Configuration is saved, but the environment-change notification failed; restart the terminal or sign out/in".into());
+    }
+    None
+}
+
+#[cfg(unix)]
+fn unix_paths(home: &Path) -> Vec<PathBuf> {
+    vec![
+        home.join(".pilotweave/copilot-cli-env.sh"),
+        home.join(".pilotweave/copilot-cli-env.fish"),
+        home.join(".profile"),
+        home.join(".bashrc"),
+        home.join(".zshrc"),
+        home.join(".config/fish/conf.d/pilotweave-copilot.fish"),
+    ]
+}
+
+#[cfg(unix)]
+fn prepare_unix_at(
+    home: &Path,
+    values: &BTreeMap<String, Option<String>>,
+) -> AppResult<Vec<crate::transaction::PreparedWrite>> {
+    use crate::transaction::PreparedWrite;
+    let paths = unix_paths(home);
+    let mut writes = vec![
+        PreparedWrite::file(
+            &paths[0],
+            Some(render_posix_env(values).into_bytes()),
+            false,
+        )?,
+        PreparedWrite::file(&paths[1], Some(render_fish_env(values).into_bytes()), false)?,
+    ];
+    let block = format!(
+        "{BLOCK_START}\n. {}\n{BLOCK_END}",
+        shell_quote(&paths[0].to_string_lossy())
+    );
+    for path in &paths[2..5] {
+        let before = crate::safe_io::read_optional(path, crate::transaction::MAX_RESOURCE_BYTES)?;
+        let text = std::str::from_utf8(before.as_deref().unwrap_or_default())
+            .map_err(|_| AppError::Config("Shell profile is not UTF-8".into()))?;
+        let after = replace_bounded_block(text, &block)?.into_bytes();
+        let write = PreparedWrite::file(path, Some(after), true)?;
+        if before != write.before {
+            return Err(AppError::Config(
+                "Shell profile changed during preparation".into(),
+            ));
+        }
+        writes.push(write);
+    }
+    let fish = format!("source {}\n", fish_quote(&paths[1].to_string_lossy()));
+    writes.push(PreparedWrite::file(
+        &paths[5],
+        Some(fish.into_bytes()),
+        false,
+    )?);
+    Ok(writes)
 }
 
 fn render_headers(connection: &Connection, secret: Option<&str>) -> String {
@@ -241,18 +379,24 @@ fn apply_env_values(
             },
         };
         if let Err(error) = result {
+            let mut rollback_failed = false;
             for rollback_name in MANAGED_VARIABLES {
                 match before.get(*rollback_name).and_then(Option::as_deref) {
                     Some(value) => {
-                        let _ = store.set(rollback_name, value);
+                        rollback_failed |= store.set(rollback_name, value).is_err();
                     }
                     None => {
-                        let _ = store.delete(rollback_name);
+                        rollback_failed |= store.delete(rollback_name).is_err();
                     }
                 }
             }
             return Err(AppError::Config(format!(
-                "Failed to update {name}; previous environment was restored: {error}"
+                "Failed to update {name}; rollback status: {}: {error}",
+                if rollback_failed {
+                    "incomplete; manual recovery required"
+                } else {
+                    "restored"
+                }
             )));
         }
     }
@@ -285,7 +429,10 @@ fn apply_windows(values: &BTreeMap<String, Option<String>>) -> AppResult<()> {
         .map_err(|error| AppError::Config(format!("Failed to open HKCU\\Environment: {error}")))?;
     let mut store = RegistryEnvStore(key);
     apply_env_values(&mut store, values)?;
-    broadcast_environment_change()
+    if broadcast_environment_change().is_err() {
+        log::warn!("Environment saved; notification failed. Open a new login session if needed");
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -329,27 +476,16 @@ fn apply_unix(values: &BTreeMap<String, Option<String>>) -> AppResult<()> {
 /// Split from [`apply_unix`] so tests can target a temporary home directory.
 #[cfg(unix)]
 fn apply_unix_at(home: &Path, values: &BTreeMap<String, Option<String>>) -> AppResult<()> {
-    let state_dir = home.join(".pilotweave");
-    fs::create_dir_all(&state_dir).map_err(|error| AppError::io(&state_dir, error))?;
-    let env_path = state_dir.join("copilot-cli-env.sh");
-    let fish_env_path = state_dir.join("copilot-cli-env.fish");
-    atomic_write_private(&env_path, render_posix_env(values).as_bytes())?;
-    atomic_write_private(&fish_env_path, render_fish_env(values).as_bytes())?;
-
-    let source_line = format!(". {}", shell_quote(&env_path.to_string_lossy()));
-    let block = format!("{BLOCK_START}\n{source_line}\n{BLOCK_END}");
-    for name in [".profile", ".bashrc", ".zshrc"] {
-        update_profile_block(&home.join(name), &block)?;
+    let writes = prepare_unix_at(home, values)?;
+    let path = home.join(".pilotweave/cli-adapter-journal.json");
+    let mut transaction =
+        crate::transaction::Transaction::begin(path, &Uuid::new_v4().to_string(), writes)?;
+    if let Err(error) = transaction.apply() {
+        transaction.rollback()?;
+        transaction.clear()?;
+        return Err(error);
     }
-
-    let fish_hook = home
-        .join(".config")
-        .join("fish")
-        .join("conf.d")
-        .join("pilotweave-copilot.fish");
-    let fish_source = format!("source {}\n", fish_quote(&fish_env_path.to_string_lossy()));
-    atomic_write_private(&fish_hook, fish_source.as_bytes())?;
-    Ok(())
+    transaction.complete()
 }
 
 #[cfg(unix)]
@@ -391,22 +527,12 @@ fn fish_quote(value: &str) -> String {
 }
 
 #[cfg(unix)]
-fn update_profile_block(path: &Path, block: &str) -> AppResult<()> {
-    ensure_regular_file_or_missing(path)?;
-    let existing = if path.exists() {
-        fs::read_to_string(path).map_err(|error| AppError::io(path, error))?
-    } else {
-        String::new()
-    };
-    let updated = replace_bounded_block(&existing, block)?;
-    if updated != existing {
-        atomic_write_private(path, updated.as_bytes())?;
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
 fn replace_bounded_block(existing: &str, block: &str) -> AppResult<String> {
+    if existing.matches(BLOCK_START).count() > 1 || existing.matches(BLOCK_END).count() > 1 {
+        return Err(AppError::Config(
+            "Multiple managed shell blocks require manual review".into(),
+        ));
+    }
     match (existing.find(BLOCK_START), existing.find(BLOCK_END)) {
         (None, None) => {
             let mut output = existing.trim_end_matches('\n').to_string();
@@ -428,54 +554,10 @@ fn replace_bounded_block(existing: &str, block: &str) -> AppResult<String> {
             }
             Ok(output)
         }
-        _ => Err(AppError::Config(format!(
-            "Shell profile contains an incomplete PilotWeave block: {}",
-            existing.lines().next().unwrap_or_default()
-        ))),
+        _ => Err(AppError::Config(
+            "Shell profile contains an incomplete PilotWeave block".into(),
+        )),
     }
-}
-
-#[cfg(unix)]
-fn ensure_regular_file_or_missing(path: &Path) -> AppResult<()> {
-    if let Ok(metadata) = fs::symlink_metadata(path) {
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            return Err(AppError::InvalidInput(format!(
-                "Refusing to modify a non-regular file: {}",
-                path.display()
-            )));
-        }
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn atomic_write_private(path: &Path, bytes: &[u8]) -> AppResult<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let parent = path
-        .parent()
-        .ok_or_else(|| AppError::Config("Target path has no parent directory".into()))?;
-    fs::create_dir_all(parent).map_err(|error| AppError::io(parent, error))?;
-    ensure_regular_file_or_missing(path)?;
-    let temp = parent.join(format!(".pilotweave-{}.tmp", Uuid::new_v4()));
-    let result = (|| -> AppResult<()> {
-        let mut file = fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temp)
-            .map_err(|error| AppError::io(&temp, error))?;
-        file.set_permissions(fs::Permissions::from_mode(0o600))
-            .map_err(|error| AppError::io(&temp, error))?;
-        file.write_all(bytes)
-            .map_err(|error| AppError::io(&temp, error))?;
-        file.sync_all()
-            .map_err(|error| AppError::io(&temp, error))?;
-        fs::rename(&temp, path).map_err(|error| AppError::io(path, error))?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temp);
-    }
-    result
 }
 
 #[cfg(test)]

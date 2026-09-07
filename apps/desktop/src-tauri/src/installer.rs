@@ -1,11 +1,11 @@
 use crate::error::{AppError, AppResult};
+#[cfg(windows)]
+use crate::native_process::CapturedOutput;
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 #[cfg(windows)]
 use std::path::{Path, PathBuf};
-#[cfg(windows)]
-use std::process::{Command, Output};
 use uuid::Uuid;
 
 const INSTALL_PLAN_TTL_SECONDS: i64 = 15 * 60;
@@ -106,6 +106,11 @@ pub struct InstallPlanStore {
 impl InstallPlanStore {
     pub fn preview(&mut self, requested_component_ids: Vec<String>) -> AppResult<InstallPlan> {
         self.purge_expired();
+        if self.plans.len() >= 16 {
+            return Err(AppError::InvalidInput(
+                "Too many pending plans; wait for expiry or apply an existing plan".into(),
+            ));
+        }
         let observations = discover_components();
         let requested = canonical_component_ids(&requested_component_ids)?;
         let mut operations = Vec::new();
@@ -143,13 +148,7 @@ impl InstallPlanStore {
     }
 
     pub fn consume(&mut self, plan_id: &str) -> AppResult<InstallPlan> {
-        self.purge_expired();
-        let stored = self.plans.remove(plan_id).ok_or_else(|| {
-            AppError::InvalidInput(
-                "Install plan is missing, expired, or was already consumed; preview again"
-                    .to_string(),
-            )
-        })?;
+        let stored = self.take(plan_id)?;
         let current = discover_components();
         for component_id in &stored.plan.requested_component_ids {
             let before = stored
@@ -164,6 +163,13 @@ impl InstallPlanStore {
             }
         }
         Ok(stored.plan)
+    }
+
+    fn take(&mut self, plan_id: &str) -> AppResult<StoredInstallPlan> {
+        self.purge_expired();
+        self.plans.remove(plan_id).ok_or_else(|| {
+            AppError::InvalidInput("Install plan is missing, expired or consumed".into())
+        })
     }
 
     fn purge_expired(&mut self) {
@@ -188,8 +194,7 @@ pub fn discover_components() -> Vec<InstallComponentObservation> {
     }
 }
 
-pub fn apply_plan(store: &mut InstallPlanStore, plan_id: &str) -> AppResult<InstallApplyResult> {
-    let plan = store.consume(plan_id)?;
+pub fn execute_plan(plan: InstallPlan) -> AppResult<InstallApplyResult> {
     #[cfg(windows)]
     {
         let mut runner = NativeRunner;
@@ -377,7 +382,7 @@ fn observation_from_path(
 
 #[cfg(windows)]
 trait ProcessRunner {
-    fn run(&mut self, executable: &Path, args: &[&str]) -> std::io::Result<Output>;
+    fn run(&mut self, executable: &Path, args: &[&str]) -> AppResult<CapturedOutput>;
 }
 
 #[cfg(windows)]
@@ -385,8 +390,14 @@ struct NativeRunner;
 
 #[cfg(windows)]
 impl ProcessRunner for NativeRunner {
-    fn run(&mut self, executable: &Path, args: &[&str]) -> std::io::Result<Output> {
-        Command::new(executable).args(args).output()
+    fn run(&mut self, executable: &Path, args: &[&str]) -> AppResult<CapturedOutput> {
+        let args = args.iter().map(std::ffi::OsStr::new).collect::<Vec<_>>();
+        crate::native_process::run_capture_bounded(
+            executable,
+            &args,
+            std::time::Duration::from_secs(20 * 60),
+            128 * 1024,
+        )
     }
 }
 
@@ -458,8 +469,17 @@ fn apply_windows_plan(
                 };
                 runner.run(&code, &["--install-extension", COPILOT_EXTENSION_ID])
             }
-        }
-        .map_err(|error| AppError::Config(format!("Failed to launch installer: {error}")))?;
+        };
+        let output = match output {
+            Ok(output) => output,
+            Err(_) => {
+                results.push(InstallOperationResult {
+                    component_id: operation.component_id.clone(), status: InstallResultStatus::Failed,
+                    detail: "Installer could not complete within its process safety limits; independent components will continue".into(),
+                });
+                continue;
+            }
+        };
 
         let after = discover_windows_components();
         let verified =
@@ -492,35 +512,34 @@ fn apply_windows_plan(
 
 #[cfg(windows)]
 fn extension_installed(code: &Path) -> bool {
-    Command::new(code)
-        .arg("--list-extensions")
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|output| {
-            String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .any(|line| line.trim().eq_ignore_ascii_case(COPILOT_EXTENSION_ID))
-        })
-        .unwrap_or(false)
+    crate::native_process::run_capture_bounded(
+        code,
+        &[std::ffi::OsStr::new("--list-extensions")],
+        std::time::Duration::from_secs(15),
+        128 * 1024,
+    )
+    .ok()
+    .filter(|output| output.status.success() && !output.stdout_truncated)
+    .map(|output| {
+        output
+            .stdout
+            .lines()
+            .any(|line| line.trim().eq_ignore_ascii_case(COPILOT_EXTENSION_ID))
+    })
+    .unwrap_or(false)
 }
 
 #[cfg(windows)]
 fn find_code_executable() -> Option<PathBuf> {
-    find_on_path("code.exe")
-        .or_else(|| find_on_path("code.cmd"))
-        .or_else(|| {
-            std::env::var_os("LOCALAPPDATA")
-                .map(PathBuf::from)
-                .and_then(|root| {
-                    [
-                        root.join("Programs/Microsoft VS Code/bin/code.cmd"),
-                        root.join("Programs/Microsoft VS Code/Code.exe"),
-                    ]
+    find_on_path("code.exe").or_else(|| {
+        std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .and_then(|root| {
+                [root.join("Programs/Microsoft VS Code/Code.exe")]
                     .into_iter()
                     .find(|path| path.is_file())
-                })
-        })
+            })
+    })
 }
 
 #[cfg(windows)]
@@ -592,12 +611,24 @@ mod tests {
     }
 
     #[test]
-    fn install_plan_is_one_shot() {
+    fn install_plan_is_one_shot_without_live_machine_discovery() {
         let mut store = InstallPlanStore::default();
-        let plan = store
-            .preview(vec![COMPONENT_COPILOT_CLI.to_string()])
-            .expect("preview");
-        let _ = store.consume(&plan.id).expect("consume");
-        assert!(store.consume(&plan.id).is_err());
+        let now = Utc::now();
+        let plan = InstallPlan {
+            id: "fixture".into(),
+            requested_component_ids: vec![COMPONENT_COPILOT_CLI.into()],
+            operations: Vec::new(),
+            created_at: now,
+            expires_at: now + Duration::minutes(15),
+        };
+        store.plans.insert(
+            plan.id.clone(),
+            StoredInstallPlan {
+                plan: plan.clone(),
+                observation_fingerprints: BTreeMap::new(),
+            },
+        );
+        assert!(store.take(&plan.id).is_ok());
+        assert!(store.take(&plan.id).is_err());
     }
 }

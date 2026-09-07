@@ -6,7 +6,6 @@ use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use uuid::Uuid;
 
@@ -142,6 +141,20 @@ pub fn discover_targets() -> AppResult<Vec<ClientTarget>> {
 
 pub fn preview(connection: &Connection, target: &ClientTarget) -> DeploymentOperation {
     let model_count = connection.enabled_models().count();
+    let changes = if model_count == 0 {
+        vec![
+            "Remove the Custom Endpoint group owned by this PilotWeave connection".to_string(),
+            "Preserve every group not owned by this PilotWeave connection".to_string(),
+            "Create a private rollback backup before the first write".to_string(),
+        ]
+    } else {
+        vec![
+            format!("Publish {model_count} enabled model(s) as one Custom Endpoint group"),
+            "Preserve every group not owned by this PilotWeave connection".to_string(),
+            "Create a private rollback backup before the first write".to_string(),
+            "Materialize the credential only in the native client configuration".to_string(),
+        ]
+    };
     DeploymentOperation {
         id: Uuid::new_v4().to_string(),
         target_id: target.id.clone(),
@@ -152,12 +165,7 @@ pub fn preview(connection: &Connection, target: &ClientTarget) -> DeploymentOper
             .as_deref()
             .map(|path| format!("Update {path}"))
             .unwrap_or_else(|| "VS Code is not available".to_string()),
-        changes: vec![
-            format!("Publish {model_count} enabled model(s) as one Custom Endpoint group"),
-            "Preserve every group not owned by this PilotWeave connection".to_string(),
-            "Create a private rollback backup before the first write".to_string(),
-            "Materialize the credential only in the native client configuration".to_string(),
-        ],
+        changes,
         supported: target.detected && target.supports_write,
         requires_restart: false,
     }
@@ -172,21 +180,59 @@ pub fn apply(
         target.path.as_deref().map(PathBuf::from).ok_or_else(|| {
             AppError::Unsupported("VS Code target has no configuration path".into())
         })?;
-    ensure_regular_file_or_missing(&path)?;
-    let mut groups = read_groups(&path)?;
-    groups.retain(|group| !is_owned_group(group, &connection.id));
-    if connection.enabled_models().next().is_some() {
-        groups.push(render_group(connection, secret));
+    let write = prepare(connection, secret, &path)?;
+    if !write.changed() {
+        return Ok("Already synchronized; original formatting preserved".into());
     }
-
-    let bytes = serde_json::to_vec_pretty(&Value::Array(groups)).map_err(|error| {
-        AppError::Config(format!("Failed to serialize VS Code models: {error}"))
-    })?;
-    let mut bytes_with_newline = bytes;
-    bytes_with_newline.push(b'\n');
     create_backup_once(&path)?;
-    atomic_write_private(&path, &bytes_with_newline)?;
+    atomic_write_private(&path, write.after.as_deref().unwrap_or_default())?;
     Ok(format!("Updated {}", path.display()))
+}
+
+pub(crate) fn prepare(
+    connection: &Connection,
+    secret: Option<&str>,
+    path: &Path,
+) -> AppResult<crate::transaction::PreparedWrite> {
+    crate::validation::validate_connection(connection)?;
+    ensure_regular_file_or_missing(path)?;
+    let before = crate::safe_io::read_optional(path, MAX_CONFIG_BYTES)?;
+    let groups = read_groups(path)?;
+    let mut desired = groups.clone();
+    desired.retain(|group| !is_owned_group(group, &connection.id));
+    if connection.default_model().is_some() {
+        desired.push(render_group(connection, secret));
+    }
+    let after = if desired == groups {
+        before.clone()
+    } else {
+        let mut bytes = serde_json::to_vec_pretty(&Value::Array(desired))
+            .map_err(|_| AppError::Config("Cannot render VS Code model configuration".into()))?;
+        bytes.push(b'\n');
+        Some(bytes)
+    };
+    let write = crate::transaction::PreparedWrite::file(path, after, false)?;
+    if write.before != before {
+        return Err(AppError::Config(
+            "VS Code configuration changed during preparation".into(),
+        ));
+    }
+    Ok(write)
+}
+
+pub(crate) fn original_backup(
+    path: &Path,
+    before: &[u8],
+) -> AppResult<Option<crate::transaction::PreparedWrite>> {
+    let backup = backup_path(path);
+    if crate::safe_io::read_optional(&backup, MAX_CONFIG_BYTES)?.is_some() {
+        return Ok(None);
+    }
+    Ok(Some(crate::transaction::PreparedWrite::file(
+        &backup,
+        Some(before.to_vec()),
+        false,
+    )?))
 }
 
 fn default_user_roots() -> Vec<(Edition, PathBuf)> {
@@ -420,51 +466,11 @@ fn create_backup_once(path: &Path) -> AppResult<()> {
 }
 
 fn ensure_regular_file_or_missing(path: &Path) -> AppResult<()> {
-    if let Ok(metadata) = fs::symlink_metadata(path) {
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            return Err(AppError::InvalidInput(format!(
-                "Refusing to modify a non-regular file: {}",
-                path.display()
-            )));
-        }
-    }
-    Ok(())
+    crate::safe_io::ensure_regular_or_missing(path)
 }
 
 fn atomic_write_private(path: &Path, bytes: &[u8]) -> AppResult<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| AppError::Config("Target path has no parent directory".into()))?;
-    fs::create_dir_all(parent).map_err(|error| AppError::io(parent, error))?;
-    ensure_regular_file_or_missing(path)?;
-    let temp = parent.join(format!(".pilotweave-{}.tmp", Uuid::new_v4()));
-    let result = (|| -> AppResult<()> {
-        let mut file = fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temp)
-            .map_err(|error| AppError::io(&temp, error))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            file.set_permissions(fs::Permissions::from_mode(0o600))
-                .map_err(|error| AppError::io(&temp, error))?;
-        }
-        file.write_all(bytes)
-            .map_err(|error| AppError::io(&temp, error))?;
-        file.sync_all()
-            .map_err(|error| AppError::io(&temp, error))?;
-        #[cfg(windows)]
-        if path.exists() {
-            fs::remove_file(path).map_err(|error| AppError::io(path, error))?;
-        }
-        fs::rename(&temp, path).map_err(|error| AppError::io(path, error))?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temp);
-    }
-    result
+    crate::safe_io::write_private(path, bytes)
 }
 
 #[cfg(test)]

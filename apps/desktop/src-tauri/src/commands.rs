@@ -16,21 +16,34 @@ use crate::installer::{
     self, InstallApplyResult, InstallComponentObservation, InstallPlan, InstallPlanStore,
 };
 use crate::redact;
-use crate::state::StateStore;
+use crate::state::{DeleteConnectionResult, StateStore};
 use crate::usage_db::UsageDb;
 use chrono::Utc;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use tauri::State;
 use uuid::Uuid;
 
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoveryPlan {
+    id: String,
+    view: crate::transaction::RecoveryView,
+    expires_at: chrono::DateTime<Utc>,
+}
+
+#[derive(Clone)]
 pub struct ManagedState {
-    store: Mutex<StateStore>,
-    plans: Mutex<PlanStore>,
-    install_plans: Mutex<InstallPlanStore>,
-    login_plans: Mutex<LoginPlanStore>,
-    login_store: Mutex<LoginStore>,
-    github_authorization: Mutex<GithubAuthorizationStore>,
-    usage_db: Mutex<Option<UsageDb>>,
+    writes: Arc<Mutex<()>>,
+    recovery_plan: Arc<Mutex<Option<RecoveryPlan>>>,
+    installs: Arc<Mutex<()>>,
+    logins: Arc<Mutex<()>>,
+    store: Arc<Mutex<StateStore>>,
+    plans: Arc<Mutex<PlanStore>>,
+    install_plans: Arc<Mutex<InstallPlanStore>>,
+    login_plans: Arc<Mutex<LoginPlanStore>>,
+    login_store: Arc<Mutex<LoginStore>>,
+    github_authorization: Arc<Mutex<GithubAuthorizationStore>>,
+    usage_db: Arc<Mutex<Option<UsageDb>>>,
     usage_db_error: Option<String>,
 }
 
@@ -43,13 +56,17 @@ impl ManagedState {
         usage_db_error: Option<String>,
     ) -> Self {
         Self {
-            store: Mutex::new(store),
-            plans: Mutex::new(PlanStore::default()),
-            install_plans: Mutex::new(InstallPlanStore::default()),
-            login_plans: Mutex::new(LoginPlanStore::default()),
-            login_store: Mutex::new(login_store),
-            github_authorization: Mutex::new(github_authorization),
-            usage_db: Mutex::new(usage_db),
+            writes: Arc::new(Mutex::new(())),
+            recovery_plan: Arc::new(Mutex::new(None)),
+            installs: Arc::new(Mutex::new(())),
+            logins: Arc::new(Mutex::new(())),
+            store: Arc::new(Mutex::new(store)),
+            plans: Arc::new(Mutex::new(PlanStore::default())),
+            install_plans: Arc::new(Mutex::new(InstallPlanStore::default())),
+            login_plans: Arc::new(Mutex::new(LoginPlanStore::default())),
+            login_store: Arc::new(Mutex::new(login_store)),
+            github_authorization: Arc::new(Mutex::new(github_authorization)),
+            usage_db: Arc::new(Mutex::new(usage_db)),
             usage_db_error,
         }
     }
@@ -96,79 +113,132 @@ fn command_error(error: AppError) -> String {
 }
 
 #[tauri::command]
-pub fn get_dashboard(state: State<'_, ManagedState>) -> Result<DashboardSnapshot, String> {
-    let (state_path, connections, deployments, state_recovery) = {
-        let store = state.store().map_err(command_error)?;
-        (
-            store.path().to_string_lossy().to_string(),
-            store.connections().to_vec(),
-            store.deployments().to_vec(),
-            store.recovery().map(str::to_string),
-        )
-    };
-    Ok(DashboardSnapshot {
-        version: STATE_VERSION,
-        state_path,
-        connections,
-        clients: adapters::discover_all(),
-        deployments,
-        state_recovery: state_recovery.map(|reason| redact::redact_text(&reason)),
-        usage_db: state.usage_db_status().map_err(command_error)?,
+pub async fn get_dashboard(state: State<'_, ManagedState>) -> Result<DashboardSnapshot, String> {
+    let state = state.inner().clone();
+    native_job(move || {
+        let (state_path, mut connections, deployments, state_recovery) = {
+            let store = state.store().map_err(command_error)?;
+            (
+                store.path().to_string_lossy().to_string(),
+                store.connections().to_vec(),
+                store.deployments().to_vec(),
+                store.recovery().map(str::to_string),
+            )
+        };
+        let credential_statuses = connections
+            .iter()
+            .map(|connection| {
+                (
+                    connection.id.clone(),
+                    crate::secrets::observe(&connection.id),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        for connection in &mut connections {
+            match credential_statuses[&connection.id].state {
+                crate::domain::CredentialState::Stored => connection.has_secret = true,
+                crate::domain::CredentialState::Missing => connection.has_secret = false,
+                crate::domain::CredentialState::Unavailable => {}
+            }
+        }
+        let deployment_recovery = deployment::recovery_required(std::path::Path::new(&state_path))
+            .then(|| {
+                "An interrupted deployment requires recovery review; managed writes are disabled"
+                    .to_string()
+            });
+        Ok(DashboardSnapshot {
+            credential_statuses,
+            deployment_recovery,
+            version: STATE_VERSION,
+            state_path,
+            connections,
+            clients: adapters::discover_all(),
+            deployments,
+            state_recovery: state_recovery.map(|reason| redact::redact_text(&reason)),
+            usage_db: state.usage_db_status().map_err(command_error)?,
+        })
     })
+    .await
 }
 
 #[tauri::command]
-pub fn get_installation_status() -> Vec<InstallComponentObservation> {
-    installer::discover_components()
+pub async fn get_installation_status() -> Result<Vec<InstallComponentObservation>, String> {
+    native_job(|| Ok(installer::discover_components())).await
 }
 
 #[tauri::command(rename_all = "camelCase")]
-pub fn preview_install(
+pub async fn preview_install(
     state: State<'_, ManagedState>,
     component_ids: Vec<String>,
 ) -> Result<InstallPlan, String> {
-    state
-        .install_plans()
-        .and_then(|mut plans| plans.preview(component_ids))
-        .map_err(command_error)
+    let state = state.inner().clone();
+    native_job(move || {
+        state
+            .install_plans()
+            .and_then(|mut plans| plans.preview(component_ids))
+            .map_err(command_error)
+    })
+    .await
 }
 
 #[tauri::command(rename_all = "camelCase")]
-pub fn apply_install_plan(
+pub async fn apply_install_plan(
     state: State<'_, ManagedState>,
     plan_id: String,
 ) -> Result<InstallApplyResult, String> {
-    state
-        .install_plans()
-        .and_then(|mut plans| installer::apply_plan(&mut plans, &plan_id))
-        .map_err(command_error)
+    let state = state.inner().clone();
+    native_job(move || {
+        let _run = state
+            .installs
+            .try_lock()
+            .map_err(|_| "Another installation is active".to_string())?;
+        let plan = state
+            .install_plans()
+            .and_then(|mut plans| plans.consume(&plan_id))
+            .map_err(command_error)?;
+        installer::execute_plan(plan).map_err(command_error)
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn get_account_status(state: State<'_, ManagedState>) -> Result<AccountStatusSnapshot, String> {
-    let (runs, recovery) = {
-        let store = state.login_store().map_err(command_error)?;
-        (store.runs(), store.recovery())
-    };
-    Ok(account::discover_status(runs, recovery))
+pub async fn get_account_status(
+    state: State<'_, ManagedState>,
+) -> Result<AccountStatusSnapshot, String> {
+    let state = state.inner().clone();
+    native_job(move || {
+        let (runs, recovery) = {
+            let store = state.login_store().map_err(command_error)?;
+            (store.runs(), store.recovery())
+        };
+        Ok(account::discover_status(runs, recovery))
+    })
+    .await
 }
 
 #[tauri::command(rename_all = "camelCase")]
-pub fn preview_login(
+pub async fn preview_login(
     state: State<'_, ManagedState>,
     surfaces: Vec<LoginSurface>,
 ) -> Result<LoginPlan, String> {
-    state
-        .login_plans()
-        .and_then(|mut plans| plans.preview(surfaces))
-        .map_err(command_error)
+    let state = state.inner().clone();
+    native_job(move || {
+        state
+            .login_plans()
+            .and_then(|mut plans| plans.preview(surfaces))
+            .map_err(command_error)
+    })
+    .await
 }
 
 #[tauri::command(rename_all = "camelCase")]
-pub fn apply_login_plan(
+pub async fn apply_login_plan(
     state: State<'_, ManagedState>,
     plan_id: String,
 ) -> Result<LoginApplyResult, String> {
+    let state = state.inner().clone();
+    native_job(move || {
+    let _run = state.logins.try_lock().map_err(|_| "Another sign-in launch is active".to_string())?;
     let stored = {
         let mut plans = state.login_plans().map_err(command_error)?;
         plans.consume(&plan_id).map_err(command_error)?
@@ -194,16 +264,22 @@ pub fn apply_login_plan(
         run: finished,
         account_status: account::discover_status(runs, recovery),
     })
+
+    }).await
 }
 
 #[tauri::command]
-pub fn get_github_authorization_status(
+pub async fn get_github_authorization_status(
     state: State<'_, ManagedState>,
 ) -> Result<GithubAuthorizationStatus, String> {
-    Ok(state
-        .github_authorization()
-        .map_err(command_error)?
-        .status())
+    let state = state.inner().clone();
+    native_job(move || {
+        Ok(state
+            .github_authorization()
+            .map_err(command_error)?
+            .status())
+    })
+    .await
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -211,17 +287,25 @@ pub async fn authorize_github(
     state: State<'_, ManagedState>,
     token: String,
 ) -> Result<GithubAuthorizationStatus, String> {
-    let existing = state
-        .github_authorization()
-        .map_err(command_error)?
-        .status();
+    let (revision, existing) = {
+        let mut store = state.github_authorization().map_err(command_error)?;
+        (
+            store.begin_attempt().map_err(command_error)?,
+            store.status(),
+        )
+    };
     let (token, outcome) = validate_github_token(token).await?;
+    let mut store = state.github_authorization().map_err(command_error)?;
+    store.ensure_current(revision).map_err(command_error)?;
     match outcome {
-        GithubValidationOutcome::Verified(validation) => state
-            .github_authorization()
-            .and_then(|mut store| store.save_verified(&token, validation))
+        GithubValidationOutcome::Verified(validation) => store
+            .save_verified(&token, validation)
             .map_err(command_error),
-        GithubValidationOutcome::Rejected(status) => Ok(merge_rejected_attempt(status, existing)),
+        GithubValidationOutcome::Rejected(status) if existing.has_secret => Err(format!(
+            "{} The previously stored authorization was left unchanged.",
+            status.detail
+        )),
+        GithubValidationOutcome::Rejected(status) => Ok(status),
     }
 }
 
@@ -229,32 +313,38 @@ pub async fn authorize_github(
 pub async fn refresh_github_authorization(
     state: State<'_, ManagedState>,
 ) -> Result<GithubAuthorizationStatus, String> {
-    let (token, existing) = {
-        let store = state.github_authorization().map_err(command_error)?;
-        let existing = store.status();
+    let (token, revision) = {
+        let mut store = state.github_authorization().map_err(command_error)?;
         let Some(token) = store.secret_for_refresh().map_err(command_error)? else {
-            return Ok(existing);
+            return Ok(store.status());
         };
-        (token, existing)
+        (token, store.begin_attempt().map_err(command_error)?)
     };
     let (token, outcome) = validate_github_token(token).await?;
+    let mut store = state.github_authorization().map_err(command_error)?;
+    store.ensure_current(revision).map_err(command_error)?;
     match outcome {
-        GithubValidationOutcome::Verified(validation) => state
-            .github_authorization()
-            .and_then(|mut store| store.save_verified(&token, validation))
+        GithubValidationOutcome::Verified(validation) => store
+            .save_verified(&token, validation)
             .map_err(command_error),
-        GithubValidationOutcome::Rejected(status) => Ok(merge_rejected_attempt(status, existing)),
+        GithubValidationOutcome::Rejected(status) => {
+            store.record_refresh_failure(status).map_err(command_error)
+        }
     }
 }
 
 #[tauri::command]
-pub fn clear_github_authorization(
+pub async fn clear_github_authorization(
     state: State<'_, ManagedState>,
 ) -> Result<GithubAuthorizationStatus, String> {
-    state
-        .github_authorization()
-        .and_then(|mut store| store.clear())
-        .map_err(command_error)
+    let state = state.inner().clone();
+    native_job(move || {
+        state
+            .github_authorization()
+            .and_then(|mut store| store.clear())
+            .map_err(command_error)
+    })
+    .await
 }
 
 async fn validate_github_token(token: String) -> Result<(String, GithubValidationOutcome), String> {
@@ -271,201 +361,187 @@ async fn validate_github_token(token: String) -> Result<(String, GithubValidatio
     .map_err(command_error)
 }
 
-fn merge_rejected_attempt(
-    mut rejected: GithubAuthorizationStatus,
-    existing: GithubAuthorizationStatus,
-) -> GithubAuthorizationStatus {
-    if existing.has_secret {
-        rejected.identity = existing.identity;
-        rejected.has_secret = true;
-        rejected.scopes = existing.scopes;
-        rejected.billing_capability = existing.billing_capability;
-        rejected.billing_detail = existing.billing_detail;
-        rejected.validated_at = existing.validated_at;
-        rejected
-            .detail
-            .push_str(" The previously stored authorization was left unchanged.");
-    }
-    rejected
-}
-
 #[tauri::command(rename_all = "camelCase")]
-pub fn upsert_connection(
+pub async fn upsert_connection(
     state: State<'_, ManagedState>,
     input: ConnectionInput,
 ) -> Result<Connection, String> {
-    let mut store = state.store().map_err(command_error)?;
-    deployment::ensure_no_pending_journal(store.path()).map_err(command_error)?;
-    store.upsert_connection(input).map_err(command_error)
+    let state = state.inner().clone();
+    native_job(move || {
+        let _write = state
+            .writes
+            .try_lock()
+            .map_err(|_| "Another managed write is active".to_string())?;
+        let mut store = state.store().map_err(command_error)?;
+        let _lease =
+            crate::safe_io::Lease::acquire(&crate::safe_io::sibling(store.path(), ".write-lock"))
+                .map_err(command_error)?;
+        deployment::ensure_no_pending_journal(store.path()).map_err(command_error)?;
+        store.upsert_connection(input).map_err(command_error)
+    })
+    .await
 }
 
 #[tauri::command(rename_all = "camelCase")]
-pub fn delete_connection(
+pub async fn delete_connection(
     state: State<'_, ManagedState>,
     connection_id: String,
-) -> Result<bool, String> {
-    let mut store = state.store().map_err(command_error)?;
-    deployment::ensure_no_pending_journal(store.path()).map_err(command_error)?;
-    store
-        .delete_connection(&connection_id)
-        .map(|()| true)
-        .map_err(command_error)
+) -> Result<DeleteConnectionResult, String> {
+    let state = state.inner().clone();
+    native_job(move || {
+        let _write = state
+            .writes
+            .try_lock()
+            .map_err(|_| "Another managed write is active".to_string())?;
+        let mut store = state.store().map_err(command_error)?;
+        let _lease =
+            crate::safe_io::Lease::acquire(&crate::safe_io::sibling(store.path(), ".write-lock"))
+                .map_err(command_error)?;
+        deployment::ensure_no_pending_journal(store.path()).map_err(command_error)?;
+        store
+            .delete_connection(&connection_id)
+            .map_err(command_error)
+    })
+    .await
 }
 
 #[tauri::command(rename_all = "camelCase")]
-pub fn preview_deployment(
+pub async fn preview_deployment(
     state: State<'_, ManagedState>,
     connection_id: String,
     target_ids: Vec<String>,
 ) -> Result<DeploymentPlan, String> {
-    let connection = {
-        let store = state.store().map_err(command_error)?;
-        deployment::ensure_no_pending_journal(store.path()).map_err(command_error)?;
-        store.connection(&connection_id).map_err(command_error)?
-    };
-    let plan = adapters::preview(&connection, &target_ids).map_err(command_error)?;
-    let targets = adapters::discover_all();
-    state
-        .plans()
-        .and_then(|mut plans| plans.insert(&connection, plan, &targets))
-        .map_err(command_error)
+    let state = state.inner().clone();
+    native_job(move || {
+        let (connection, secret) = {
+            let store = state.store().map_err(command_error)?;
+            store.ensure_writable().map_err(command_error)?;
+            deployment::ensure_no_pending_journal(store.path()).map_err(command_error)?;
+            let connection = store.connection(&connection_id).map_err(command_error)?;
+            let secret = store.secret_for(&connection).map_err(command_error)?;
+            (connection, secret)
+        };
+        let plan = adapters::preview(&connection, &target_ids).map_err(command_error)?;
+        let targets = adapters::discover_all();
+        state
+            .plans()
+            .and_then(|mut plans| plans.insert(&connection, secret.as_deref(), plan, &targets))
+            .map_err(command_error)
+    })
+    .await
 }
 
 #[tauri::command(rename_all = "camelCase")]
-pub fn apply_deployment(
-    state: State<'_, ManagedState>,
-    connection_id: String,
-    target_ids: Vec<String>,
-) -> Result<ApplyResult, String> {
-    let stored = state
-        .plans()
-        .and_then(|mut plans| plans.consume_matching(&connection_id, &target_ids))
-        .map_err(command_error)?;
-    execute_stored_plan(&state, stored).map_err(command_error)
-}
-
-#[tauri::command(rename_all = "camelCase")]
-pub fn apply_deployment_plan(
+pub async fn apply_deployment_plan(
     state: State<'_, ManagedState>,
     plan_id: String,
+    confirmed: bool,
 ) -> Result<ApplyResult, String> {
-    let stored = state
-        .plans()
-        .and_then(|mut plans| plans.consume(&plan_id))
-        .map_err(command_error)?;
-    execute_stored_plan(&state, stored).map_err(command_error)
+    let state = state.inner().clone();
+    native_job(move || {
+        if !confirmed {
+            return Err("Explicit deployment confirmation is required".into());
+        }
+        let stored = state
+            .plans()
+            .and_then(|mut plans| plans.consume(&plan_id))
+            .map_err(command_error)?;
+        execute_stored_plan(&state, stored).map_err(command_error)
+    })
+    .await
 }
 
-fn execute_stored_plan(
-    state: &State<'_, ManagedState>,
-    stored: StoredPlan,
-) -> AppResult<ApplyResult> {
+fn execute_stored_plan(state: &ManagedState, stored: StoredPlan) -> AppResult<ApplyResult> {
+    let _write = state
+        .writes
+        .try_lock()
+        .map_err(|_| AppError::Config("Another managed write is active".into()))?;
     let (connection, secret, state_path) = {
         let store = state.store()?;
+        store.ensure_writable()?;
         deployment::ensure_no_pending_journal(store.path())?;
         let connection = store.connection(&stored.plan.connection_id)?;
         let secret = store.secret_for(&connection)?;
         (connection, secret, store.path().to_path_buf())
     };
-
-    let available = adapters::discover_all();
-    deployment::validate_plan(&stored, &connection, &available)?;
-    let mut snapshots = deployment::capture_file_snapshots(&stored.plan, &available)?;
-    let mut journal = deployment::begin_journal(&state_path, &stored, &available, &snapshots)?;
-
-    let mut operations = stored.plan.operations.iter().collect::<Vec<_>>();
-    operations.sort_by_key(|operation| deployment::operation_rank(operation.target_kind));
-    let mut records = Vec::new();
-    let mut rollback_failed = false;
-
-    for operation in operations {
-        let target = available
-            .iter()
-            .find(|target| target.id == operation.target_id)
-            .ok_or_else(|| {
-                AppError::InvalidInput(format!(
-                    "Target disappeared after preflight: {}",
-                    operation.target_id
-                ))
-            })?;
-
-        if !operation.supported {
-            records.push(record(
+    let _lease =
+        crate::safe_io::Lease::acquire(&crate::safe_io::sibling(&state_path, ".write-lock"))?;
+    deployment::ensure_no_pending_journal(&state_path)?;
+    deployment::validate_plan(
+        &stored,
+        &connection,
+        secret.as_deref(),
+        &adapters::discover_all(),
+    )?;
+    let mut tx = crate::transaction::Transaction::begin(
+        deployment::journal_path(&state_path),
+        &stored.plan.id,
+        stored.writes,
+    )?;
+    let applied = tx.apply();
+    let failed = applied.is_err();
+    let mut detail = "Prepared changes were applied and verified".to_string();
+    let mut recovery_failed = false;
+    if let Err(error) = applied {
+        detail = redact::redact_with_secret(&error.to_string(), secret.as_deref());
+        match tx.rollback() {
+            Ok(()) => detail.push_str("; attempted changes were restored"),
+            Err(error) => {
+                recovery_failed = true;
+                detail.push_str(&format!(
+                    "; {}",
+                    redact::redact_with_secret(&error.to_string(), secret.as_deref())
+                ));
+            }
+        }
+    }
+    let records = stored
+        .plan
+        .operations
+        .iter()
+        .map(|operation| {
+            record(
                 &stored.plan,
                 operation,
-                DeploymentStatus::Skipped,
-                operation.description.clone(),
-            ));
-            continue;
-        }
-
-        match adapters::apply_to_target(&connection, secret.as_deref(), target) {
-            Ok(detail) => {
-                let after = deployment::fingerprint_target(target)?;
-                if operation.target_kind == crate::domain::ClientKind::VsCodeCopilot {
-                    let _ = deployment::mark_snapshot_applied(&mut snapshots, &target.id)?;
-                }
-                journal.mark_applied(&target.id, after)?;
-                records.push(record(
-                    &stored.plan,
-                    operation,
-                    DeploymentStatus::Applied,
-                    detail,
-                ));
-            }
-            Err(error) => {
-                let detail = redact::redact_with_secret(&error.to_string(), secret.as_deref());
-                records.push(record(
-                    &stored.plan,
-                    operation,
-                    DeploymentStatus::Failed,
-                    detail,
-                ));
-                match deployment::rollback_applied_files(&snapshots) {
-                    Ok(()) => mark_rolled_back(&mut records),
-                    Err(rollback_error) => {
-                        rollback_failed = true;
-                        if let Some(last) = records.last_mut() {
-                            last.detail
-                                .push_str("; rollback requires recovery review: ");
-                            last.detail.push_str(&redact::redact_with_secret(
-                                &rollback_error.to_string(),
-                                secret.as_deref(),
-                            ));
-                        }
-                    }
-                }
-                break;
-            }
+                if !operation.supported {
+                    DeploymentStatus::Skipped
+                } else if failed {
+                    DeploymentStatus::Failed
+                } else {
+                    DeploymentStatus::Applied
+                },
+                if operation.supported {
+                    detail.clone()
+                } else {
+                    operation.description.clone()
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    if let Err(error) = state.store()?.record_deployments(records.clone()) {
+        let rollback = tx.rollback();
+        return Err(AppError::Config(format!(
+            "Final deployment audit could not be saved; recovery journal retained. Audit: {}; compensation: {}",
+            redact::redact_with_secret(&error.to_string(), secret.as_deref()),
+            if rollback.is_ok() { "restored" } else { "incomplete; inspect recovery" }
+        )));
+    }
+    if !recovery_failed {
+        if failed {
+            tx.clear()?;
+        } else {
+            tx.complete()?;
         }
     }
-
-    {
-        let mut store = state.store()?;
-        store.record_deployments(records.clone())?;
+    // Notification is not part of registry persistence; failure does not undo
+    // a successfully committed environment or falsely report a failed write.
+    if let Some(warning) = adapters::copilot_cli::notify_environment() {
+        log::warn!("{warning}");
     }
-
-    if !rollback_failed {
-        journal.clear()?;
-    }
-
     Ok(ApplyResult {
         plan_id: stored.plan.id,
         records,
     })
-}
-
-fn mark_rolled_back(records: &mut [DeploymentRecord]) {
-    for record in records {
-        if record.status == DeploymentStatus::Applied
-            && record.target_kind == crate::domain::ClientKind::VsCodeCopilot
-        {
-            record.status = DeploymentStatus::Failed;
-            record
-                .detail
-                .push_str("; change was restored after a later target failed");
-        }
-    }
 }
 
 fn record(
@@ -484,4 +560,146 @@ fn record(
         detail: redact::redact_text(&detail),
         created_at: Utc::now(),
     }
+}
+
+#[tauri::command]
+pub async fn preview_deployment_recovery(
+    state: State<'_, ManagedState>,
+) -> Result<RecoveryPlan, String> {
+    let state = state.inner().clone();
+    native_job(move || {
+        let path = deployment::journal_path(state.store().map_err(command_error)?.path());
+        let allowed = deployment::recovery_resources().map_err(command_error)?;
+        let plan = RecoveryPlan {
+            id: Uuid::new_v4().to_string(),
+            view: crate::transaction::recovery_view(&path, &allowed).map_err(command_error)?,
+            expires_at: Utc::now() + chrono::Duration::minutes(15),
+        };
+        *state
+            .recovery_plan
+            .lock()
+            .map_err(|_| "Recovery plan lock failed".to_string())? = Some(plan.clone());
+        Ok(plan)
+    })
+    .await
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn apply_deployment_recovery(
+    state: State<'_, ManagedState>,
+    plan_id: String,
+    confirmed: bool,
+) -> Result<bool, String> {
+    let state = state.inner().clone();
+    native_job(move || {
+        if !confirmed {
+            return Err("Explicit recovery confirmation is required".into());
+        }
+        let plan = state
+            .recovery_plan
+            .lock()
+            .map_err(|_| "Recovery plan lock failed".to_string())?
+            .take()
+            .ok_or_else(|| {
+                "Preview recovery again; previous plan is missing or consumed".to_string()
+            })?;
+        if plan.id != plan_id || plan.expires_at <= Utc::now() {
+            return Err("Recovery preview is stale".into());
+        }
+        let _write = state
+            .writes
+            .try_lock()
+            .map_err(|_| "Another managed write is active".to_string())?;
+        let store = state.store().map_err(command_error)?;
+        let _lease =
+            crate::safe_io::Lease::acquire(&crate::safe_io::sibling(store.path(), ".write-lock"))
+                .map_err(command_error)?;
+        let path = deployment::journal_path(store.path());
+        let allowed = deployment::recovery_resources().map_err(command_error)?;
+        crate::transaction::recover(&path, &plan.view.digest, &allowed).map_err(command_error)?;
+        Ok(true)
+    })
+    .await
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn get_github_billing_overview(
+    state: State<'_, ManagedState>,
+    year: i32,
+    month: u32,
+) -> Result<crate::github_billing::GithubBillingOverview, String> {
+    let state = state.inner().clone();
+    native_job(move || {
+        let period =
+            crate::github_billing::GithubBillingPeriod::new(year, month).map_err(command_error)?;
+        billing_overview(&state, period).map_err(command_error)
+    })
+    .await
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn refresh_github_billing(
+    state: State<'_, ManagedState>,
+    year: i32,
+    month: u32,
+) -> Result<crate::github_billing::GithubBillingOverview, String> {
+    let state = state.inner().clone();
+    native_job(move || {
+        let period = crate::github_billing::GithubBillingPeriod::new(year, month).map_err(command_error)?;
+        let (revision, identity, token) = {
+            let auth = state.github_authorization().map_err(command_error)?;
+            let status = auth.status();
+            if status.state != crate::github_auth::GithubAuthorizationState::Verified {
+                return Err("Validate PilotWeave's separate GitHub authorization before refreshing personal Billing".into());
+            }
+            let identity = status.identity.ok_or_else(|| "No verified GitHub account".to_string())?;
+            let token = auth.secret_for_refresh().map_err(command_error)?.ok_or_else(|| "GitHub credential is missing".to_string())?;
+            (auth.revision(), identity, token)
+        };
+        let snapshots = crate::github_billing::fetch_personal_billing(&token, &identity, period).map_err(command_error)?;
+        drop(token);
+        {
+            let auth = state.github_authorization().map_err(command_error)?;
+            auth.ensure_current(revision).map_err(command_error)?;
+            let same_account = auth.status().identity.is_some_and(|current| current.host == identity.host && current.user_id == identity.user_id);
+            if !same_account { return Err("GitHub account changed during Billing refresh; response discarded".into()); }
+            let mut db = state.usage_db.lock().map_err(|_| "Usage database lock failed".to_string())?;
+            let db = db.as_mut().ok_or_else(|| "Usage database unavailable; no snapshot was saved".to_string())?;
+            crate::github_billing_store::insert_snapshots(db, &snapshots).map_err(command_error)?;
+        }
+        billing_overview(&state, period).map_err(command_error)
+    }).await
+}
+
+fn billing_overview(
+    state: &ManagedState,
+    period: crate::github_billing::GithubBillingPeriod,
+) -> AppResult<crate::github_billing::GithubBillingOverview> {
+    let authorization = state.github_authorization()?.status();
+    let account = authorization.identity.clone();
+    let storage = state.usage_db_status()?;
+    let db = state.usage_db.lock().map_err(|_| AppError::Lock)?;
+    let families = match (db.as_ref(), account.as_ref()) {
+        (Some(db), Some(identity)) => crate::github_billing_store::family_views(
+            db,
+            &crate::github_billing::account_key(identity),
+            period,
+        )?,
+        _ => crate::github_billing::empty_family_views(),
+    };
+    Ok(crate::github_billing::GithubBillingOverview {
+        authorization,
+        storage,
+        account,
+        families,
+        observed_at: Utc::now(),
+    })
+}
+
+async fn native_job<T: Send + 'static>(
+    job: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    tauri::async_runtime::spawn_blocking(job)
+        .await
+        .map_err(|_| "Native task failed; inspect recovery status before retrying".to_string())?
 }

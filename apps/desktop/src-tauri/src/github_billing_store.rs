@@ -1,8 +1,8 @@
 use crate::decimal::ExactDecimal;
 use crate::error::{AppError, AppResult};
 use crate::github_billing::{
-    GithubBillingCoverage, GithubBillingEndpointFamily, GithubBillingFamilyView,
-    GithubBillingItem, GithubBillingSnapshot, GithubBillingSnapshotStatus,
+    GithubBillingCoverage, GithubBillingEndpointFamily, GithubBillingFamilyView, GithubBillingItem,
+    GithubBillingPeriod, GithubBillingSnapshot, GithubBillingSnapshotStatus,
     MAX_BILLING_ITEMS_PER_SNAPSHOT, MAX_BILLING_ITEMS_RETURNED,
 };
 use crate::usage_db::UsageDb;
@@ -13,10 +13,7 @@ use std::collections::HashSet;
 const MAX_BILLING_SNAPSHOTS_PER_FAMILY: usize = 120;
 const MAX_TEXT_FIELD: usize = 512;
 
-pub fn insert_snapshots(
-    db: &mut UsageDb,
-    snapshots: &[GithubBillingSnapshot],
-) -> AppResult<()> {
+pub fn insert_snapshots(db: &mut UsageDb, snapshots: &[GithubBillingSnapshot]) -> AppResult<()> {
     if snapshots.is_empty() || snapshots.len() > GithubBillingEndpointFamily::ALL.len() {
         return Err(AppError::InvalidInput(
             "A personal Billing refresh must contain one or two endpoint snapshots".to_string(),
@@ -118,17 +115,18 @@ pub fn insert_snapshots(
 pub fn family_views(
     db: &UsageDb,
     account_hint: &str,
+    period: GithubBillingPeriod,
 ) -> AppResult<Vec<GithubBillingFamilyView>> {
     check_text("Billing account", account_hint)?;
     GithubBillingEndpointFamily::ALL
         .into_iter()
         .map(|endpoint_family| {
-            let latest = load_snapshot(&db.conn, account_hint, endpoint_family, false)?;
+            let latest = load_snapshot(&db.conn, account_hint, endpoint_family, period, false)?;
             let last_successful = if latest
                 .as_ref()
                 .is_some_and(|snapshot| !snapshot.status.is_success())
             {
-                load_snapshot(&db.conn, account_hint, endpoint_family, true)?
+                load_snapshot(&db.conn, account_hint, endpoint_family, period, true)?
             } else {
                 None
             };
@@ -219,6 +217,7 @@ fn load_snapshot(
     conn: &SqliteConnection,
     account_hint: &str,
     endpoint_family: GithubBillingEndpointFamily,
+    period: GithubBillingPeriod,
     successful_only: bool,
 ) -> AppResult<Option<GithubBillingSnapshot>> {
     let sql = if successful_only {
@@ -226,6 +225,7 @@ fn load_snapshot(
                 fetched_at, coverage, status, error
          FROM github_billing_snapshots
          WHERE account_hint = ?1 AND endpoint_family = ?2
+           AND period_start = ?3 AND period_end = ?4
            AND status IN ('available', 'successful-empty')
          ORDER BY fetched_at DESC, rowid DESC
          LIMIT 1"
@@ -234,25 +234,35 @@ fn load_snapshot(
                 fetched_at, coverage, status, error
          FROM github_billing_snapshots
          WHERE account_hint = ?1 AND endpoint_family = ?2
+           AND period_start = ?3 AND period_end = ?4
          ORDER BY fetched_at DESC, rowid DESC
          LIMIT 1"
     };
 
     let row = conn
-        .query_row(sql, params![account_hint, endpoint_family.as_str()], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, String>(6)?,
-                row.get::<_, String>(7)?,
-                row.get::<_, String>(8)?,
-                row.get::<_, Option<String>>(9)?,
-            ))
-        })
+        .query_row(
+            sql,
+            params![
+                account_hint,
+                endpoint_family.as_str(),
+                period.start.to_rfc3339(),
+                period.end.to_rfc3339()
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                ))
+            },
+        )
         .optional()
         .map_err(sqlite_error)?;
 
@@ -272,11 +282,11 @@ fn load_snapshot(
         return Ok(None);
     };
 
-    let endpoint_family = GithubBillingEndpointFamily::from_str(&stored_family)
+    let endpoint_family = GithubBillingEndpointFamily::parse(&stored_family)
         .ok_or_else(|| AppError::Config("Stored Billing endpoint family is invalid".to_string()))?;
-    let coverage = GithubBillingCoverage::from_str(&coverage)
+    let coverage = GithubBillingCoverage::parse(&coverage)
         .ok_or_else(|| AppError::Config("Stored Billing coverage is invalid".to_string()))?;
-    let status = GithubBillingSnapshotStatus::from_str(&status)
+    let status = GithubBillingSnapshotStatus::parse(&status)
         .ok_or_else(|| AppError::Config("Stored Billing status is invalid".to_string()))?;
     let period_start = parse_datetime("Billing period start", &period_start)?;
     let period_end = parse_datetime("Billing period end", &period_end)?;
@@ -488,8 +498,8 @@ mod tests {
             account_hint: "octocat".to_string(),
             endpoint_family: family,
             api_version: "2026-03-10".to_string(),
-            period_start: fetched_at - Duration::days(1),
-            period_end: fetched_at + Duration::days(30),
+            period_start: GithubBillingPeriod::current().expect("period").start,
+            period_end: GithubBillingPeriod::current().expect("period").end,
             fetched_at,
             coverage: if status == GithubBillingSnapshotStatus::NotCovered {
                 GithubBillingCoverage::NotCovered
@@ -504,6 +514,37 @@ mod tests {
             items: successful_items,
             items_truncated: false,
         }
+    }
+
+    #[test]
+    fn failed_month_does_not_fall_back_to_a_different_month_or_account() {
+        let directory = tempfile::tempdir().expect("temp");
+        let mut db = UsageDb::open_at(&directory.path().join("usage.sqlite3")).expect("db");
+        let now = Utc::now();
+        let period = GithubBillingPeriod::current().expect("period");
+        let mut previous = snapshot(
+            "prior",
+            GithubBillingEndpointFamily::PremiumRequest,
+            GithubBillingSnapshotStatus::Available,
+            now,
+        );
+        previous.period_start = period.start - Duration::days(31);
+        previous.period_end = period.start;
+        insert_snapshots(&mut db, &[previous]).expect("prior");
+        let failed = snapshot(
+            "failed",
+            GithubBillingEndpointFamily::PremiumRequest,
+            GithubBillingSnapshotStatus::NetworkError,
+            now + Duration::seconds(1),
+        );
+        insert_snapshots(&mut db, &[failed]).expect("failure");
+        let current = family_views(&db, "octocat", period).expect("query");
+        assert_eq!(current[1].latest.as_ref().expect("latest").id, "failed");
+        assert!(current[1].last_successful.is_none());
+        assert!(family_views(&db, "other-user", period)
+            .expect("other")
+            .iter()
+            .all(|view| view.latest.is_none()));
     }
 
     #[test]
@@ -532,12 +573,15 @@ mod tests {
         )
         .expect("insert failure");
 
-        let views = family_views(&db, "octocat").expect("views");
+        let views = family_views(
+            &db,
+            "octocat",
+            GithubBillingPeriod::current().expect("period"),
+        )
+        .expect("views");
         let premium = views
             .iter()
-            .find(|view| {
-                view.endpoint_family == GithubBillingEndpointFamily::PremiumRequest
-            })
+            .find(|view| view.endpoint_family == GithubBillingEndpointFamily::PremiumRequest)
             .expect("premium");
         assert_eq!(
             premium.latest.as_ref().expect("latest").status,
@@ -546,10 +590,7 @@ mod tests {
         let successful = premium.last_successful.as_ref().expect("last success");
         assert_eq!(successful.id, "success");
         assert_eq!(
-            successful.items[0]
-                .net_amount_usd
-                .expect("net")
-                .to_string(),
+            successful.items[0].net_amount_usd.expect("net").to_string(),
             "4.000"
         );
     }
@@ -578,18 +619,19 @@ mod tests {
         )
         .expect("insert");
 
-        let views = family_views(&db, "octocat").expect("views");
+        let views = family_views(
+            &db,
+            "octocat",
+            GithubBillingPeriod::current().expect("period"),
+        )
+        .expect("views");
         assert_eq!(views.len(), 2);
         assert_eq!(
             views[0].latest.as_ref().expect("credit").endpoint_family,
             GithubBillingEndpointFamily::AiCredit
         );
         assert_eq!(
-            views[1]
-                .latest
-                .as_ref()
-                .expect("premium")
-                .endpoint_family,
+            views[1].latest.as_ref().expect("premium").endpoint_family,
             GithubBillingEndpointFamily::PremiumRequest
         );
     }
@@ -611,7 +653,12 @@ mod tests {
         value.total_item_count = value.items.len() as u64;
         insert_snapshots(&mut db, &[value]).expect("insert");
 
-        let latest = family_views(&db, "octocat").expect("views")[1]
+        let latest = family_views(
+            &db,
+            "octocat",
+            GithubBillingPeriod::current().expect("period"),
+        )
+        .expect("views")[1]
             .latest
             .clone()
             .expect("latest");

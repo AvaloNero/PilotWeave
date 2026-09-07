@@ -5,12 +5,16 @@ pub mod decimal;
 mod deployment;
 pub mod domain;
 pub mod error;
-mod github_auth;
+pub mod github_auth;
+pub mod github_billing;
+pub mod github_billing_store;
 mod installer;
 mod native_process;
 mod redact;
+mod safe_io;
 mod secrets;
 mod state;
+mod transaction;
 pub mod usage_db;
 mod validation;
 
@@ -51,14 +55,17 @@ pub fn run() {
             commands::preview_login,
             commands::apply_login_plan,
             commands::get_github_authorization_status,
+            commands::get_github_billing_overview,
+            commands::refresh_github_billing,
             commands::authorize_github,
             commands::refresh_github_authorization,
             commands::clear_github_authorization,
             commands::upsert_connection,
             commands::delete_connection,
             commands::preview_deployment,
-            commands::apply_deployment,
             commands::apply_deployment_plan,
+            commands::preview_deployment_recovery,
+            commands::apply_deployment_recovery,
         ])
         .run(tauri::generate_context!())
         .expect("error while running PilotWeave");

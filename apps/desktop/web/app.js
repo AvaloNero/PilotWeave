@@ -30,6 +30,7 @@
       subtitle: "Detected Copilot surfaces and their deployment capabilities.",
       add: false,
     },
+    usage: { title: "Official usage", subtitle: "Personal GitHub Billing snapshots; separate from local token estimates.", add: false },
     resources: {
       title: "Resources",
       subtitle: "Shared Skills, MCP servers, and instructions are the next milestone.",
@@ -50,6 +51,10 @@
   let route = "overview";
   let snapshot = null;
   let loading = false;
+  let billing = null;
+  let billingBusy = false;
+  let billingGeneration = 0;
+  let billingMonth = new Date().toISOString().slice(0, 7);
 
   function nowIso() {
     return new Date().toISOString();
@@ -152,6 +157,7 @@
   }
 
   let demoState = loadDemoState();
+  const demoPlans = new Map();
 
   function saveDemoState() {
     sessionStorage.setItem("pilotweave-demo", JSON.stringify(demoState));
@@ -214,17 +220,20 @@
         const targets = args.targetIds.map((id) =>
           demoState.clients.find((item) => item.id === id),
         );
-        return createMockPlan(connection, targets.filter(Boolean));
+        const plan = createMockPlan(connection, targets.filter(Boolean));
+        if (demoPlans.size >= 16) demoPlans.delete(demoPlans.keys().next().value);
+        demoPlans.set(plan.id, { plan, updatedAt: connection.updatedAt });
+        return structuredClone(plan);
       }
-      case "apply_deployment": {
-        const connection = demoState.connections.find(
-          (item) => item.id === args.connectionId,
-        );
-        if (!connection) throw new Error("Unknown connection");
-        const targets = args.targetIds
-          .map((id) => demoState.clients.find((item) => item.id === id))
-          .filter(Boolean);
-        const plan = createMockPlan(connection, targets);
+      case "apply_deployment_plan": {
+        if (args.confirmed !== true) throw new Error("Explicit confirmation is required");
+        const stored = demoPlans.get(args.planId);
+        demoPlans.delete(args.planId);
+        if (!stored) throw new Error("Preview missing, expired, or already consumed");
+        const { plan, updatedAt } = stored;
+        const connection = demoState.connections.find((item) => item.id === plan.connectionId);
+        if (!connection || connection.updatedAt !== updatedAt) throw new Error("Connection changed; preview again");
+        if (Date.now() - Date.parse(plan.createdAt) >= 15 * 60000) throw new Error("Preview expired");
         const records = plan.operations.map((operation) => ({
           id: crypto.randomUUID(),
           planId: plan.id,
@@ -336,9 +345,11 @@
   function setRuntimeState() {
     runtimeDot.classList.toggle("online", true);
     runtimeLabel.textContent = isDesktop ? "Native backend" : "Browser preview";
+    const blocked = snapshot?.stateRecovery || snapshot?.deploymentRecovery;
     runtimeDetail.textContent = isDesktop
-      ? "Local writes enabled"
+      ? (blocked ? "Managed writes paused — recovery required" : "Local backend ready")
       : "No filesystem writes";
+    runtimeDot.classList.toggle("online", !blocked);
   }
 
   async function refresh() {
@@ -372,6 +383,7 @@
       button.classList.toggle("active", button.dataset.route === route);
     });
     render();
+    if (route === "usage" && !billing && !billingBusy) loadBilling(false);
   }
 
   function render() {
@@ -385,6 +397,7 @@
       connections: renderConnections,
       clients: renderClients,
       resources: renderResources,
+      usage: renderUsage,
       activity: renderActivity,
       settings: renderSettings,
     };
@@ -521,8 +534,53 @@
       </div>`;
   }
 
+  function renderUsage() {
+    const families = billing?.families ?? [];
+    return `<section class="card"><h2>Official personal Billing</h2>
+      <p>AI credits and legacy premium requests are different units. These are GitHub-reported amounts, not token-price estimates. Organization-paid usage is not covered by personal endpoints.</p>
+      <label>Billing month <input id="billing-month" type="month" value="${escapeHtml(billingMonth)}" /></label>
+      <button class="button" data-action="load-billing" ${billingBusy ? "disabled" : ""}>Read saved snapshots</button>
+      <button class="button primary" data-action="refresh-billing" ${billingBusy || !isDesktop ? "disabled" : ""}>${billingBusy ? "Loading…" : "Refresh from GitHub"}</button>
+      <p>${!isDesktop ? "Browser preview: no native authorization, API requests or usage records." : billing?.account ? `Account: ${escapeHtml(billing.account.login)} (GitHub ID ${escapeHtml(billing.account.userId)})` : "Configure PilotWeave's separate GitHub authorization in Settings first."}</p>
+      <p>Local token imports, cache statistics and API-equivalent estimates are not implemented in this view.</p></section>
+      ${families.map((family) => {
+        const attempt = family.latest;
+        const value = family.lastSuccessful ?? attempt;
+        const items = value?.items ?? [];
+        return `<section class="card"><h2>${escapeHtml(family.endpointFamily)}</h2>
+          <p>Latest retrieval: ${escapeHtml(attempt?.status ?? "Not queried")}${attempt?.error ? ` — ${escapeHtml(attempt.error)}` : ""}</p>
+          ${family.lastSuccessful ? '<p class="muted">Stale: showing the last successful snapshot for this same account and month.</p>' : ""}
+          ${value ? `<p>Coverage: ${escapeHtml(value.coverage)} · ${escapeHtml(value.periodStart)} → ${escapeHtml(value.periodEnd)} · Fetched ${escapeHtml(formatDate(value.fetchedAt))}</p>` : ""}
+          ${value?.itemsTruncated ? `<p>Showing ${items.length} of ${value.totalItemCount} items; no incomplete total is calculated.</p>` : ""}
+          ${items.length ? `<div style="overflow:auto"><table><thead><tr><th>Product / SKU</th><th>Model</th><th>Quantity</th><th>Unit</th><th>GitHub net amount (USD)</th></tr></thead><tbody>${items.map((item) => `<tr><td>${escapeHtml(item.product)} / ${escapeHtml(item.sku)}</td><td>${escapeHtml(item.model ?? "Unknown")}</td><td>${escapeHtml(item.quantity)}</td><td>${escapeHtml(item.unit)}</td><td>${escapeHtml(item.netAmountUsd ?? "Unavailable")}</td></tr>`).join("")}</tbody></table></div>` : "<p>No observed items. Unavailable data is not zero usage.</p>"}
+          </section>`;
+      }).join("")}`;
+  }
+
+  async function loadBilling(refreshRemote) {
+    if (!isDesktop || billingBusy) return;
+    const selected = content.querySelector("#billing-month")?.value ?? billingMonth;
+    if (!/^\d{4}-\d{2}$/.test(selected)) { showToast("Select a valid month", "error"); return; }
+    billingMonth = selected;
+    const [year, month] = selected.split("-").map(Number);
+    const generation = ++billingGeneration;
+    billingBusy = true;
+    render();
+    try {
+      const result = await invoke(refreshRemote ? "refresh_github_billing" : "get_github_billing_overview", { year, month });
+      if (generation === billingGeneration) billing = result;
+    } catch (error) {
+      showToast(error?.message ?? String(error), "error");
+    } finally {
+      if (generation === billingGeneration) billingBusy = false;
+      render();
+    }
+  }
+
   function renderSettings() {
     return `
+      ${snapshot.deploymentRecovery ? `<section class="card"><h2>Deployment recovery required</h2><p>${escapeHtml(snapshot.deploymentRecovery)}</p><button class="button" data-action="preview-recovery">Review safe recovery</button></section>` : ""}
+
       <div class="settings-list">
         ${settingRow("Runtime", isDesktop ? "Tauri native backend" : "Browser preview", isDesktop ? "Client configuration writes can be applied after preview." : "All deployment applies are simulated and remain inside this tab.")}
         ${settingRow("State file", snapshot.statePath, "Non-secret connections, deployments, and schema version.")}
@@ -592,7 +650,7 @@
             <div class="connection-avatar">${escapeHtml(initials(connection.name))}</div>
             <div><h3>${escapeHtml(connection.name)}</h3><span class="muted" style="font-size:10px">${escapeHtml(connection.providerKind)} · ${escapeHtml(connection.protocol)}</span></div>
           </div>
-          <span class="badge ${connection.hasSecret ? "secure" : ""}">${connection.hasSecret ? "Credential stored" : "No credential"}</span>
+          <span class="badge ${connection.hasSecret ? "secure" : ""}">${snapshot.credentialStatuses?.[connection.id]?.state === "unavailable" ? "Credential store unavailable" : connection.hasSecret ? "Credential stored" : "No credential"}</span>
         </div>
         <div class="endpoint" title="${escapeHtml(connection.baseUrl)}">${escapeHtml(connection.baseUrl)}</div>
         <div class="model-list">
@@ -787,9 +845,10 @@
         );
         root.querySelector("#confirm-delete").addEventListener("click", async () => {
           try {
-            await invoke("delete_connection", { connectionId: connection.id });
+            const result = await invoke("delete_connection", { connectionId: connection.id });
             closeModal();
-            showToast("Connection deleted");
+            showToast(result?.credentialCleanupWarning ?? "Connection deleted",
+              result?.credentialCleanupWarning ? "warning" : "success");
             await refresh();
           } catch (error) {
             showToast(error?.message ?? String(error), "error");
@@ -805,7 +864,7 @@
       title: `Deploy ${connection.name}`,
       wide: true,
       body: `
-        <p class="muted" style="font-size:11px;line-height:1.6">Select concrete client targets. PilotWeave will rebuild the plan again immediately before applying it.</p>
+        <p class="muted" style="font-size:11px;line-height:1.6">Select concrete client targets. Only the exact reviewed plan can be applied. Plans expire after 15 minutes and can be used once.</p>
         <div class="target-list">
           ${targets
             .map(
@@ -825,31 +884,46 @@
           button.addEventListener("click", closeModal),
         );
         const actionButton = root.querySelector("#preview-deployment");
-        let selectedTargetIds = [];
-        let plan = null;
+        const session = new window.PilotWeavePlanSession();
+        const previewElement = root.querySelector("#deployment-preview");
+        root.querySelectorAll('input[name="deployment-target"]').forEach((input) => {
+          input.addEventListener("change", () => {
+            session.invalidate();
+            previewElement.textContent = "Selection changed. Generate a new preview.";
+            actionButton.textContent = "Preview changes";
+            actionButton.disabled = false;
+          });
+        });
+        root.querySelectorAll("[data-modal-close]").forEach((button) => {
+          button.addEventListener("click", () => session.invalidate());
+        });
         actionButton.addEventListener("click", async () => {
           try {
-            if (!plan) {
-              selectedTargetIds = Array.from(
+            if (!session.plan) {
+              if (session.pending) return;
+              const selectedTargetIds = Array.from(
                 root.querySelectorAll('input[name="deployment-target"]:checked'),
               ).map((input) => input.value);
-              if (!selectedTargetIds.length) {
-                showToast("Select at least one target", "error");
-                return;
-              }
-              plan = await invoke("preview_deployment", {
-                connectionId: connection.id,
-                targetIds: selectedTargetIds,
-              });
-              root.querySelector("#deployment-preview").innerHTML = `
-                <div class="operation-list">${plan.operations.map(operationCard).join("")}</div>`;
-              actionButton.textContent = "Apply supported changes";
-            } else {
+              if (!selectedTargetIds.length) throw new Error("Select at least one target");
+              const generation = session.begin();
               actionButton.disabled = true;
-              const result = await invoke("apply_deployment", {
-                connectionId: connection.id,
-                targetIds: selectedTargetIds,
+              const plan = await invoke("preview_deployment", {
+                connectionId: connection.id, targetIds: selectedTargetIds,
               });
+              if (!root.isConnected || !session.accept(generation, plan)) return;
+              previewElement.innerHTML = `
+                <div class="operation-list">${plan.operations.map(operationCard).join("")}</div>
+                <label><input id="confirm-reviewed-plan" type="checkbox" style="width:auto" />
+                  I reviewed these exact changes and their credential-storage effects.</label>`;
+              actionButton.textContent = "Apply reviewed changes";
+              actionButton.disabled = true;
+              root.querySelector("#confirm-reviewed-plan").addEventListener("change", (event) => {
+                actionButton.disabled = !event.target.checked;
+              });
+            } else {
+              const args = session.consume(root.querySelector("#confirm-reviewed-plan")?.checked === true);
+              actionButton.disabled = true;
+              const result = await invoke("apply_deployment_plan", args);
               closeModal();
               const applied = result.records.filter((item) => item.status === "applied").length;
               const skipped = result.records.filter((item) => item.status === "skipped").length;
@@ -858,7 +932,10 @@
               await refresh();
             }
           } catch (error) {
+            session.invalidate();
             actionButton.disabled = false;
+            actionButton.textContent = "Preview changes";
+            previewElement.textContent = "Generate a new preview before retrying.";
             showToast(error?.message ?? String(error), "error");
           }
         });
@@ -874,6 +951,34 @@
     </article>`;
   }
 
+  async function openRecovery() {
+    try {
+      const plan = await invoke("preview_deployment_recovery");
+      openModal({
+        title: "Review interrupted deployment recovery",
+        body: `<p>${plan.view.resourceCount} physical resources were recorded; ${plan.view.conflictCount} have external changes.</p><p>${plan.view.committed ? "The audit was committed. This only removes the completed journal." : "Only unchanged PilotWeave writes can be restored. Newer user edits will never be overwritten."}</p><label><input id="confirm-recovery" type="checkbox" style="width:auto" />I reviewed and approve this recovery operation.</label>`,
+        footer: '<button class="button ghost" data-modal-close>Cancel</button><button class="button primary" id="apply-recovery" disabled>Recover</button>',
+        onOpen(root) {
+          const button = root.querySelector("#apply-recovery");
+          root.querySelector("#confirm-recovery").addEventListener("change", (event) => { button.disabled = !event.target.checked; });
+          button.addEventListener("click", async () => {
+            button.disabled = true;
+            try {
+              await invoke("apply_deployment_recovery", { planId: plan.id, confirmed: true });
+              closeModal();
+              showToast("Recovery completed; original audit may require review");
+              await refresh();
+            } catch (error) {
+              closeModal();
+              showToast(`${error?.message ?? error} Preview again before retrying.`, "error");
+              await refresh();
+            }
+          });
+        },
+      });
+    } catch (error) { showToast(error?.message ?? String(error), "error"); }
+  }
+
   document.querySelector("#primary-nav").addEventListener("click", (event) => {
     const button = event.target.closest("[data-route]");
     if (button) setRoute(button.dataset.route);
@@ -884,6 +989,11 @@
     if (!action) return;
     const connection = snapshot?.connections.find((item) => item.id === action.dataset.id);
     switch (action.dataset.action) {
+      case "load-billing": loadBilling(false); break;
+      case "refresh-billing": loadBilling(true); break;
+      case "preview-recovery":
+        openRecovery();
+        break;
       case "add-connection":
         openConnectionForm();
         break;

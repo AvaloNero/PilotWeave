@@ -6,11 +6,9 @@ use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use std::collections::HashMap;
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use url::Url;
-use uuid::Uuid;
 
 const AUTH_STATE_VERSION: u32 = 1;
 const AUTH_SECRET_REF: &str = "github:personal-usage";
@@ -33,6 +31,7 @@ pub enum GithubAuthorizationState {
     Unauthorized,
     Forbidden,
     NetworkError,
+    CredentialUnavailable,
     SchemaError,
     Conflict,
     ReadOnlyRecovery,
@@ -112,10 +111,20 @@ struct GithubAuthorizationRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GithubAuthorizationFile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    validation_failure: Option<ValidationFailure>,
     #[serde(default = "default_auth_state_version")]
     version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     authorization: Option<GithubAuthorizationRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ValidationFailure {
+    state: GithubAuthorizationState,
+    detail: String,
+    checked_at: DateTime<Utc>,
 }
 
 impl Default for GithubAuthorizationFile {
@@ -123,6 +132,7 @@ impl Default for GithubAuthorizationFile {
         Self {
             version: AUTH_STATE_VERSION,
             authorization: None,
+            validation_failure: None,
         }
     }
 }
@@ -158,6 +168,8 @@ pub struct GithubAuthorizationStore {
     state: GithubAuthorizationFile,
     recovery: Option<String>,
     secrets: Box<dyn SecretBackend>,
+    revision: u64,
+    observed_bytes: Option<Vec<u8>>,
 }
 
 impl GithubAuthorizationStore {
@@ -168,6 +180,8 @@ impl GithubAuthorizationStore {
                 state: GithubAuthorizationFile::default(),
                 recovery: Some("Cannot resolve the user config directory".to_string()),
                 secrets: Box::new(NativeSecretBackend),
+                revision: 0,
+                observed_bytes: None,
             };
         };
         Self::open_at_with_backend(
@@ -181,16 +195,22 @@ impl GithubAuthorizationStore {
     fn open_at_with_backend(path: PathBuf, secrets: Box<dyn SecretBackend>) -> Self {
         match load_state(&path) {
             Ok(state) => Self {
+                observed_bytes: crate::safe_io::read_optional(&path, MAX_AUTH_STATE_BYTES)
+                    .ok()
+                    .flatten(),
                 path,
                 state,
                 recovery: None,
                 secrets,
+                revision: 0,
             },
             Err(error) => Self {
                 path,
                 state: GithubAuthorizationFile::default(),
                 recovery: Some(error.to_string()),
                 secrets,
+                revision: 0,
+                observed_bytes: None,
             },
         }
     }
@@ -217,7 +237,7 @@ impl GithubAuthorizationStore {
             Ok(value) => value,
             Err(_) => {
                 return GithubAuthorizationStatus {
-                    state: GithubAuthorizationState::NetworkError,
+                    state: GithubAuthorizationState::CredentialUnavailable,
                     identity: self.state.authorization.as_ref().map(record_identity),
                     has_secret: false,
                     scopes: self
@@ -250,7 +270,7 @@ impl GithubAuthorizationStore {
             }
         };
 
-        match (&self.state.authorization, secret.is_some()) {
+        let mut status = match (&self.state.authorization, secret.is_some()) {
             (Some(record), true) => GithubAuthorizationStatus {
                 state: GithubAuthorizationState::Verified,
                 identity: Some(record_identity(record)),
@@ -292,7 +312,62 @@ impl GithubAuthorizationStore {
                 cleanup_warning: None,
             },
             (None, false) => missing_status(),
+        };
+        if status.state == GithubAuthorizationState::Verified {
+            if let Some(failure) = &self.state.validation_failure {
+                status.state = failure.state;
+                status.detail =
+                    format!("{} (last attempt: {})", failure.detail, failure.checked_at);
+                status.billing_capability = GithubBillingCapability::Unknown;
+                status.billing_detail =
+                    "Previous capability is stale until authorization is revalidated".into();
+            }
         }
+        status
+    }
+
+    /// Latest-started request wins. Clearing also invalidates in-flight work.
+    pub fn begin_attempt(&mut self) -> AppResult<u64> {
+        self.revision = self
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| AppError::Config("Authorization revision exhausted; restart".into()))?;
+        Ok(self.revision)
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    pub fn ensure_current(&self, revision: u64) -> AppResult<()> {
+        if revision != self.revision {
+            return Err(AppError::Config(
+                "Authorization changed while the request was running; stale result discarded"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn record_refresh_failure(
+        &mut self,
+        failure: GithubAuthorizationStatus,
+    ) -> AppResult<GithubAuthorizationStatus> {
+        self.ensure_writable()?;
+        let _lease = self.lease_and_check_disk()?;
+        validate_text("Validation failure", &failure.detail)?;
+        let previous = self.state.clone();
+        self.state.validation_failure = Some(ValidationFailure {
+            state: failure.state,
+            detail: failure.detail,
+            checked_at: Utc::now(),
+        });
+        if let Err(error) = write_state(&self.path, &self.state) {
+            self.state = previous;
+            return Err(error);
+        }
+        self.capture_committed_bytes()?;
+        Ok(self.status())
     }
 
     pub fn secret_for_refresh(&self) -> AppResult<Option<String>> {
@@ -310,6 +385,7 @@ impl GithubAuthorizationStore {
         validation: GithubAuthorizationValidation,
     ) -> AppResult<GithubAuthorizationStatus> {
         self.ensure_writable()?;
+        let _lease = self.lease_and_check_disk()?;
         validate_token_input(token)?;
         validate_identity(&validation.identity)?;
         validate_scopes(&validation.scopes)?;
@@ -320,6 +396,7 @@ impl GithubAuthorizationStore {
         self.secrets.set(AUTH_SECRET_REF, token)?;
         self.state = GithubAuthorizationFile {
             version: AUTH_STATE_VERSION,
+            validation_failure: None,
             authorization: Some(GithubAuthorizationRecord {
                 host: validation.identity.host,
                 login: validation.identity.login,
@@ -345,11 +422,14 @@ impl GithubAuthorizationStore {
             }
             return Err(error);
         }
+        self.capture_committed_bytes()?;
         Ok(self.status())
     }
 
     pub fn clear(&mut self) -> AppResult<GithubAuthorizationStatus> {
+        self.begin_attempt()?;
         self.ensure_writable()?;
+        let _lease = self.lease_and_check_disk()?;
         let previous_state = self.state.clone();
         self.state = GithubAuthorizationFile::default();
         if let Err(error) = write_state(&self.path, &self.state) {
@@ -357,6 +437,7 @@ impl GithubAuthorizationStore {
             return Err(error);
         }
 
+        self.capture_committed_bytes()?;
         match self.secrets.delete(AUTH_SECRET_REF) {
             Ok(()) => Ok(missing_status()),
             Err(_) => Ok(GithubAuthorizationStatus {
@@ -367,6 +448,23 @@ impl GithubAuthorizationStore {
                 ..missing_status()
             }),
         }
+    }
+
+    fn lease_and_check_disk(&self) -> AppResult<crate::safe_io::Lease> {
+        let lease =
+            crate::safe_io::Lease::acquire(&crate::safe_io::sibling(&self.path, ".write-lock"))?;
+        if crate::safe_io::read_optional(&self.path, MAX_AUTH_STATE_BYTES)? != self.observed_bytes {
+            return Err(AppError::Config(
+                "GitHub authorization changed in another process; restart before changing it"
+                    .into(),
+            ));
+        }
+        Ok(lease)
+    }
+
+    fn capture_committed_bytes(&mut self) -> AppResult<()> {
+        self.observed_bytes = crate::safe_io::read_optional(&self.path, MAX_AUTH_STATE_BYTES)?;
+        Ok(())
     }
 
     fn ensure_writable(&self) -> AppResult<()> {
@@ -739,55 +837,37 @@ fn load_state(path: &Path) -> AppResult<GithubAuthorizationFile> {
         validate_scopes(&record.scopes)?;
         validate_text("Billing capability detail", &record.billing_detail)?;
     }
+    if let Some(failure) = &state.validation_failure {
+        validate_text("Validation failure", &failure.detail)?;
+        if !matches!(
+            failure.state,
+            GithubAuthorizationState::Unauthorized
+                | GithubAuthorizationState::Forbidden
+                | GithubAuthorizationState::NetworkError
+                | GithubAuthorizationState::SchemaError
+        ) {
+            return Err(AppError::Config(
+                "Invalid persisted authorization failure state".into(),
+            ));
+        }
+    }
     Ok(GithubAuthorizationFile {
         version: AUTH_STATE_VERSION,
+        validation_failure: state.validation_failure,
         authorization: state.authorization,
     })
 }
 
 fn write_state(path: &Path, state: &GithubAuthorizationFile) -> AppResult<()> {
-    let parent = path.parent().ok_or_else(|| {
-        AppError::Config("GitHub authorization metadata path has no parent".to_string())
-    })?;
-    fs::create_dir_all(parent).map_err(|error| AppError::io(parent, error))?;
     let bytes = serde_json::to_vec_pretty(state).map_err(|error| {
-        AppError::Config(format!(
-            "Failed to serialize GitHub authorization metadata: {error}"
-        ))
+        AppError::Config(format!("Cannot serialize authorization metadata: {error}"))
     })?;
     if bytes.len() as u64 > MAX_AUTH_STATE_BYTES {
         return Err(AppError::InvalidInput(
-            "GitHub authorization metadata exceeds its storage limit".to_string(),
+            "authorization metadata exceeds its storage limit".into(),
         ));
     }
-    let temp = parent.join(format!(".github-authorization-{}.tmp", Uuid::new_v4()));
-    let result = (|| -> AppResult<()> {
-        let mut options = fs::OpenOptions::new();
-        options.create_new(true).write(true);
-        let mut file = options
-            .open(&temp)
-            .map_err(|error| AppError::io(&temp, error))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            file.set_permissions(fs::Permissions::from_mode(0o600))
-                .map_err(|error| AppError::io(&temp, error))?;
-        }
-        file.write_all(&bytes)
-            .map_err(|error| AppError::io(&temp, error))?;
-        file.sync_all()
-            .map_err(|error| AppError::io(&temp, error))?;
-        #[cfg(windows)]
-        if path.exists() {
-            fs::remove_file(path).map_err(|error| AppError::io(path, error))?;
-        }
-        fs::rename(&temp, path).map_err(|error| AppError::io(path, error))?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temp);
-    }
-    result
+    crate::safe_io::write_private(path, &bytes)
 }
 
 #[cfg(test)]
@@ -941,5 +1021,42 @@ mod tests {
         assert_eq!(parse_scopes("read:user, gist"), ["read:user", "gist"]);
         assert!(validate_scopes(&["invalid scope".to_string()]).is_err());
         assert!(validate_scopes(&vec!["scope".to_string(); MAX_SCOPES + 1]).is_err());
+    }
+    #[test]
+    fn clear_and_new_requests_invalidate_old_results() {
+        let dir = tempfile::tempdir().expect("temp");
+        let mut store = GithubAuthorizationStore::open_at_with_backend(
+            dir.path().join("auth.json"),
+            Box::new(MemorySecretBackend::default()),
+        );
+        let first = store.begin_attempt().expect("first");
+        let second = store.begin_attempt().expect("second");
+        assert!(store.ensure_current(first).is_err());
+        assert!(store.ensure_current(second).is_ok());
+        store.clear().expect("clear");
+        assert!(store.ensure_current(second).is_err());
+    }
+
+    #[test]
+    fn revoked_authorization_does_not_reappear_verified_after_reopen() {
+        let dir = tempfile::tempdir().expect("temp");
+        let path = dir.path().join("auth.json");
+        let backend = MemorySecretBackend::default();
+        let mut store =
+            GithubAuthorizationStore::open_at_with_backend(path.clone(), Box::new(backend.clone()));
+        store
+            .save_verified("synthetic-token", validation("octocat"))
+            .expect("save");
+        store
+            .record_refresh_failure(transient_status(
+                GithubAuthorizationState::Unauthorized,
+                "Revoked",
+            ))
+            .expect("record");
+        let reopened = GithubAuthorizationStore::open_at_with_backend(path, Box::new(backend));
+        assert_eq!(
+            reopened.status().state,
+            GithubAuthorizationState::Unauthorized
+        );
     }
 }
