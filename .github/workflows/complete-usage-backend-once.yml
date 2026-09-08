@@ -92,6 +92,62 @@ jobs:
           fetch_gzip_payload 9a37d84e891c285d7ae429f31822c753a97c32a0 \
             apps/desktop/src-tauri/src/usage.rs
 
+      - name: Apply validation findings
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          usage = Path("apps/desktop/src-tauri/src/usage.rs")
+          text = usage.read_text(encoding="utf-8")
+          text = text.replace(
+              "use crate::price_catalog::{self, CanonicalModelIdentity, PriceCatalogStatus, PriceQuote};",
+              "use crate::price_catalog::{self, PriceCatalogStatus, PriceQuote};",
+          )
+          text = text.replace(
+              "use rusqlite::{params, OptionalExtension};",
+              "use rusqlite::params;",
+          )
+          text = text.replace(
+              "const MAX_LINE_BYTES: usize = 1 * 1_024 * 1_024;",
+              "const MAX_LINE_BYTES: usize = 1_024 * 1_024;",
+          )
+          text = text.replace(
+              "\nfn record_sync_run(\n",
+              "\n#[allow(clippy::too_many_arguments)]\nfn record_sync_run(\n",
+              1,
+          )
+          usage.write_text(text, encoding="utf-8")
+
+          usage_db = Path("apps/desktop/src-tauri/src/usage_db.rs")
+          text = usage_db.read_text(encoding="utf-8")
+          text = text.replace(
+              "    pub fn update_source_observation(\n",
+              "    #[allow(clippy::too_many_arguments)]\n    pub fn update_source_observation(\n",
+              1,
+          )
+          usage_db.write_text(text, encoding="utf-8")
+
+          test = Path("apps/desktop/src-tauri/tests/usage_db.rs")
+          text = test.read_text(encoding="utf-8")
+          text = text.replace(
+              "        request_hash: None,\n        input_semantics: InputSemantics::TotalIncludesCacheReadAndWrite,",
+              "        request_hash: None,\n        canonical_model_id: None,\n        route: \"unknown\".to_string(),\n        attribution_confidence: \"unknown\".to_string(),\n        input_semantics: InputSemantics::TotalIncludesCacheReadAndWrite,",
+              1,
+          )
+          text = text.replace(
+              "        output: Some(output),\n        started_at: Some(Utc::now()),",
+              "        output: Some(output),\n        reasoning: None,\n        request_count: None,\n        started_at: Some(Utc::now()),",
+              1,
+          )
+          text = text.replace(
+              "        source_created_at: Some(Utc::now()),\n    }",
+              "        source_created_at: Some(Utc::now()),\n        logical_surfaces: vec![\"copilot-cli\".to_string(), \"github-copilot-app\".to_string()],\n        price_snapshot_id: None,\n        estimate_usd: None,\n        estimate_status: \"unpriced\".to_string(),\n        quality_flags: Vec::new(),\n    }",
+              1,
+          )
+          test.write_text(text, encoding="utf-8")
+          PY
+
       - name: Format and validate implementation
         id: validation
         shell: bash
