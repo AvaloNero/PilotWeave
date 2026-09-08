@@ -93,15 +93,45 @@ jobs:
             apps/desktop/src-tauri/src/usage.rs
 
       - name: Format and validate implementation
+        id: validation
+        shell: bash
         run: |
-          npm ci
-          cargo fmt --all
-          npm run check:web
-          cargo test --workspace --locked
-          cargo clippy --workspace --all-targets --locked -- -D warnings
-          git diff --check
+          set +e
+          log="$RUNNER_TEMP/usage-backend-validation.log"
+          : > "$log"
+          failed=0
+
+          run_check() {
+            printf '\n===== %s =====\n' "$*" | tee -a "$log"
+            "$@" 2>&1 | tee -a "$log"
+            status=${PIPESTATUS[0]}
+            printf '===== exit %s =====\n' "$status" | tee -a "$log"
+            if [ "$status" -ne 0 ]; then
+              failed=1
+            fi
+          }
+
+          run_check npm ci
+          run_check cargo fmt --all
+          run_check npm run check:web
+          run_check cargo test --workspace --locked
+          run_check cargo clippy --workspace --all-targets --locked -- -D warnings
+          run_check git diff --check
+
+          echo "failed=$failed" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Upload validation diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: usage-backend-validation-${{ github.run_id }}
+          path: ${{ runner.temp }}/usage-backend-validation.log
+          retention-days: 7
+          if-no-files-found: error
 
       - name: Commit exact implementation to main
+        if: steps.validation.outputs.failed == '0'
         shell: bash
         run: |
           set -euo pipefail
@@ -114,3 +144,10 @@ jobs:
           git add -A
           git commit -m "feat: import local Copilot usage and price estimates"
           git push origin HEAD:main
+
+      - name: Fail when validation failed
+        if: steps.validation.outputs.failed != '0'
+        shell: bash
+        run: |
+          echo "Local usage backend validation failed; inspect the uploaded diagnostics artifact." >&2
+          exit 1
