@@ -1,0 +1,116 @@
+name: Complete local usage backend once
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/complete-usage-backend-once.yml
+
+permissions:
+  contents: write
+
+env:
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  apply-test-and-commit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Check out exact main commit
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            libayatana-appindicator3-dev \
+            libdbus-1-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            pkg-config
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.88.0
+          components: rustfmt, clippy
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Materialize reviewed source blobs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p apps/desktop/src-tauri/src
+
+          fetch_plain_blob() {
+            local sha="$1"
+            local destination="$2"
+            gh api "repos/$GITHUB_REPOSITORY/git/blobs/$sha" --jq .content \
+              | tr -d '\n' \
+              | base64 --decode > "$destination"
+          }
+
+          fetch_gzip_payload() {
+            local sha="$1"
+            local destination="$2"
+            local encoded="$RUNNER_TEMP/${sha}.txt"
+            gh api "repos/$GITHUB_REPOSITORY/git/blobs/$sha" --jq .content \
+              | tr -d '\n' \
+              | base64 --decode > "$encoded"
+            python3 - "$encoded" "$destination" <<'PY'
+          import base64
+          import gzip
+          import sys
+          from pathlib import Path
+
+          encoded = Path(sys.argv[1]).read_text(encoding="utf-8").strip()
+          Path(sys.argv[2]).write_bytes(gzip.decompress(base64.b64decode(encoded, validate=True)))
+          PY
+          }
+
+          fetch_plain_blob 58e1c9ceb042377e7c6365d6670cf5931da63363 \
+            apps/desktop/src-tauri/src/decimal.rs
+          fetch_plain_blob a3965bd17638ec430fd17114acbc4697f3d6568e \
+            apps/desktop/src-tauri/src/price_catalog.rs
+          fetch_plain_blob 03293d8ad40b7f8a654fb720f4d328a339f0b116 \
+            apps/desktop/src-tauri/src/lib.rs
+          fetch_gzip_payload 92b243d75684e81e822a6747042128fc80c2d6ff \
+            apps/desktop/src-tauri/src/commands.rs
+          fetch_gzip_payload 74d35769ea99f18cdabbf2d35d4a63a16ea5dea3 \
+            apps/desktop/src-tauri/src/usage_db.rs
+          fetch_gzip_payload 9a37d84e891c285d7ae429f31822c753a97c32a0 \
+            apps/desktop/src-tauri/src/usage.rs
+
+      - name: Format and validate implementation
+        run: |
+          npm ci
+          cargo fmt --all
+          npm run check:web
+          cargo test --workspace --locked
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          git diff --check
+
+      - name: Commit exact implementation to main
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm .github/workflows/complete-usage-backend-once.yml
+          cargo fmt --all -- --check
+          git fetch origin main
+          test "$(git rev-parse origin/main)" = "$GITHUB_SHA"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "feat: import local Copilot usage and price estimates"
+          git push origin HEAD:main
