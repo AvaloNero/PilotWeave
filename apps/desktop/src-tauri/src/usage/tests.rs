@@ -327,7 +327,7 @@ fn active_final_line_and_atomic_cursor_survive_reopen_and_truncation() {
     assert_eq!(f.db.record_count("vscode-otel").unwrap(), 1);
     let mut different: Value = serde_json::from_slice(COMPLETE).unwrap();
     different["_spanContext"]["spanId"] = json!("new-span");
-    fs::write(&f.roots.vscode_otel, format!("{}\n", different)).unwrap();
+    fs::write(&f.roots.vscode_otel, format!("{different}\n")).unwrap();
     f.sync();
     assert_eq!(f.db.record_count("vscode-otel").unwrap(), 2);
     assert!(importer::sources(&f.db, &f.roots).unwrap()[1].enabled);
