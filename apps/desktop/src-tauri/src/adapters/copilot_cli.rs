@@ -12,6 +12,31 @@ use std::path::Path;
 use std::path::PathBuf;
 use uuid::Uuid;
 
+#[cfg(any(windows, test))]
+mod env_snapshot;
+
+// Validate bounded existing configuration before preparing a transaction. In
+// particular, unknown registry types are not silently replaced as missing data.
+fn validate_existing_configuration() -> AppResult<()> {
+    #[cfg(windows)]
+    {
+        env_snapshot::native_snapshot().map(|_| ())
+    }
+    #[cfg(unix)]
+    {
+        let home =
+            dirs::home_dir().ok_or_else(|| AppError::Config("Cannot resolve user home".into()))?;
+        for path in unix_paths(&home) {
+            crate::safe_file::read_optional(&path, 1024 * 1024)?;
+        }
+        Ok(())
+    }
+    #[cfg(not(any(windows, unix)))]
+    Err(AppError::Unsupported(
+        "CLI deployment is unsupported on this platform".into(),
+    ))
+}
+
 const MANAGED_VARIABLES: &[&str] = &[
     "COPILOT_PROVIDER_TYPE",
     "COPILOT_PROVIDER_BASE_URL",
@@ -167,6 +192,7 @@ pub(crate) fn prepare(
     connection: &Connection,
     secret: Option<&str>,
 ) -> AppResult<Vec<crate::transaction::PreparedWrite>> {
+    validate_existing_configuration()?;
     let values = desired_environment(connection, secret)?;
     #[cfg(windows)]
     {

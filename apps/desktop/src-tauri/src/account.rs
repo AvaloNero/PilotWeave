@@ -8,6 +8,7 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsStr;
+#[cfg(test)]
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -1033,23 +1034,9 @@ fn validate_run(run: &LoginRunRecord) -> AppResult<()> {
 }
 
 fn load_history(path: &Path) -> AppResult<LoginHistoryState> {
-    if !path.exists() {
+    let Some(bytes) = crate::safe_file::read_optional(path, MAX_LOGIN_HISTORY_BYTES)? else {
         return Ok(LoginHistoryState::default());
-    }
-    let metadata = fs::symlink_metadata(path).map_err(|error| AppError::io(path, error))?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(AppError::InvalidInput(format!(
-            "Sign-in history must be a regular file: {}",
-            path.display()
-        )));
-    }
-    if metadata.len() > MAX_LOGIN_HISTORY_BYTES {
-        return Err(AppError::InvalidInput(format!(
-            "Sign-in history exceeds {} MiB",
-            MAX_LOGIN_HISTORY_BYTES / 1_024 / 1_024
-        )));
-    }
-    let bytes = fs::read(path).map_err(|error| AppError::io(path, error))?;
+    };
     let state: LoginHistoryState =
         serde_json::from_slice(&bytes).map_err(|error| AppError::json(path, error))?;
     if state.version > LOGIN_HISTORY_VERSION {

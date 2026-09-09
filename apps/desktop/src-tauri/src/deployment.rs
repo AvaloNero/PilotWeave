@@ -1,9 +1,9 @@
 use crate::domain::{ClientKind, ClientTarget, Connection, DeploymentPlan};
 use crate::error::{AppError, AppResult};
-use crate::{adapters, safe_io, transaction, validation};
-use chrono::{Duration, Utc};
+use crate::{adapters, safe_io, transaction};
+#[cfg(test)]
+use chrono::Utc;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 pub fn recovery_resources() -> AppResult<Vec<transaction::Resource>> {
     let mut resources = adapters::copilot_cli::observed_resources()?;
@@ -24,151 +24,68 @@ pub fn recovery_resources() -> AppResult<Vec<transaction::Resource>> {
 #[cfg(test)]
 use std::fs;
 
-const PLAN_TTL_SECONDS: i64 = 15 * 60;
+mod planner;
+pub use planner::{validate_plan, PlanContext, PlanStore, StoredPlan};
 
-pub struct StoredPlan {
-    pub plan: DeploymentPlan,
-    pub writes: Vec<transaction::PreparedWrite>,
-    connection_digest: String,
-    target_fingerprints: BTreeMap<String, String>,
-}
-
-#[derive(Default)]
-pub struct PlanStore {
-    plans: HashMap<String, StoredPlan>,
-}
-
-impl PlanStore {
-    pub fn insert(
-        &mut self,
-        connection: &Connection,
-        secret: Option<&str>,
-        mut plan: DeploymentPlan,
-        targets: &[ClientTarget],
-    ) -> AppResult<DeploymentPlan> {
-        self.purge_expired();
-        if self.plans.len() >= 16 {
-            return Err(AppError::InvalidInput(
-                "Too many pending deployment plans".into(),
-            ));
-        }
-        validation::validate_connection(connection)?;
-        let mut fingerprints = BTreeMap::new();
-        let mut writes = Vec::new();
-        for operation in &mut plan.operations {
-            let target = targets
-                .iter()
-                .find(|value| value.id == operation.target_id)
-                .ok_or_else(|| AppError::InvalidInput("Deployment target disappeared".into()))?;
-            fingerprints.insert(target.id.clone(), fingerprint_target(target)?);
-            if !operation.supported {
-                continue;
-            }
-            if !target.detected || !target.supports_write {
-                return Err(AppError::Unsupported("Target is not writable".into()));
-            }
-            let prepared = match target.kind {
-                ClientKind::VsCodeCopilot => {
-                    let path = Path::new(target.path.as_deref().ok_or_else(|| {
-                        AppError::Config("Missing VS Code configuration path".into())
-                    })?);
-                    let write = adapters::vscode::prepare(connection, secret, path)?;
-                    let mut prepared = Vec::new();
-                    if write.changed() {
-                        if let Some(before) = &write.before {
-                            if let Some(backup) = adapters::vscode::original_backup(path, before)? {
-                                prepared.push(backup);
-                            }
-                        }
-                    }
-                    prepared.push(write);
-                    prepared
-                }
-                ClientKind::CopilotCli => adapters::copilot_cli::prepare(connection, secret)?,
-                ClientKind::GithubCopilotApp => {
-                    return Err(AppError::Unsupported(
-                        "Copilot app remains manual/read-only".into(),
-                    ))
-                }
-            };
-            let changed = prepared.iter().filter(|write| write.changed()).count();
-            operation.changes.push(format!(
-                "{changed} physical resource(s) require changes; identical data is not rewritten"
-            ));
-            writes.extend(prepared);
-        }
-        let writes = transaction::deduplicate(writes)?;
-        let stored = StoredPlan {
-            connection_digest: connection_digest(connection, secret)?,
-            plan: plan.clone(),
-            writes,
-            target_fingerprints: fingerprints,
-        };
-        self.plans.insert(plan.id.clone(), stored);
-        Ok(plan)
-    }
-
-    pub fn consume(&mut self, id: &str) -> AppResult<StoredPlan> {
-        self.purge_expired();
-        self.plans.remove(id).ok_or_else(|| {
-            AppError::InvalidInput(
-                "Deployment plan is missing, expired or already consumed; preview again".into(),
-            )
-        })
-    }
-
-    fn purge_expired(&mut self) {
-        let cutoff = Utc::now() - Duration::seconds(PLAN_TTL_SECONDS);
-        self.plans.retain(|_, value| value.plan.created_at > cutoff);
-    }
-}
-
-pub fn validate_plan(
-    stored: &StoredPlan,
+pub(super) fn prepare_writes(
     connection: &Connection,
     secret: Option<&str>,
+    plan: &mut DeploymentPlan,
     targets: &[ClientTarget],
-) -> AppResult<()> {
-    if Utc::now() - stored.plan.created_at >= Duration::seconds(PLAN_TTL_SECONDS)
-        || connection_digest(connection, secret)? != stored.connection_digest
-    {
-        return Err(AppError::InvalidInput(
-            "Connection, credential or plan lifetime changed; preview again".into(),
-        ));
-    }
-    for (id, expected) in &stored.target_fingerprints {
+) -> AppResult<Vec<transaction::PreparedWrite>> {
+    let mut writes = Vec::new();
+    for operation in &mut plan.operations {
         let target = targets
             .iter()
-            .find(|value| &value.id == id)
-            .ok_or_else(|| AppError::InvalidInput("Target disappeared after preview".into()))?;
-        if fingerprint_target(target)? != *expected {
-            return Err(AppError::InvalidInput(
-                "Target changed after preview; preview again".into(),
-            ));
+            .find(|value| value.id == operation.target_id)
+            .ok_or_else(|| AppError::InvalidInput("Deployment target disappeared".into()))?;
+        if !operation.supported {
+            continue;
         }
-    }
-    for write in &stored.writes {
-        if write.resource.read()? != write.before {
-            return Err(AppError::InvalidInput(
-                "Prepared configuration changed; preview again".into(),
-            ));
+        if !target.detected || !target.supports_write {
+            return Err(AppError::Unsupported("Target is not writable".into()));
         }
+        let prepared = match target.kind {
+            ClientKind::VsCodeCopilot => {
+                let path = Path::new(target.path.as_deref().ok_or_else(|| {
+                    AppError::Config("Missing VS Code configuration path".into())
+                })?);
+                let write = adapters::vscode::prepare(connection, secret, path)?;
+                let mut prepared = Vec::new();
+                if write.changed() {
+                    if let Some(before) = &write.before {
+                        if let Some(backup) = adapters::vscode::original_backup(path, before)? {
+                            prepared.push(backup);
+                        }
+                    }
+                }
+                prepared.push(write);
+                prepared
+            }
+            ClientKind::CopilotCli => adapters::copilot_cli::prepare(connection, secret)?,
+            ClientKind::GithubCopilotApp => {
+                return Err(AppError::Unsupported(
+                    "Copilot app remains manual/read-only".into(),
+                ))
+            }
+        };
+        let changed = prepared.iter().filter(|write| write.changed()).count();
+        operation.changes.push(format!(
+            "{changed} physical resource(s) require changes; identical data is not rewritten"
+        ));
+        writes.extend(prepared);
     }
-    Ok(())
-}
-
-fn connection_digest(connection: &Connection, secret: Option<&str>) -> AppResult<String> {
-    let mut hash = Sha256::new();
-    hash.update(
-        serde_json::to_vec(connection)
-            .map_err(|_| AppError::Config("Cannot fingerprint connection".into()))?,
-    );
-    hash.update([0]);
-    hash.update(secret.unwrap_or_default().as_bytes());
-    Ok(format!("{:x}", hash.finalize()))
+    transaction::deduplicate(writes)
 }
 
 pub fn fingerprint_target(target: &ClientTarget) -> AppResult<String> {
+    fingerprint_target_with_writes(target, None)
+}
+
+pub(super) fn fingerprint_target_with_writes(
+    target: &ClientTarget,
+    writes: Option<&[transaction::PreparedWrite]>,
+) -> AppResult<String> {
     let mut hash = Sha256::new();
     hash.update(
         serde_json::to_vec(target)
@@ -188,7 +105,15 @@ pub fn fingerprint_target(target: &ClientTarget) -> AppResult<String> {
     };
     for resource in resources {
         hash.update(resource.key().as_bytes());
-        match resource.read()? {
+        let bytes = match writes.and_then(|writes| {
+            writes
+                .iter()
+                .find(|write| write.resource.key() == resource.key())
+        }) {
+            Some(write) => write.after.clone(),
+            None => resource.read()?,
+        };
+        match bytes {
             Some(bytes) => {
                 hash.update([1]);
                 hash.update(bytes);
@@ -225,7 +150,7 @@ mod tests {
     use crate::domain::{ApiProtocol, ClientStatus, ModelCapabilities, ModelSpec, ProviderKind};
     use std::collections::BTreeMap;
 
-    fn connection() -> Connection {
+    pub(super) fn connection() -> Connection {
         let now = Utc::now();
         Connection {
             id: "one".to_string(),
@@ -248,7 +173,7 @@ mod tests {
         }
     }
 
-    fn target(path: &Path) -> ClientTarget {
+    pub(super) fn target(path: &Path) -> ClientTarget {
         ClientTarget {
             id: "vscode:test".to_string(),
             kind: ClientKind::VsCodeCopilot,
@@ -262,7 +187,7 @@ mod tests {
         }
     }
 
-    fn plan(connection: &Connection, target: &ClientTarget) -> DeploymentPlan {
+    pub(super) fn plan(connection: &Connection, target: &ClientTarget) -> DeploymentPlan {
         DeploymentPlan {
             id: "plan".to_string(),
             connection_id: connection.id.clone(),
@@ -291,16 +216,20 @@ mod tests {
         let target = target(&path);
         let plan = plan(&connection, &target);
         let mut store = PlanStore::default();
-        store
+        let reviewed = store
             .insert(
                 &connection,
                 None,
                 plan.clone(),
                 std::slice::from_ref(&target),
+                PlanContext::new("test-owner", "state".into(), None),
             )
             .expect("insert");
-        assert_eq!(store.consume(&plan.id).expect("consume").plan.id, plan.id);
-        assert!(store.consume(&plan.id).is_err());
+        assert_eq!(
+            store.consume(&reviewed.id).expect("consume").plan.id,
+            reviewed.id
+        );
+        assert!(store.consume(&reviewed.id).is_err());
     }
 
     #[test]
@@ -312,16 +241,56 @@ mod tests {
         let target = target(&path);
         let plan = plan(&connection, &target);
         let mut store = PlanStore::default();
-        store
+        let reviewed = store
             .insert(
                 &connection,
                 None,
                 plan.clone(),
                 std::slice::from_ref(&target),
+                PlanContext::new("test-owner", "state".into(), None),
             )
             .expect("insert");
         fs::write(&path, b"[1]").expect("external change");
-        let stored = store.consume(&plan.id).expect("consume");
-        assert!(validate_plan(&stored, &connection, None, &[target]).is_err());
+        let stored = store.consume(&reviewed.id).expect("consume");
+        assert!(validate_plan(
+            &stored,
+            &connection,
+            &[target],
+            &PlanContext::new("test-owner", "state".into(), None)
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn prepared_output_fingerprint_never_adopts_a_later_external_edit() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.json");
+        fs::write(&path, b"[]").unwrap();
+        let connection = connection();
+        let target = target(&path);
+        let mut plans = PlanStore::default();
+        let reviewed = plans
+            .insert(
+                &connection,
+                None,
+                plan(&connection, &target),
+                std::slice::from_ref(&target),
+                PlanContext::new("test-owner", "state".into(), None),
+            )
+            .unwrap();
+        let stored = plans.consume(&reviewed.id).unwrap();
+        let expected = stored.after_fingerprints[&target.id].clone();
+        let mut transaction = transaction::Transaction::begin(
+            root.path().join("journal.json"),
+            &reviewed.id,
+            stored.writes,
+        )
+        .unwrap();
+        transaction.apply().unwrap();
+        assert_eq!(fingerprint_target(&target).unwrap(), expected);
+        fs::write(&path, b"[{\"external\":true}]").unwrap();
+        assert_ne!(fingerprint_target(&target).unwrap(), expected);
+        assert!(transaction.rollback().is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"[{\"external\":true}]");
     }
 }

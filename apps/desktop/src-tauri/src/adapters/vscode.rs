@@ -466,11 +466,11 @@ fn create_backup_once(path: &Path) -> AppResult<()> {
 }
 
 fn ensure_regular_file_or_missing(path: &Path) -> AppResult<()> {
-    crate::safe_io::ensure_regular_or_missing(path)
+    crate::safe_file::ensure_regular_or_missing(path)
 }
 
 fn atomic_write_private(path: &Path, bytes: &[u8]) -> AppResult<()> {
-    crate::safe_io::write_private(path, bytes)
+    crate::safe_file::atomic_write_private(path, bytes)
 }
 
 #[cfg(test)]

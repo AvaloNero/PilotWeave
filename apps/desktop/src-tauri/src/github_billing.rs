@@ -220,6 +220,8 @@ pub struct GithubBillingSnapshot {
     pub items: Vec<GithubBillingItem>,
     pub total_item_count: u64,
     pub items_truncated: bool,
+    #[serde(default)]
+    pub retry_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -267,6 +269,7 @@ pub fn fetch_personal_billing(
     token: &str,
     identity: &GithubAuthorizationIdentity,
     period: GithubBillingPeriod,
+    cancel: &std::sync::atomic::AtomicBool,
 ) -> AppResult<Vec<GithubBillingSnapshot>> {
     validate_token(token)?;
     validate_identity(identity)?;
@@ -281,6 +284,7 @@ pub fn fetch_personal_billing(
     let authorization = format!("Bearer {token}");
     Ok(GithubBillingEndpointFamily::ALL
         .into_iter()
+        .take_while(|_| !cancel.load(std::sync::atomic::Ordering::SeqCst))
         .map(|family| fetch_family(&agent, &authorization, identity, period, family))
         .collect())
 }
@@ -330,7 +334,7 @@ fn fetch_family(
 
     let status = response.status().as_u16();
     if status != 200 {
-        return status_snapshot(
+        let mut snapshot = status_snapshot(
             identity,
             period,
             family,
@@ -338,6 +342,10 @@ fn fetch_family(
             status,
             response.headers(),
         );
+        if snapshot.status == GithubBillingSnapshotStatus::RateLimited {
+            snapshot.retry_at = Some(retry_time(response.headers(), fetched_at));
+        }
+        return snapshot;
     }
 
     let bytes = match response
@@ -560,7 +568,7 @@ fn parse_report(
     };
     Ok(GithubBillingSnapshot {
         id: Uuid::new_v4().to_string(),
-        account_hint: account_key(identity),
+        account_hint: identity_key(identity),
         endpoint_family: family,
         api_version: GITHUB_BILLING_API_VERSION.to_string(),
         period_start: period.start,
@@ -572,6 +580,7 @@ fn parse_report(
         total_item_count: items.len() as u64,
         items,
         items_truncated: false,
+        retry_at: None,
     })
 }
 
@@ -630,7 +639,7 @@ fn error_snapshot(
 ) -> GithubBillingSnapshot {
     GithubBillingSnapshot {
         id: Uuid::new_v4().to_string(),
-        account_hint: account_key(identity),
+        account_hint: identity_key(identity),
         endpoint_family: family,
         api_version: GITHUB_BILLING_API_VERSION.to_string(),
         period_start: period.start,
@@ -642,6 +651,7 @@ fn error_snapshot(
         items: Vec::new(),
         total_item_count: 0,
         items_truncated: false,
+        retry_at: None,
     }
 }
 
@@ -705,6 +715,31 @@ fn retry_after_seconds(headers: &ureq::http::HeaderMap) -> Option<u64> {
         .filter(|value| *value <= 86_400)
 }
 
+pub fn identity_key(identity: &GithubAuthorizationIdentity) -> String {
+    // Preserve the stable account keys already used by existing Billing rows.
+    account_key(identity)
+}
+fn retry_time(headers: &ureq::http::HeaderMap, now: DateTime<Utc>) -> DateTime<Utc> {
+    if let Some(seconds) = retry_after_seconds(headers) {
+        return now + chrono::Duration::seconds(seconds.max(1) as i64);
+    }
+    let absolute = headers
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| DateTime::parse_from_rfc2822(v).ok())
+        .map(|v| v.with_timezone(&Utc))
+        .or_else(|| {
+            headers
+                .get("x-ratelimit-reset")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<i64>().ok())
+                .and_then(|v| DateTime::from_timestamp(v, 0))
+        });
+    absolute
+        .filter(|d| *d > now && *d <= now + chrono::Duration::days(1))
+        .unwrap_or(now + chrono::Duration::minutes(1))
+}
+
 fn rate_limit_detail(headers: &ureq::http::HeaderMap) -> String {
     match retry_after_seconds(headers) {
         Some(seconds) => format!(
@@ -726,6 +761,28 @@ mod tests {
             user_id: 42,
             avatar_url: None,
         }
+    }
+
+    #[test]
+    fn rate_limit_retry_time_is_bounded_and_stable_identity_survives_login_rename() {
+        let now = Utc::now();
+        let mut headers = ureq::http::HeaderMap::new();
+        headers.insert("retry-after", "120".parse().unwrap());
+        assert_eq!(
+            retry_time(&headers, now),
+            now + chrono::Duration::seconds(120)
+        );
+        headers.insert("retry-after", "99999999999".parse().unwrap());
+        assert_eq!(
+            retry_time(&headers, now),
+            now + chrono::Duration::minutes(1)
+        );
+        let first = identity();
+        let mut renamed = first.clone();
+        renamed.login = "renamed".into();
+        assert_eq!(identity_key(&first), identity_key(&renamed));
+        renamed.user_id += 1;
+        assert_ne!(identity_key(&first), identity_key(&renamed));
     }
 
     fn current_period() -> GithubBillingPeriod {

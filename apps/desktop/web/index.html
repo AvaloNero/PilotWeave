@@ -9,6 +9,7 @@
     <link rel="stylesheet" href="installer.css" />
     <link rel="stylesheet" href="account.css" />
     <link rel="stylesheet" href="github-auth.css" />
+    <link rel="stylesheet" href="setup-usage.css" />
   </head>
   <body>
     <div class="app-shell">
@@ -19,30 +20,30 @@
           </div>
           <div>
             <strong>PilotWeave</strong>
-            <small>Copilot control plane</small>
+            <small>Your Copilot setup</small>
           </div>
         </div>
 
         <nav id="primary-nav" aria-label="Primary navigation">
           <button class="nav-item active" data-route="overview">
-            <span class="nav-icon">⌂</span><span>Overview</span>
+            <span class="nav-icon">⌂</span><span>Home</span>
           </button>
           <button class="nav-item" data-route="connections">
             <span class="nav-icon">◇</span><span>Connections</span>
           </button>
-          <button class="nav-item" data-route="clients">
-            <span class="nav-icon">▦</span><span>Clients</span>
+          <button class="nav-item" data-route="usage">
+            <span class="nav-icon">◷</span><span>Usage</span>
           </button>
-          <button class="nav-item" data-route="usage"><span class="nav-icon">◷</span><span>Official usage</span></button>
-          <button class="nav-item" data-route="resources">
-            <span class="nav-icon">✦</span><span>Resources</span>
-          </button>
+          <details class="more-nav"><summary class="nav-item"><span class="nav-icon">···</span><span>More</span></summary>
+          <button class="nav-item" data-route="clients"><span class="nav-icon">▦</span><span>Client diagnostics</span></button>
           <button class="nav-item" data-route="activity">
             <span class="nav-icon">↗</span><span>Activity</span>
           </button>
           <button class="nav-item" data-route="settings">
             <span class="nav-icon">⚙</span><span>Settings</span>
           </button>
+          <button class="nav-item" data-route="about"><span class="nav-icon">ⓘ</span><span>About</span></button>
+          </details>
         </nav>
 
         <div class="sidebar-footer">
@@ -57,8 +58,8 @@
       <main class="main-panel">
         <header class="topbar">
           <div>
-            <p class="eyebrow">LOCAL CONTROL PLANE</p>
-            <h1 id="page-title">Overview</h1>
+            <p class="eyebrow">PILOTWEAVE</p>
+            <h1 id="page-title">Home</h1>
             <p id="page-subtitle">One model setup across every Copilot surface.</p>
           </div>
           <div class="topbar-actions">
@@ -72,10 +73,12 @@
 
     <div id="modal-root"></div>
     <div id="toast-root" aria-live="assertive"></div>
-    <script src="plan-session.js"></script>
-    <script src="app.js"></script>
+    <script src="deployment-review.js"></script>
     <script src="installer-ui.js"></script>
     <script src="account-ui.js"></script>
     <script src="github-auth-ui.js"></script>
+    <script src="setup-ui.js"></script>
+    <script src="usage-ui.js"></script>
+    <script src="app.js"></script>
   </body>
 </html>

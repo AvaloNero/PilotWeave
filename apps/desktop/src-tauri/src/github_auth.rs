@@ -5,6 +5,7 @@ use chrono::{DateTime, Datelike, Utc};
 use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use std::collections::HashMap;
+#[cfg(test)]
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -801,23 +802,9 @@ fn transient_status(
 }
 
 fn load_state(path: &Path) -> AppResult<GithubAuthorizationFile> {
-    if !path.exists() {
+    let Some(bytes) = crate::safe_file::read_optional(path, MAX_AUTH_STATE_BYTES)? else {
         return Ok(GithubAuthorizationFile::default());
-    }
-    let metadata = fs::symlink_metadata(path).map_err(|error| AppError::io(path, error))?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(AppError::InvalidInput(format!(
-            "GitHub authorization metadata must be a regular file: {}",
-            path.display()
-        )));
-    }
-    if metadata.len() > MAX_AUTH_STATE_BYTES {
-        return Err(AppError::InvalidInput(format!(
-            "GitHub authorization metadata exceeds {} KiB",
-            MAX_AUTH_STATE_BYTES / 1_024
-        )));
-    }
-    let bytes = fs::read(path).map_err(|error| AppError::io(path, error))?;
+    };
     let state: GithubAuthorizationFile =
         serde_json::from_slice(&bytes).map_err(|error| AppError::json(path, error))?;
     if state.version > AUTH_STATE_VERSION {

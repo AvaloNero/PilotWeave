@@ -398,9 +398,13 @@ pub struct RecoveryView {
     pub committed: bool,
     pub resource_count: usize,
     pub conflict_count: usize,
+    pub unknown_resource_count: usize,
+    pub unreadable_resource_count: usize,
 }
 
-fn load_checked(path: &Path, allowed: &[Resource]) -> AppResult<Transaction> {
+// Validate journal metadata without following any resource named by the journal.
+// This also permits a reviewed, target-free dismissal when a client disappeared.
+fn load_checked(path: &Path) -> AppResult<Transaction> {
     let bytes = safe_io::read_optional(path, MAX_JOURNAL_BYTES)?
         .ok_or_else(|| AppError::InvalidInput("No deployment recovery journal exists".into()))?;
     let journal: Journal = serde_json::from_slice(&bytes).map_err(|_| {
@@ -416,16 +420,15 @@ fn load_checked(path: &Path, allowed: &[Resource]) -> AppResult<Transaction> {
             "Unsupported recovery journal version or bounds".into(),
         ));
     }
-    let allowed = allowed
-        .iter()
-        .map(Resource::key)
-        .collect::<std::collections::HashSet<_>>();
     let mut seen = std::collections::HashSet::new();
     for write in &journal.writes {
         write.validate()?;
         let key = write.resource.key();
-        if !allowed.contains(&key) || !seen.insert(key) {
-            return Err(AppError::Config("Recovery journal references an unknown or duplicate physical resource; no writes performed".into()));
+        if !seen.insert(key) {
+            return Err(AppError::Config(
+                "Recovery journal references a duplicate physical resource; no writes performed"
+                    .into(),
+            ));
         }
     }
     // Reuse aggregate limits, but do not reorder the recorded attempt sequence.
@@ -438,14 +441,27 @@ fn load_checked(path: &Path, allowed: &[Resource]) -> AppResult<Transaction> {
 
 pub fn recovery_view(path: &Path, allowed: &[Resource]) -> AppResult<RecoveryView> {
     use sha2::{Digest, Sha256};
-    let tx = load_checked(path, allowed)?;
+    let tx = load_checked(path)?;
     let bytes = serde_json::to_vec(&tx.journal)
         .map_err(|_| AppError::Config("Cannot fingerprint recovery journal".into()))?;
     let mut conflicts = 0;
-    for write in tx.journal.writes.iter().take(tx.journal.attempted) {
-        let current = write.resource.read()?;
-        if current != write.before && current != write.after {
-            conflicts += 1;
+    let mut unknown = 0;
+    let mut unreadable = 0;
+    let allowed = allowed
+        .iter()
+        .map(Resource::key)
+        .collect::<std::collections::HashSet<_>>();
+    for (index, write) in tx.journal.writes.iter().enumerate() {
+        if !allowed.contains(&write.resource.key()) {
+            unknown += 1;
+            continue; // Never inspect a path/registry value outside native discovery.
+        }
+        if index < tx.journal.attempted && !matches!(tx.journal.phase, Phase::Committed) {
+            match write.resource.read() {
+                Ok(current) if current != write.before && current != write.after => conflicts += 1,
+                Err(_) => unreadable += 1,
+                _ => {}
+            }
         }
     }
     Ok(RecoveryView {
@@ -454,6 +470,8 @@ pub fn recovery_view(path: &Path, allowed: &[Resource]) -> AppResult<RecoveryVie
         committed: tx.journal.phase == Phase::Committed,
         resource_count: tx.journal.writes.len(),
         conflict_count: conflicts,
+        unknown_resource_count: unknown,
+        unreadable_resource_count: unreadable,
     })
 }
 
@@ -464,11 +482,36 @@ pub fn recover(path: &Path, expected_digest: &str, allowed: &[Resource]) -> AppR
             "Recovery journal changed after preview".into(),
         ));
     }
-    let mut tx = load_checked(path, allowed)?;
+    let mut tx = load_checked(path)?;
     if tx.journal.phase != Phase::Committed {
+        let allowed = allowed
+            .iter()
+            .map(Resource::key)
+            .collect::<std::collections::HashSet<_>>();
+        if tx
+            .journal
+            .writes
+            .iter()
+            .any(|write| !allowed.contains(&write.resource.key()))
+        {
+            return Err(AppError::Config("A recovery target is no longer available. Review keeping current files to end recovery without restoring targets.".into()));
+        }
         tx.rollback()?;
     }
     tx.clear()
+}
+
+/// Explicitly abandon rollback after a separate native-held review. Only the
+/// bounded, backend-owned journal is removed. Target paths are never accessed,
+/// and no deployment is recorded as successful by this operation.
+pub fn keep_current(path: &Path, expected_digest: &str) -> AppResult<()> {
+    let current = recovery_view(path, &[])?;
+    if current.digest != expected_digest {
+        return Err(AppError::InvalidInput(
+            "Recovery journal changed after preview".into(),
+        ));
+    }
+    load_checked(path)?.clear()
 }
 
 #[cfg(test)]
@@ -492,6 +535,99 @@ mod tests {
         recover(&path, &view.digest, &allowed).expect("recover");
         assert_eq!(fs::read(&file).expect("read"), b"before");
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn reviewed_retention_resolves_external_conflicts_without_changing_any_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("models.json");
+        fs::write(&file, b"before-private-secret").unwrap();
+        let write =
+            PreparedWrite::file(&file, Some(b"after-private-secret".to_vec()), false).unwrap();
+        let allowed = vec![write.resource.clone()];
+        let path = dir.path().join("journal");
+        let mut tx = Transaction::begin(path.clone(), "id", vec![write]).unwrap();
+        tx.apply().unwrap();
+        fs::write(&file, b"external-edit").unwrap();
+        let view = recovery_view(&path, &allowed).unwrap();
+        assert_eq!(view.conflict_count, 1);
+        assert!(!serde_json::to_string(&view)
+            .unwrap()
+            .contains("private-secret"));
+        assert!(recover(&path, &view.digest, &allowed).is_err());
+        assert!(path.exists());
+        // Failed restoration persisted a new journal; the old review cannot dismiss it.
+        assert!(keep_current(&path, &view.digest).is_err());
+        let reviewed = recovery_view(&path, &[]).unwrap();
+        keep_current(&path, &reviewed.digest).unwrap();
+        assert!(!path.exists());
+        assert_eq!(fs::read(&file).unwrap(), b"external-edit");
+        assert!(keep_current(&path, &reviewed.digest).is_err());
+        // The resolved journal no longer blocks a fresh, separately reviewed transaction.
+        Transaction::begin(
+            path,
+            "next",
+            vec![PreparedWrite::file(&file, Some(b"next".to_vec()), false).unwrap()],
+        )
+        .unwrap()
+        .clear()
+        .unwrap();
+    }
+
+    #[test]
+    fn removed_targets_can_be_dismissed_without_reading_journal_resource_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("models.json");
+        let path = dir.path().join("journal");
+        let mut tx = Transaction::begin(
+            path.clone(),
+            "id",
+            vec![PreparedWrite::file(&file, Some(b"after".to_vec()), false).unwrap()],
+        )
+        .unwrap();
+        tx.apply().unwrap();
+        fs::remove_file(&file).unwrap();
+        fs::create_dir(&file).unwrap(); // Reading this as a source would fail; never follow it.
+        let view = recovery_view(&path, &[]).unwrap();
+        assert_eq!(view.unknown_resource_count, 1);
+        assert_eq!(view.unreadable_resource_count, 0);
+        assert!(recover(&path, &view.digest, &[]).is_err());
+        keep_current(&path, &view.digest).unwrap();
+        assert!(file.is_dir());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn unreadable_allowed_target_still_has_a_target_free_retention_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("models.json");
+        let path = dir.path().join("journal");
+        let write = PreparedWrite::file(&file, Some(b"after".to_vec()), false).unwrap();
+        let allowed = vec![write.resource.clone()];
+        let mut tx = Transaction::begin(path.clone(), "id", vec![write]).unwrap();
+        tx.apply().unwrap();
+        fs::remove_file(&file).unwrap();
+        fs::create_dir(&file).unwrap();
+        let view = recovery_view(&path, &allowed).unwrap();
+        assert_eq!(view.unknown_resource_count, 0);
+        assert_eq!(view.unreadable_resource_count, 1);
+        keep_current(&path, &view.digest).unwrap();
+        assert!(file.is_dir());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn changed_or_corrupt_journal_cannot_be_dismissed_with_a_prior_review() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal");
+        let mut tx = Transaction::begin(path.clone(), "id", vec![]).unwrap();
+        let view = recovery_view(&path, &[]).unwrap();
+        tx.rollback().unwrap();
+        assert!(keep_current(&path, &view.digest).is_err());
+        assert!(path.exists());
+        fs::write(&path, b"invalid").unwrap();
+        assert!(keep_current(&path, &view.digest).is_err());
+        assert_eq!(fs::read(path).unwrap(), b"invalid");
     }
 
     #[test]

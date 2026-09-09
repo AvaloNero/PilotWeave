@@ -143,6 +143,16 @@ apps/desktop/src-tauri/src/
 
 Do not continue expanding `commands.rs` and `domain.rs` indefinitely. Move behavior into focused services and adapters.
 
+### P0/P1 implementation additions
+
+`setup.rs` derives Home progress from current component/account/deployment observations. User account confirmations, their original evidence and time, selected Connection, and manual provider confirmation are persisted in `setup_preferences`. A saved confirmation never becomes automatically verified. New deployment audit records include optional target and Connection fingerprints; legacy records remain readable but cannot prove current synchronization.
+
+`usage/` contains separate command, parser, import, query, runtime, price, store, and DTO modules. `github_billing.rs` and `github_billing_store.rs` are registered separately. SQLite v3 preserves v1/v2 data, tracks the currently observed price catalog separately from immutable snapshots, and enables WAL; blocking import/query workers open their own native-owned database connection so reading local logs does not hold the Connection-store lock or the frontend's shared usage handle. Cursor and observation metadata commit together. Price updates compare the original observation before writing, and cumulative updates refuse to replace a concurrent historical price binding.
+
+Frontend `setup-ui.js` and `usage-ui.js` render explicit app routes. Installation, account and authorization modules receive loaded state and mount into explicit containers. They do not watch page-title text or inject panels through MutationObserver. Runtime quota, monthly Billing, local observations and price catalogs keep independent source/status/freshness. Usage jobs have native exclusion, cancellation, time limits and persisted outcomes. Counter and money values cross IPC as exact decimal strings when required by their DTOs.
+
+Concrete source schemas, limits, provenance and remaining upstream limitations are recorded in [usage-sources.md](usage-sources.md). The module tree below remains the normative target decomposition for later milestones, not a claim that every listed file exists.
+
 ## Required target modules
 
 One acceptable layout is:
@@ -483,3 +493,5 @@ The required MVP is architecturally complete only when:
 - historical price snapshots are immutable;
 - unknown token semantics or price data do not become zero;
 - deployment validation, ownership, journaling, rollback, redaction, and recovery satisfy the required contract.
+
+A blocked deployment recovery offers a separate native-held Keep current files review. The action removes only the bounded, validated pending journal, after matching its reviewed digest and taking the managed write locks. It never follows journal target paths or records success. Restore continues to require native-discovered resources and refuses external changes. Unknown and unreadable resources are explicit preview counts; a missing client cannot trap the user in a repeated restore failure. The confirmation warns that pending rollback data is discarded.

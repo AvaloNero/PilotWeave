@@ -16,26 +16,22 @@
 
   const routes = {
     overview: {
-      title: "Overview",
-      subtitle: "One model setup across every Copilot surface.",
-      add: true,
+      title: "Home",
+      subtitle: "One account. One model setup. Every supported client.",
+      add: false,
     },
     connections: {
       title: "Connections",
-      subtitle: "Client-neutral provider endpoints, credentials, and model catalogs.",
+      subtitle: "Your provider endpoints, credentials, and models.",
       add: true,
     },
     clients: {
-      title: "Clients",
+      title: "Client diagnostics",
       subtitle: "Detected Copilot surfaces and their deployment capabilities.",
       add: false,
     },
-    usage: { title: "Official usage", subtitle: "Personal GitHub Billing snapshots; separate from local token estimates.", add: false },
-    resources: {
-      title: "Resources",
-      subtitle: "Shared Skills, MCP servers, and instructions are the next milestone.",
-      add: false,
-    },
+    usage: { title: "Usage", subtitle: "Official quota, personal Billing, and local observations with source coverage.", add: false },
+    about: { title: "About", subtitle: "PilotWeave", add: false },
     activity: {
       title: "Activity",
       subtitle: "Local deployment audit history without secret values.",
@@ -51,10 +47,25 @@
   let route = "overview";
   let snapshot = null;
   let loading = false;
-  let billing = null;
-  let billingBusy = false;
-  let billingGeneration = 0;
-  let billingMonth = new Date().toISOString().slice(0, 7);
+  const data = { errors: {} };
+  const usageSections = () => [
+    ["localUsage", "get_usage_overview", { query: window.PilotWeaveUsage.query() }],
+    ["sources", "get_usage_sources"], ["quota", "get_official_runtime_usage"],
+    ["billing", "get_github_billing", window.PilotWeaveUsage.billingQuery()], ["catalog", "get_price_catalog"], ["runs", "get_usage_runs"],
+  ];
+  const sectionVersions = {};
+  async function loadSections(sections) {
+    const versions = sections.map(([key]) => (sectionVersions[key] = (sectionVersions[key] ?? 0) + 1));
+    const results = await Promise.allSettled(sections.map(([, command, args]) => invoke(command, args)));
+    results.forEach((result, i) => {
+      const key = sections[i][0];
+      if (versions[i] !== sectionVersions[key]) return;
+      if (result.status === "fulfilled") { data[key] = result.value; delete data.errors[key]; }
+      else { data[key] = null; data.errors[key] = result.reason?.message ?? String(result.reason); }
+    });
+  }
+  async function refreshUsage() { await loadSections(usageSections()); render(); }
+
 
   function nowIso() {
     return new Date().toISOString();
@@ -220,20 +231,37 @@
         const targets = args.targetIds.map((id) =>
           demoState.clients.find((item) => item.id === id),
         );
-        const plan = createMockPlan(connection, targets.filter(Boolean));
-        if (demoPlans.size >= 16) demoPlans.delete(demoPlans.keys().next().value);
-        demoPlans.set(plan.id, { plan, updatedAt: connection.updatedAt });
-        return structuredClone(plan);
+        if (!targets.length || targets.some((target) => !target)) throw new Error("Unknown deployment target");
+        for (const [id, stored] of demoPlans) {
+          if (Date.now() >= stored.expiresAt) demoPlans.delete(id);
+        }
+        if (demoPlans.size >= 32) throw new Error("Too many pending previews");
+        const plan = createMockPlan(connection, targets);
+        demoPlans.set(plan.id, {
+          plan: structuredClone(plan),
+          connectionRevision: JSON.stringify(connection),
+          targetRevision: JSON.stringify(targets),
+          expiresAt: Date.now() + 15 * 60 * 1000,
+        });
+        return plan;
       }
       case "apply_deployment_plan": {
-        if (args.confirmed !== true) throw new Error("Explicit confirmation is required");
         const stored = demoPlans.get(args.planId);
         demoPlans.delete(args.planId);
-        if (!stored) throw new Error("Preview missing, expired, or already consumed");
-        const { plan, updatedAt } = stored;
-        const connection = demoState.connections.find((item) => item.id === plan.connectionId);
-        if (!connection || connection.updatedAt !== updatedAt) throw new Error("Connection changed; preview again");
-        if (Date.now() - Date.parse(plan.createdAt) >= 15 * 60000) throw new Error("Preview expired");
+        if (!stored || Date.now() >= stored.expiresAt || args.confirmed !== true) {
+          throw new Error("Preview expired or was consumed; preview again");
+        }
+        const { plan } = stored;
+        const connection = demoState.connections.find(
+          (item) => item.id === plan.connectionId,
+        );
+        if (!connection) throw new Error("Unknown connection");
+        const targets = plan.targetIds
+          .map((id) => demoState.clients.find((item) => item.id === id))
+          .filter(Boolean);
+        if (stored.connectionRevision !== JSON.stringify(connection) || stored.targetRevision !== JSON.stringify(targets)) {
+          throw new Error("PlanChanged: preview again");
+        }
         const records = plan.operations.map((operation) => ({
           id: crypto.randomUUID(),
           planId: plan.id,
@@ -252,7 +280,7 @@
         return { planId: plan.id, records };
       }
       default:
-        throw new Error(`Unsupported browser-preview command: ${command}`);
+        return window.PilotWeaveUsage.preview(command, demoState);
     }
   }
 
@@ -345,11 +373,9 @@
   function setRuntimeState() {
     runtimeDot.classList.toggle("online", true);
     runtimeLabel.textContent = isDesktop ? "Native backend" : "Browser preview";
-    const blocked = snapshot?.stateRecovery || snapshot?.deploymentRecovery;
     runtimeDetail.textContent = isDesktop
-      ? (blocked ? "Managed writes paused — recovery required" : "Local backend ready")
+      ? "Local writes enabled"
       : "No filesystem writes";
-    runtimeDot.classList.toggle("online", !blocked);
   }
 
   async function refresh() {
@@ -358,7 +384,12 @@
     refreshButton.disabled = true;
     content.innerHTML = '<div class="loading"><div><div class="spinner"></div>Loading local state…</div></div>';
     try {
-      snapshot = await invoke("get_dashboard");
+      await loadSections([["dashboard", "get_dashboard"], ["components", "get_installation_status"], ["setup", "get_setup_status"], ["authorization", "get_github_authorization_status"], ...usageSections()]);
+      if (!data.dashboard) throw new Error(data.errors.dashboard);
+      snapshot = data.dashboard;
+      window.PilotWeaveInstaller.hydrate(data.components);
+      window.PilotWeaveAccount.hydrate(data.setup?.accounts);
+      window.PilotWeaveGithubAuth.hydrate(data.authorization);
       setRuntimeState();
       render();
     } catch (error) {
@@ -383,7 +414,6 @@
       button.classList.toggle("active", button.dataset.route === route);
     });
     render();
-    if (route === "usage" && !billing && !billingBusy) loadBilling(false);
   }
 
   function render() {
@@ -392,70 +422,25 @@
     pageTitle.textContent = meta.title;
     pageSubtitle.textContent = meta.subtitle;
     addConnectionButton.hidden = !meta.add;
+    addConnectionButton.disabled = Boolean(snapshot.stateRecovery);
     const renderers = {
       overview: renderOverview,
       connections: renderConnections,
       clients: renderClients,
-      resources: renderResources,
-      usage: renderUsage,
+      usage: () => window.PilotWeaveUsage.render(snapshot, data, isDesktop),
+      about: () => '<section class="setting-row"><div><h2>PilotWeave</h2><p>An independent Copilot setup tool. Pre-release; not affiliated with GitHub.</p><p>Configuration is local. Client authentication stays in each official client.</p></div></section>',
       activity: renderActivity,
       settings: renderSettings,
     };
-    content.innerHTML = renderers[route]();
+    content.innerHTML = (!isDesktop && !["overview", "usage"].includes(route) ? '<div class="preview-banner">Browser preview · disposable sample data · no native computer access</div>' : "") + renderers[route]();
+    content.dataset.route = route;
+    window.PilotWeaveInstaller.mount();
+    window.PilotWeaveAccount.mount();
+    window.PilotWeaveGithubAuth.mount();
   }
 
   function renderOverview() {
-    const connections = snapshot.connections;
-    const clients = snapshot.clients;
-    const detectedClients = clients.filter((client) => client.detected).length;
-    const writableClients = clients.filter(
-      (client) => client.detected && client.supportsWrite,
-    ).length;
-    const modelCount = connections.reduce(
-      (total, connection) =>
-        total + connection.models.filter((item) => item.enabled).length,
-      0,
-    );
-    return `
-      ${storageWarningBanner()}
-      <div class="hero">
-        <div class="hero-copy">
-          <p class="eyebrow">DESIRED STATE, NOT ANOTHER SWITCHER</p>
-          <h2>Connect a provider once, then deploy it safely to every Copilot surface.</h2>
-          <p>PilotWeave keeps the source of truth client-neutral. VS Code profiles, Copilot CLI, and the GitHub Copilot app are deployment targets with explicit capabilities and safety boundaries.</p>
-          <div class="inline-actions">
-            <button class="button primary" data-action="add-connection">Add your first connection</button>
-            <button class="button ghost" data-action="route" data-route="clients">Review detected clients</button>
-          </div>
-        </div>
-        <div class="hero-flow" aria-label="PilotWeave data flow">
-          <div class="flow-node"><span>Connections</span><strong>${connections.length}</strong></div>
-          <div class="flow-arrow"></div>
-          <div class="flow-node"><span>Model catalog</span><strong>${modelCount} enabled</strong></div>
-          <div class="flow-arrow"></div>
-          <div class="flow-node"><span>Client deployments</span><strong>${writableClients} writable</strong></div>
-        </div>
-      </div>
-
-      <div class="stats-grid">
-        ${statCard("Connections", connections.length)}
-        ${statCard("Enabled models", modelCount)}
-        ${statCard("Detected clients", detectedClients)}
-        ${statCard("Deployment records", snapshot.deployments.length)}
-      </div>
-
-      <div class="section-heading">
-        <div><h2>Client surfaces</h2><p class="section-copy">What PilotWeave can see and safely manage on this machine.</p></div>
-        <button class="button ghost small" data-action="route" data-route="clients">View all</button>
-      </div>
-      <div class="client-grid">${clients.slice(0, 3).map(clientCard).join("")}</div>
-
-      <div class="section-heading">
-        <div><h2>Connections</h2><p class="section-copy">Reusable endpoints and model catalogs.</p></div>
-        <button class="button ghost small" data-action="route" data-route="connections">Manage</button>
-      </div>
-      ${connections.length ? `<div class="card-grid">${connections.slice(0, 4).map(connectionCard).join("")}</div>` : emptyConnections()}
-    `;
+    return storageWarningBanner() + window.PilotWeaveSetup.render(snapshot, data, isDesktop);
   }
 
   function renderConnections() {
@@ -472,7 +457,7 @@
   }
 
   function renderClients() {
-    return `
+    return `<section id="installation-panel" class="install-panel"></section><section id="account-panel" class="account-panel"></section>
       <div class="security-note">
         <div class="note-icon">◎</div>
         <div>
@@ -484,103 +469,18 @@
     `;
   }
 
-  function renderResources() {
-    return `
-      <div class="milestone-panel">
-        <div class="empty-icon">✦</div>
-        <p class="eyebrow">NEXT MILESTONE</p>
-        <h2>Shared Skills, MCP, and Instructions</h2>
-        <p>The product shell already reserves this domain, but the MVP does not claim resource deployment is complete. The next implementation will model resources once and bind them to VS Code profiles, Copilot CLI, the GitHub Copilot app, and repositories.</p>
-        <div class="badges" style="justify-content:center">
-          <span class="badge">Skills</span><span class="badge">MCP</span><span class="badge">Instructions</span><span class="badge">Repository scope</span>
-        </div>
-      </div>`;
-  }
-
   function renderActivity() {
-    if (!snapshot.deployments.length) {
-      return `
-        <div class="empty-state">
-          <div class="empty-icon">↗</div>
-          <h2>No deployment activity yet</h2>
-          <p>Preview and apply a connection to create a local, secret-free audit record.</p>
-          <button class="button primary" data-action="route" data-route="connections">Open connections</button>
-        </div>`;
-    }
-    const connectionById = Object.fromEntries(
-      snapshot.connections.map((connection) => [connection.id, connection]),
-    );
-    const clientById = Object.fromEntries(
-      snapshot.clients.map((client) => [client.id, client]),
-    );
-    return `
-      <div class="table-wrap">
-        <table>
-          <thead><tr><th>Time</th><th>Connection</th><th>Target</th><th>Status</th><th>Detail</th></tr></thead>
-          <tbody>
-            ${snapshot.deployments
-              .map(
-                (record) => `<tr>
-                  <td>${escapeHtml(formatDate(record.createdAt))}</td>
-                  <td>${escapeHtml(connectionById[record.connectionId]?.name ?? record.connectionId)}</td>
-                  <td>${escapeHtml(clientById[record.targetId]?.name ?? record.targetId)}</td>
-                  <td><span class="status-pill ${escapeHtml(record.status)}">${escapeHtml(statusLabel(record.status))}</span></td>
-                  <td>${escapeHtml(record.detail)}</td>
-                </tr>`,
-              )
-              .join("")}
-          </tbody>
-        </table>
-      </div>`;
-  }
-
-  function renderUsage() {
-    const families = billing?.families ?? [];
-    return `<section class="card"><h2>Official personal Billing</h2>
-      <p>AI credits and legacy premium requests are different units. These are GitHub-reported amounts, not token-price estimates. Organization-paid usage is not covered by personal endpoints.</p>
-      <label>Billing month <input id="billing-month" type="month" value="${escapeHtml(billingMonth)}" /></label>
-      <button class="button" data-action="load-billing" ${billingBusy ? "disabled" : ""}>Read saved snapshots</button>
-      <button class="button primary" data-action="refresh-billing" ${billingBusy || !isDesktop ? "disabled" : ""}>${billingBusy ? "Loading…" : "Refresh from GitHub"}</button>
-      <p>${!isDesktop ? "Browser preview: no native authorization, API requests or usage records." : billing?.account ? `Account: ${escapeHtml(billing.account.login)} (GitHub ID ${escapeHtml(billing.account.userId)})` : "Configure PilotWeave's separate GitHub authorization in Settings first."}</p>
-      <p>Local token imports, cache statistics and API-equivalent estimates are not implemented in this view.</p></section>
-      ${families.map((family) => {
-        const attempt = family.latest;
-        const value = family.lastSuccessful ?? attempt;
-        const items = value?.items ?? [];
-        return `<section class="card"><h2>${escapeHtml(family.endpointFamily)}</h2>
-          <p>Latest retrieval: ${escapeHtml(attempt?.status ?? "Not queried")}${attempt?.error ? ` — ${escapeHtml(attempt.error)}` : ""}</p>
-          ${family.lastSuccessful ? '<p class="muted">Stale: showing the last successful snapshot for this same account and month.</p>' : ""}
-          ${value ? `<p>Coverage: ${escapeHtml(value.coverage)} · ${escapeHtml(value.periodStart)} → ${escapeHtml(value.periodEnd)} · Fetched ${escapeHtml(formatDate(value.fetchedAt))}</p>` : ""}
-          ${value?.itemsTruncated ? `<p>Showing ${items.length} of ${value.totalItemCount} items; no incomplete total is calculated.</p>` : ""}
-          ${items.length ? `<div style="overflow:auto"><table><thead><tr><th>Product / SKU</th><th>Model</th><th>Quantity</th><th>Unit</th><th>GitHub net amount (USD)</th></tr></thead><tbody>${items.map((item) => `<tr><td>${escapeHtml(item.product)} / ${escapeHtml(item.sku)}</td><td>${escapeHtml(item.model ?? "Unknown")}</td><td>${escapeHtml(item.quantity)}</td><td>${escapeHtml(item.unit)}</td><td>${escapeHtml(item.netAmountUsd ?? "Unavailable")}</td></tr>`).join("")}</tbody></table></div>` : "<p>No observed items. Unavailable data is not zero usage.</p>"}
-          </section>`;
-      }).join("")}`;
-  }
-
-  async function loadBilling(refreshRemote) {
-    if (!isDesktop || billingBusy) return;
-    const selected = content.querySelector("#billing-month")?.value ?? billingMonth;
-    if (!/^\d{4}-\d{2}$/.test(selected)) { showToast("Select a valid month", "error"); return; }
-    billingMonth = selected;
-    const [year, month] = selected.split("-").map(Number);
-    const generation = ++billingGeneration;
-    billingBusy = true;
-    render();
-    try {
-      const result = await invoke(refreshRemote ? "refresh_github_billing" : "get_github_billing_overview", { year, month });
-      if (generation === billingGeneration) billing = result;
-    } catch (error) {
-      showToast(error?.message ?? String(error), "error");
-    } finally {
-      if (generation === billingGeneration) billingBusy = false;
-      render();
-    }
+    const entries = [
+      ...snapshot.deployments.map((r) => ({ time: r.createdAt, kind: "Deployment / rollback", source: r.targetId, status: r.status, detail: r.detail, route: "connections" })),
+      ...(data.setup?.accounts?.loginRuns ?? []).map((r) => ({ time: r.finishedAt ?? r.startedAt, kind: "Official sign-in", source: r.requestedSurfaces.join(", "), status: r.status, detail: r.summary, route: "clients" })),
+      ...(data.runs ?? []).map((r) => ({ time: r.finishedAt ?? r.startedAt, kind: "Import / refresh", source: r.sourceId, status: r.status, detail: r.detail, route: "usage" })),
+    ].sort((a, b) => Date.parse(b.time) - Date.parse(a.time));
+    return `<section class="usage-panel"><div class="step-heading"><h2>Recent activity</h2><span>Local, redacted history</span></div>${data.errors.runs ? `<p class="inline-error">${escapeHtml(data.errors.runs)}</p>` : ""}
+      ${entries.length ? `<div class="usage-table-wrap"><table class="usage-table"><thead><tr><th>Time</th><th>Operation</th><th>Target / source</th><th>Status</th><th>Detail</th><th>Next step</th></tr></thead><tbody>${entries.slice(0, 200).map((r) => `<tr><td>${escapeHtml(formatDate(r.time))}</td><td>${escapeHtml(r.kind)}</td><td>${escapeHtml(r.source)}</td><td>${escapeHtml(window.PilotWeaveUsage.label(r.status))}</td><td>${escapeHtml(r.detail)}</td><td><button class="button ghost small" data-action="route" data-route="${r.route}">Review</button></td></tr>`).join("")}</tbody></table></div>` : '<p class="usage-empty">No recorded activity yet.</p>'}</section>`;
   }
 
   function renderSettings() {
-    return `
-      ${snapshot.deploymentRecovery ? `<section class="card"><h2>Deployment recovery required</h2><p>${escapeHtml(snapshot.deploymentRecovery)}</p><button class="button" data-action="preview-recovery">Review safe recovery</button></section>` : ""}
-
+    return `<section id="github-authorization-panel"></section>
       <div class="settings-list">
         ${settingRow("Runtime", isDesktop ? "Tauri native backend" : "Browser preview", isDesktop ? "Client configuration writes can be applied after preview." : "All deployment applies are simulated and remain inside this tab.")}
         ${settingRow("State file", snapshot.statePath, "Non-secret connections, deployments, and schema version.")}
@@ -602,6 +502,7 @@
 
   function storageWarningBanner() {
     const warnings = [];
+    if (snapshot.deploymentRecovery) warnings.push(snapshot.deploymentRecovery);
     if (snapshot.stateRecovery) {
       warnings.push(
         `Connection storage is in read-only recovery: ${snapshot.stateRecovery}`,
@@ -616,6 +517,7 @@
       <div>
         <strong>Storage needs attention</strong>
         ${warnings.map((warning) => `<p>${escapeHtml(warning)}</p>`).join("")}
+        ${snapshot.deploymentRecovery ? '<button class="button" data-action="preview-recovery">Review safe recovery</button>' : ""}
       </div>
     </div>`;
   }
@@ -688,7 +590,7 @@
     backdrop.addEventListener("click", (event) => {
       if (event.target === backdrop) closeModal();
     });
-    modalRoot.querySelector("[data-modal-close]")?.addEventListener("click", closeModal);
+    modalRoot.querySelectorAll("[data-modal-close]").forEach((button) => button.addEventListener("click", closeModal));
     onOpen?.(modalRoot);
   }
 
@@ -697,6 +599,10 @@
   }
 
   function openConnectionForm(connection = null) {
+    if (snapshot.stateRecovery || snapshot.deploymentRecovery) {
+      showToast("Connection changes are disabled during read-only recovery", "error");
+      return;
+    }
     const modelsText = connection?.models
       ?.map((item) => `${item.modelId} | ${item.name}`)
       .join("\n") ?? "";
@@ -835,6 +741,10 @@
   }
 
   function openDeleteConfirmation(connection) {
+    if (snapshot.stateRecovery || snapshot.deploymentRecovery) {
+      showToast("Connection changes are disabled during read-only recovery", "error");
+      return;
+    }
     openModal({
       title: "Delete connection",
       body: `<p class="muted" style="line-height:1.7">Delete <strong style="color:var(--text)">${escapeHtml(connection.name)}</strong>, its local deployment history, and its credential-store entry? Native client configuration is not automatically removed in this MVP.</p>`,
@@ -847,8 +757,7 @@
           try {
             const result = await invoke("delete_connection", { connectionId: connection.id });
             closeModal();
-            showToast(result?.credentialCleanupWarning ?? "Connection deleted",
-              result?.credentialCleanupWarning ? "warning" : "success");
+            showToast(result?.credentialCleanupWarning ?? "Connection deleted", result?.credentialCleanupWarning ? "warning" : "success");
             await refresh();
           } catch (error) {
             showToast(error?.message ?? String(error), "error");
@@ -859,24 +768,28 @@
   }
 
   function openDeployment(connection) {
+    if (snapshot.stateRecovery || snapshot.deploymentRecovery) {
+      showToast("Managed writes are disabled during read-only recovery", "error");
+      return;
+    }
     const targets = snapshot.clients;
     openModal({
       title: `Deploy ${connection.name}`,
       wide: true,
       body: `
-        <p class="muted" style="font-size:11px;line-height:1.6">Select concrete client targets. Only the exact reviewed plan can be applied. Plans expire after 15 minutes and can be used once.</p>
-        <div class="target-list">
+        <p class="muted" style="font-size:11px;line-height:1.6">Review the concrete targets before confirming. This exact preview expires after 15 minutes and can be applied once. Changed state requires a new preview.</p>
+        <details><summary>Review individual targets and VS Code profiles</summary><div class="target-list">
           ${targets
             .map(
               (target) => `<div class="target-option">
-                <input id="target-${escapeHtml(target.id)}" type="checkbox" name="deployment-target" value="${escapeHtml(target.id)}" ${target.detected ? "checked" : "disabled"} />
+                <input id="target-${escapeHtml(target.id)}" type="checkbox" name="deployment-target" value="${escapeHtml(target.id)}" ${target.detected && target.supportsWrite ? "checked" : target.detected ? "" : "disabled"} />
                 <label for="target-${escapeHtml(target.id)}"><strong>${escapeHtml(target.name)}</strong><small>${escapeHtml(target.detail)} · ${escapeHtml(target.supportsWrite ? "writable" : "manual/read-only")}</small></label>
                 <span class="status-pill ${escapeHtml(target.status)}">${escapeHtml(statusLabel(target.status))}</span>
               </div>`,
             )
             .join("")}
         </div>
-        <hr class="preview-separator" />
+        </details><hr class="preview-separator" />
         <div id="deployment-preview"><p class="muted" style="font-size:11px">Preview has not been generated.</p></div>`,
       footer: `<button class="button ghost" data-modal-close>Cancel</button><button class="button primary" id="preview-deployment">Preview changes</button>`,
       onOpen(root) {
@@ -884,46 +797,33 @@
           button.addEventListener("click", closeModal),
         );
         const actionButton = root.querySelector("#preview-deployment");
-        const session = new window.PilotWeavePlanSession();
-        const previewElement = root.querySelector("#deployment-preview");
+        const review = window.PilotWeaveDeploymentReview.createSession(invoke);
         root.querySelectorAll('input[name="deployment-target"]').forEach((input) => {
           input.addEventListener("change", () => {
-            session.invalidate();
-            previewElement.textContent = "Selection changed. Generate a new preview.";
+            review.invalidate();
             actionButton.textContent = "Preview changes";
-            actionButton.disabled = false;
+            root.querySelector("#deployment-preview").textContent = "Selection changed. Generate a new preview.";
           });
         });
-        root.querySelectorAll("[data-modal-close]").forEach((button) => {
-          button.addEventListener("click", () => session.invalidate());
-        });
         actionButton.addEventListener("click", async () => {
+          if (review.busy) return;
+          actionButton.disabled = true;
           try {
-            if (!session.plan) {
-              if (session.pending) return;
+            if (!review.plan) {
               const selectedTargetIds = Array.from(
                 root.querySelectorAll('input[name="deployment-target"]:checked'),
               ).map((input) => input.value);
-              if (!selectedTargetIds.length) throw new Error("Select at least one target");
-              const generation = session.begin();
-              actionButton.disabled = true;
-              const plan = await invoke("preview_deployment", {
-                connectionId: connection.id, targetIds: selectedTargetIds,
-              });
-              if (!root.isConnected || !session.accept(generation, plan)) return;
-              previewElement.innerHTML = `
-                <div class="operation-list">${plan.operations.map(operationCard).join("")}</div>
-                <label><input id="confirm-reviewed-plan" type="checkbox" style="width:auto" />
-                  I reviewed these exact changes and their credential-storage effects.</label>`;
-              actionButton.textContent = "Apply reviewed changes";
-              actionButton.disabled = true;
-              root.querySelector("#confirm-reviewed-plan").addEventListener("change", (event) => {
-                actionButton.disabled = !event.target.checked;
-              });
+              if (!selectedTargetIds.length) {
+                showToast("Select at least one target", "error");
+                return;
+              }
+              const plan = await review.preview(connection.id, selectedTargetIds);
+              if (!plan) return;
+              root.querySelector("#deployment-preview").innerHTML = `
+                <div class="operation-list">${plan.operations.map(operationCard).join("")}</div>`;
+              actionButton.textContent = "Apply supported changes";
             } else {
-              const args = session.consume(root.querySelector("#confirm-reviewed-plan")?.checked === true);
-              actionButton.disabled = true;
-              const result = await invoke("apply_deployment_plan", args);
+              const result = await review.apply();
               closeModal();
               const applied = result.records.filter((item) => item.status === "applied").length;
               const skipped = result.records.filter((item) => item.status === "skipped").length;
@@ -932,41 +832,79 @@
               await refresh();
             }
           } catch (error) {
-            session.invalidate();
-            actionButton.disabled = false;
-            actionButton.textContent = "Preview changes";
-            previewElement.textContent = "Generate a new preview before retrying.";
+            review.invalidate();
+            root.querySelector("#deployment-preview").textContent = "The previous preview cannot be reused. Review a new preview before applying.";
             showToast(error?.message ?? String(error), "error");
+          } finally {
+            actionButton.disabled = false;
+            actionButton.textContent = review.plan ? "Apply supported changes" : "Preview changes";
           }
         });
       },
     });
   }
 
-  function operationCard(operation) {
-    return `<article class="operation-card">
-      <div class="card-header"><div><strong>${escapeHtml(operation.title)}</strong><p>${escapeHtml(operation.description)}</p></div><span class="status-pill ${operation.supported ? "available" : "read-only"}">${operation.supported ? "Will apply" : "Manual"}</span></div>
-      <ul>${operation.changes.map((change) => `<li>${escapeHtml(change)}</li>`).join("")}</ul>
-      ${operation.requiresRestart ? '<p style="margin-top:9px;color:var(--warning)">A new terminal or client process is required.</p>' : ""}
-    </article>`;
-  }
 
-  async function openRecovery() {
+  function openAccountConfirmation() {
+    if (!isDesktop || !data.setup) return;
+    const evidenceFingerprint = data.setup.evidenceFingerprint;
+    openModal({ title: "Confirm the same GitHub account", body: `
+      <p>Check the account displayed in VS Code Copilot, Copilot CLI, and the Copilot app. This records your confirmation separately from automatic verification.</p>
+      <label class="setup-select">GitHub login<input id="confirmed-login" maxlength="39" value="${escapeHtml(data.setup.target?.login ?? "")}" placeholder="Your github.com login" /></label>
+      <p class="muted">PilotWeave uses GitHub's public user API to resolve the stable account ID. No Billing authorization is required.</p>
+      <label class="account-confirmation"><input type="checkbox" id="confirm-all-accounts" /><span>I checked that all three clients display this same github.com account.</span></label>`,
+      footer: '<button class="button ghost" data-modal-close>Cancel</button><button class="button primary" id="save-account-confirmation" disabled>Save my confirmation</button>',
+      onOpen(root) {
+        const button = root.querySelector("#save-account-confirmation");
+        root.querySelector("#confirm-all-accounts").addEventListener("change", (e) => { button.disabled = !e.target.checked; });
+        button.addEventListener("click", async () => {
+          button.disabled = true;
+          try { await invoke("confirm_account_alignment", { login: root.querySelector("#confirmed-login").value.trim(), evidenceFingerprint, confirmed: true }); closeModal(); await refresh(); }
+          catch (error) { showToast(error?.message ?? String(error), "error"); button.disabled = false; }
+        });
+      },
+    });
+  }
+  function openManualSetup() {
+    const connection = window.PilotWeaveSetup.derive(snapshot, data, isDesktop).selected;
+    if (!connection) { openConnectionForm(); return; }
+    openModal({ title: "Set up the Copilot app provider", body: `
+      <ol class="manual-steps"><li>Open the Copilot app and its <strong>Model providers</strong> settings.</li>
+      <li>Add <strong>${escapeHtml(connection.name)}</strong>, endpoint <code>${escapeHtml(connection.baseUrl)}</code>, and model <code>${escapeHtml(connection.models.find((m) => m.enabled)?.modelId ?? "Unknown")}</code>. Enter your provider key in the app if requested.</li>
+      <li>Select the provider and model in the app, then verify they work.</li></ol><p>PilotWeave cannot verify or automatically change the app's private provider configuration. Completion here is your manual confirmation.</p>`,
+      footer: `<button class="button ghost" data-modal-close>Close</button><button class="button primary" id="confirm-manual" ${!isDesktop ? "disabled" : ""}>I completed manual setup</button>`,
+      onOpen(root) { root.querySelector("#confirm-manual").addEventListener("click", async (event) => {
+        event.target.disabled = true;
+        try { await invoke("confirm_manual_provider", { connectionId: connection.id, confirmed: true }); closeModal(); await refresh(); }
+        catch (error) { showToast(error?.message ?? String(error), "error"); event.target.disabled = false; }
+      }); },
+    });
+  }
+  async function openRecovery(action = "restore") {
+    if (!isDesktop) return;
     try {
-      const plan = await invoke("preview_deployment_recovery");
+      const plan = await invoke("preview_deployment_recovery", { action });
+      const keepCurrent = plan.action === "keepCurrent";
+      const blocked = !keepCurrent && !plan.view.committed && (plan.view.conflictCount > 0 || plan.view.unknownResourceCount > 0 || plan.view.unreadableResourceCount > 0);
       openModal({
-        title: "Review interrupted deployment recovery",
-        body: `<p>${plan.view.resourceCount} physical resources were recorded; ${plan.view.conflictCount} have external changes.</p><p>${plan.view.committed ? "The audit was committed. This only removes the completed journal." : "Only unchanged PilotWeave writes can be restored. Newer user edits will never be overwritten."}</p><label><input id="confirm-recovery" type="checkbox" style="width:auto" />I reviewed and approve this recovery operation.</label>`,
-        footer: '<button class="button ghost" data-modal-close>Cancel</button><button class="button primary" id="apply-recovery" disabled>Recover</button>',
+        title: keepCurrent ? "Review keeping current files" : "Review interrupted deployment recovery",
+        body: keepCurrent
+          ? `<p>Keep all ${plan.view.resourceCount} recorded resources exactly as they are. This removes the pending rollback journal and ends the deployment write block.</p><p><strong>The pending changes cannot be rolled back by PilotWeave after this operation.</strong> This does not verify client configuration or mark the deployment successful. Review the current client setup before deploying again.</p><label><input id="confirm-recovery" type="checkbox" style="width:auto" />I reviewed this choice and accept keeping the current files and discarding pending rollback data.</label>`
+          : `<p>${plan.view.resourceCount} physical resources were recorded; ${plan.view.conflictCount} have external changes, ${plan.view.unknownResourceCount ?? 0} are no longer detected or cannot be located, and ${plan.view.unreadableResourceCount ?? 0} cannot be read safely.</p><p>${plan.view.committed ? "The audit was committed. This only removes the completed journal." : blocked ? "Automatic restoration is blocked. Resolve the affected targets and preview again, or separately review keeping all current files to end recovery." : "Unchanged PilotWeave writes will be restored. A new external edit will stop safe restoration and retain the journal for another review."}</p><label><input id="confirm-recovery" type="checkbox" style="width:auto" ${blocked ? "disabled" : ""} />I reviewed and approve this recovery operation.</label>`,
+        footer: `<button class="button ghost" data-modal-close>Cancel</button>${!keepCurrent && !plan.view.committed ? '<button class="button ghost" id="review-keep-current">Review keeping current files…</button>' : ""}<button class="button primary" id="apply-recovery" disabled>${keepCurrent ? "Keep files and end recovery" : "Recover"}</button>`,
         onOpen(root) {
           const button = root.querySelector("#apply-recovery");
-          root.querySelector("#confirm-recovery").addEventListener("change", (event) => { button.disabled = !event.target.checked; });
+          root.querySelector("#confirm-recovery").addEventListener("change", (event) => { button.disabled = blocked || !event.target.checked; });
+          root.querySelector("#review-keep-current")?.addEventListener("click", async (event) => {
+            event.target.disabled = true;
+            await openRecovery("keepCurrent");
+          });
           button.addEventListener("click", async () => {
             button.disabled = true;
             try {
               await invoke("apply_deployment_recovery", { planId: plan.id, confirmed: true });
               closeModal();
-              showToast("Recovery completed; original audit may require review");
+              showToast(keepCurrent ? "Current files retained; review client setup before deploying again" : "Recovery completed; original audit may require review");
               await refresh();
             } catch (error) {
               closeModal();
@@ -979,6 +917,15 @@
     } catch (error) { showToast(error?.message ?? String(error), "error"); }
   }
 
+
+  function operationCard(operation) {
+    return `<article class="operation-card">
+      <div class="card-header"><div><strong>${escapeHtml(operation.title)}</strong><p>${escapeHtml(operation.description)}</p></div><span class="status-pill ${operation.supported ? "available" : "read-only"}">${operation.supported ? "Will apply" : "Manual"}</span></div>
+      <ul>${operation.changes.map((change) => `<li>${escapeHtml(change)}</li>`).join("")}</ul>
+      ${operation.requiresRestart ? '<p style="margin-top:9px;color:var(--warning)">A new terminal or client process is required.</p>' : ""}
+    </article>`;
+  }
+
   document.querySelector("#primary-nav").addEventListener("click", (event) => {
     const button = event.target.closest("[data-route]");
     if (button) setRoute(button.dataset.route);
@@ -989,11 +936,16 @@
     if (!action) return;
     const connection = snapshot?.connections.find((item) => item.id === action.dataset.id);
     switch (action.dataset.action) {
-      case "load-billing": loadBilling(false); break;
-      case "refresh-billing": loadBilling(true); break;
-      case "preview-recovery":
-        openRecovery();
-        break;
+      case "setup-install":
+        window.PilotWeaveInstaller.preview((data.components ?? []).filter((c) => ["missing", "broken"].includes(c.status)).map((c) => c.id)); break;
+      case "setup-signin": window.PilotWeaveAccount.preview(); break;
+      case "setup-accounts": openAccountConfirmation(); break;
+      case "setup-deploy": {
+        const selected = window.PilotWeaveSetup.derive(snapshot, data, isDesktop).selected;
+        if (selected) openDeployment(selected); else openConnectionForm(); break;
+      }
+      case "setup-manual": openManualSetup(); break;
+      case "preview-recovery": openRecovery(); break;
       case "add-connection":
         openConnectionForm();
         break;
@@ -1018,5 +970,12 @@
   addConnectionButton.addEventListener("click", () => openConnectionForm());
   refreshButton.addEventListener("click", refresh);
 
+  content.addEventListener("change", async (event) => {
+    if (event.target.id !== "setup-connection") return;
+    try { await invoke("select_setup_connection", { connectionId: event.target.value }); await refresh(); }
+    catch (error) { showToast(error?.message ?? String(error), "error"); }
+  });
+  document.addEventListener("pilotweave:refresh-setup", () => refresh());
+  window.PilotWeaveUsage.configure({ invoke, refresh: refreshUsage, render, showToast, openModal, closeModal, getData: () => data, native: isDesktop });
   refresh();
 })();

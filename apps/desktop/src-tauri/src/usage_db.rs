@@ -16,7 +16,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
-pub const USAGE_SCHEMA_VERSION: u32 = 1;
+pub const USAGE_SCHEMA_VERSION: u32 = 3;
 /// Upper bound for one sync transaction (spec section 12.3).
 pub const MAX_BATCH_RECORDS: usize = 500;
 /// Bound for externally derived short text fields.
@@ -291,7 +291,7 @@ pub struct NewPriceRow {
     pub tier: String,
     pub context_threshold: Option<u64>,
     pub input_rate_per_million: ExactDecimal,
-    /// `None` means an explicit NotApplicable rate, never "unknown zero".
+    /// Missing rates are unavailable; callers must not silently turn them into zero.
     pub cache_read_rate_per_million: Option<ExactDecimal>,
     pub cache_write_rate_per_million: Option<ExactDecimal>,
     pub output_rate_per_million: ExactDecimal,
@@ -319,6 +319,13 @@ impl UsageDb {
     }
 
     pub fn open_at(path: &Path) -> AppResult<Self> {
+        crate::safe_file::ensure_regular_or_missing(path)?;
+        for suffix in ["-wal", "-shm", "-journal"] {
+            crate::safe_file::ensure_regular_or_missing(&PathBuf::from(format!(
+                "{}{suffix}",
+                path.display()
+            )))?;
+        }
         if let Ok(metadata) = fs::symlink_metadata(path) {
             if metadata.file_type().is_symlink() || !metadata.is_file() {
                 return Err(AppError::InvalidInput(format!(
@@ -354,7 +361,14 @@ impl UsageDb {
             path: path.to_path_buf(),
         };
         db.migrate()?;
+        db.conn
+            .pragma_update(None, "journal_mode", "WAL")
+            .map_err(sqlite_error)?;
         Ok(db)
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
     }
 
     fn migrate(&mut self) -> AppResult<()> {
@@ -372,14 +386,20 @@ impl UsageDb {
         }
 
         let tx = self.conn.transaction().map_err(sqlite_error)?;
-        tx.execute_batch(MIGRATION_V1).map_err(|error| {
-            AppError::Config(format!("Usage database migration to v1 failed: {error}"))
-        })?;
-        tx.execute(
-            "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
-            params![USAGE_SCHEMA_VERSION, Utc::now().to_rfc3339()],
-        )
-        .map_err(sqlite_error)?;
+        for (target, migration) in [
+            (1, MIGRATION_V1),
+            (2, crate::usage::store::MIGRATION_V2),
+            (3, crate::usage::store::MIGRATION_V3),
+        ] {
+            if version < target {
+                tx.execute_batch(migration).map_err(sqlite_error)?;
+                tx.execute(
+                    "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                    params![target, Utc::now().to_rfc3339()],
+                )
+                .map_err(sqlite_error)?;
+            }
+        }
         tx.pragma_update(None, "user_version", USAGE_SCHEMA_VERSION)
             .map_err(sqlite_error)?;
         tx.commit().map_err(sqlite_error)?;
@@ -756,6 +776,40 @@ mod tests {
         // Reopening an up-to-date database is a no-op, not a re-migration.
         let db = UsageDb::open_at(&path).expect("reopen");
         assert_eq!(db.status().state, UsageDbState::Available);
+    }
+
+    #[test]
+    fn v1_database_migrates_without_losing_existing_records_and_cursors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("usage.sqlite3");
+        let conn = SqliteConnection::open(&path).unwrap();
+        conn.execute_batch(MIGRATION_V1).unwrap();
+        conn.pragma_update(None, "user_version", 1).unwrap();
+        let mut legacy = UsageDb {
+            conn,
+            path: path.clone(),
+        };
+        legacy.register_source(&source("legacy")).unwrap();
+        legacy
+            .upsert_records_with_cursor("legacy", &cursor(45), &[record("legacy-record", 123)])
+            .unwrap();
+        drop(legacy);
+        let db = UsageDb::open_at(&path).unwrap();
+        assert_eq!(db.status().schema_version, Some(USAGE_SCHEMA_VERSION));
+        assert_eq!(db.record_count("legacy").unwrap(), 1);
+        assert_eq!(db.cursor("legacy").unwrap().unwrap().offset, 45);
+        let count: i64 = db
+            .conn
+            .query_row("SELECT count(*) FROM usage_observation_details", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0);
+        let mode: String = db
+            .conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode, "wal");
     }
 
     #[test]

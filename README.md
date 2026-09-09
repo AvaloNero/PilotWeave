@@ -1,8 +1,8 @@
 # PilotWeave
 
-**A local control plane for GitHub Copilot clients.**
+**Set up GitHub Copilot on this computer.**
 
-PilotWeave keeps provider connections, model catalogs, credentials, and client targets in one place, then projects that desired state into supported Copilot surfaces installed on the machine.
+Install apps, confirm one GitHub account, deploy one model setup, and inspect usage with explicit source coverage.
 
 > Configure once. Preview every change. Apply across supported Copilot surfaces.
 
@@ -30,7 +30,18 @@ PilotWeave is still pre-release, but the repository now contains working vertica
 - Native Settings and Clients panels for installation, account orchestration, sign-in history, separate GitHub authorization, storage recovery, and browser-preview limitations.
 - A browser fallback for reviewing the interface without native writes or real authentication.
 
-The separate GitHub authorization slice currently validates identity and endpoint capability. It does **not** yet claim that personal Billing report items are synchronized into `usage.sqlite3`, nor that official runtime quota and local token-usage import are complete.
+The Home setup flow now combines component discovery, account evidence, a persistent user confirmation, a selected Connection, live deployment fingerprints, and manual app setup. Its four core steps are independent from Billing authorization and usage opt-in. Navigation is Home, Connections, Usage, and More; unfinished Resources navigation and obsolete one-off workflows have been removed.
+
+Usage has native commands and a SQLite v2 migration for:
+
+- Read-only Copilot SDK protocol 3 quota/model observations; no session or prompt RPCs.
+- Monthly personal GitHub Billing snapshots, stable account identity, independent endpoint families, retry-after and same-month stale fallback.
+- Opt-in CLI/shared-runtime session imports and VS Code OTel chat-span imports, with fixed source roots, bounded incremental cursors, cancellation and physical-source deduplication.
+- Reported/normalized input, output, fresh input, cache read/write, weighted cache hit, request counts, model/route/client/provider/day breakdowns and record details.
+- Immutable official OpenRouter text-price catalogs, exact aliases, tier-aware decimal API-equivalent comparisons and explicit incomplete coverage.
+- Filters, source setup/disable/clear controls, runtime/Billing/catalog refreshes, immutable snapshot provenance and local job history.
+
+See [adapter provenance and supported schemas](docs/usage-sources.md) and the [P0/P1 handoff](docs/p0-p1-handoff.md). These changes do not establish clean-machine or real-account release acceptance.
 
 ## Required MVP
 
@@ -38,11 +49,8 @@ The complete behavior and acceptance criteria are defined in [the MVP implementa
 
 - Complete clean Windows 11 x64 installation verification, including every applicable package/product/publisher requirement and partial/cancellation behavior.
 - Continue same-account verification after official client flows where stable, token-free client observations are available; preserve Action required or Unsupported elsewhere.
-- Fetch, validate, persist, and render authoritative personal GitHub AI-credit or legacy premium-request snapshots without mixing incompatible units.
-- Add current supported Copilot runtime quota/model observations independently from GitHub Billing.
-- Import observable local model usage for official GitHub routes and BYOK routes while preserving unknown fields, attribution confidence, source coverage, and privacy boundaries.
-- Show input, output, cache read, cache write, cache-hit rate, route confidence, covered period, freshness, and data-quality warnings.
-- Calculate and display decimal API-equivalent estimates from immutable, versioned price snapshots while keeping GitHub authoritative amounts visibly separate.
+- Validate runtime quota and personal Billing with actual supported client/account combinations during P2.
+- Expand usage coverage only when upstream exposes the missing semantics: current CLI shutdown metrics do not establish fresh-vs-total input, VS Code may omit cache-write tokens, and no separate supported Copilot app usage source is established. Current data remains Unknown/Partial/Unsupported where appropriate.
 - Implement the required MCP, Skills, and Instructions synchronization only for stable public paths with the normal preview, ownership, journal, and rollback contract.
 - Finish deletion/revocation, ownership, interrupted-operation, and clean-machine regression cases that remain open in the normative specification.
 
@@ -81,7 +89,10 @@ Current regression coverage includes:
 - **GitHub Copilot app** — deployment remains intentionally read-only; tests pin the manual-configuration boundary and runbook preview.
 - **Installation and sign-in** — backend-owned component/surface allowlists, one-shot plans, bounded native-process output, interrupted login-run recovery, and UTF-8-safe redacted diagnostics.
 - **Separate GitHub authorization** — fake credential-store tests prove token/metadata separation, corrupt metadata recovery, rollback of a previous secret after metadata-write failure, bounded token/scope validation, and clear behavior.
-- **Usage persistence and money** — SQLite migrations, foreign keys, idempotent transactional upserts/cursors, bounded batches, reopen behavior, and exact decimal round trips.
+- **Usage persistence and money** — v1-to-v2 migrations, foreign keys, append/truncate/rotate/reopen behavior, incomplete final lines, atomic batches, cancel/recovery, stable cumulative IDs, privacy sentinels, exact counters across IPC, cache arithmetic, context tiers, aliases, and immutable historical prices.
+- **Setup and UI** — manual vs verified identity, expiry/evidence invalidation, drift, optional usage readiness, escaped remote strings, exact decimal display, and model-list union.
+
+An optional isolated browser check is available as `node apps/desktop/web/tests/browser-smoke.cjs` with Playwright installed (or `PILOTWEAVE_PLAYWRIGHT` set to its module path). `PILOTWEAVE_BROWSER` can select a browser executable. It uses a fresh headless profile and in-memory native fixtures; screenshots go to a temporary directory. It does not exercise a real native account or installer.
 
 Tests use temporary directories, fake stores/runners, and sanitized data. They never modify real VS Code profiles, registry keys, environment variables, shell files, client sessions, or GitHub credentials.
 

@@ -6,9 +6,7 @@ use std::path::PathBuf;
 use uuid::Uuid;
 
 pub fn discover_target() -> ClientTarget {
-    let path = installation_candidates()
-        .into_iter()
-        .find(|candidate| candidate.exists());
+    let path = installation_path();
     let detected = path.is_some();
     ClientTarget {
         id: "github-copilot-app:local".to_string(),
@@ -32,6 +30,14 @@ pub fn discover_target() -> ClientTarget {
                 .to_string()
         }),
     }
+}
+
+pub(crate) fn installation_path() -> Option<PathBuf> {
+    find_installed_candidate(installation_candidates())
+}
+
+fn find_installed_candidate(candidates: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
+    candidates.into_iter().find(|candidate| candidate.is_file())
 }
 
 pub fn preview(connection: &Connection, target: &ClientTarget) -> DeploymentOperation {
@@ -75,25 +81,15 @@ fn installation_candidates() -> Vec<PathBuf> {
 
     #[cfg(windows)]
     {
-        if let Some(local) = env::var_os("LOCALAPPDATA") {
-            let local = PathBuf::from(local);
-            candidates.push(
-                local
-                    .join("Programs")
-                    .join("GitHub Copilot")
-                    .join("GitHub Copilot.exe"),
-            );
-            candidates.push(local.join("GitHubCopilot").join("GitHub Copilot.exe"));
-        }
-        for variable in ["PROGRAMFILES", "PROGRAMFILES(X86)"] {
-            if let Some(root) = env::var_os(variable) {
-                candidates.push(
-                    PathBuf::from(root)
-                        .join("GitHub Copilot")
-                        .join("GitHub Copilot.exe"),
-                );
-            }
-        }
+        let local_app_data = env::var_os("LOCALAPPDATA").map(PathBuf::from);
+        let program_files = ["PROGRAMFILES", "PROGRAMFILES(X86)"]
+            .into_iter()
+            .filter_map(env::var_os)
+            .map(PathBuf::from);
+        candidates.extend(windows_installation_candidates(
+            local_app_data,
+            program_files,
+        ));
     }
 
     #[cfg(target_os = "macos")]
@@ -117,12 +113,41 @@ fn installation_candidates() -> Vec<PathBuf> {
     candidates
 }
 
+#[cfg(windows)]
+fn windows_installation_candidates(
+    local_app_data: Option<PathBuf>,
+    program_files: impl IntoIterator<Item = PathBuf>,
+) -> Vec<PathBuf> {
+    const EXECUTABLE_NAMES: [&str; 2] = ["github.exe", "GitHub Copilot.exe"];
+
+    let mut candidates = Vec::new();
+    if let Some(local) = local_app_data {
+        for directory in [
+            local.join("Programs").join("GitHub Copilot"),
+            local.join("GitHubCopilot"),
+        ] {
+            for executable_name in EXECUTABLE_NAMES {
+                candidates.push(directory.join(executable_name));
+            }
+        }
+    }
+    for root in program_files {
+        let directory = root.join("GitHub Copilot");
+        for executable_name in EXECUTABLE_NAMES {
+            candidates.push(directory.join(executable_name));
+        }
+    }
+    candidates
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::domain::{ApiProtocol, ModelCapabilities, ModelSpec, ProviderKind};
     use chrono::Utc;
     use std::collections::BTreeMap;
+    #[cfg(windows)]
+    use std::fs;
 
     fn connection() -> Connection {
         Connection {
@@ -178,5 +203,58 @@ mod tests {
             .expect_err("GitHub Copilot app writes are out of scope");
         assert!(matches!(error, AppError::Unsupported(_)));
         assert!(error.to_string().contains("read-only"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn current_winget_entrypoint_is_detected_from_a_supported_root() {
+        let temp = tempfile::tempdir().expect("temp directory");
+        let local_app_data = temp.path().join("LocalAppData");
+        let current_entrypoint = local_app_data
+            .join("Programs")
+            .join("GitHub Copilot")
+            .join("github.exe");
+        fs::create_dir_all(current_entrypoint.parent().expect("app directory"))
+            .expect("create app directory");
+        fs::write(&current_entrypoint, b"fixture").expect("create executable fixture");
+
+        let candidates =
+            windows_installation_candidates(Some(local_app_data), std::iter::empty::<PathBuf>());
+
+        assert_eq!(
+            find_installed_candidate(candidates),
+            Some(current_entrypoint)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_candidates_keep_legacy_entrypoint_compatibility() {
+        let local_app_data = PathBuf::from(r"C:\Users\example\AppData\Local");
+        let program_files = PathBuf::from(r"C:\Program Files");
+
+        let candidates =
+            windows_installation_candidates(Some(local_app_data.clone()), [program_files.clone()]);
+
+        assert_eq!(
+            candidates.first(),
+            Some(
+                &local_app_data
+                    .join("Programs")
+                    .join("GitHub Copilot")
+                    .join("github.exe")
+            )
+        );
+        assert!(candidates.contains(
+            &local_app_data
+                .join("Programs")
+                .join("GitHub Copilot")
+                .join("GitHub Copilot.exe")
+        ));
+        assert!(candidates.contains(
+            &program_files
+                .join("GitHub Copilot")
+                .join("GitHub Copilot.exe")
+        ));
     }
 }

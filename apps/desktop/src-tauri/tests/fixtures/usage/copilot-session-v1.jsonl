@@ -1,0 +1,4 @@
+{"type":"session.start","timestamp":"2026-09-01T00:00:00Z","data":{"sessionId":"sanitized-session-01","version":1,"producer":"copilot-agent","copilotVersion":"0.0.fixture","startTime":"2026-09-01T00:00:00Z"}}
+{"type":"user.message","timestamp":"2026-09-01T00:00:01Z","data":{"content":"PRIVATE_PROMPT_DO_NOT_RETAIN","attachments":[{"path":"PRIVATE_SOURCE_PATH"}]}}
+{"type":"assistant.usage","ephemeral":true,"timestamp":"2026-09-01T00:00:02Z","data":{"inputTokens":999999,"outputTokens":999999}}
+{"type":"session.shutdown","timestamp":"2026-09-01T01:00:00Z","data":{"sessionStartTime":1788220800000,"modelMetrics":{"gpt-5":{"requests":{"count":2,"cost":0.2},"usage":{"inputTokens":1000,"outputTokens":40,"cacheReadTokens":800,"cacheWriteTokens":0}}},"summary":"PRIVATE_RESPONSE_DO_NOT_RETAIN","environment":{"TOKEN":"PRIVATE_TOKEN_DO_NOT_RETAIN"}}}

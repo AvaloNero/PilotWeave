@@ -27,7 +27,6 @@
   let loading = false;
   let currentPlan = null;
   let renderVersion = 0;
-  let scheduled = false;
 
   const browserIdentity = {
     host: "github.com",
@@ -92,33 +91,15 @@
     setTimeout(() => toast.remove(), 4200);
   }
 
-  function isClientsRoute() {
-    return pageTitle.textContent?.trim() === "Clients";
-  }
-
   function markChanged() {
     renderVersion += 1;
     ensurePanel();
   }
 
-  function scheduleEnsurePanel() {
-    if (scheduled) return;
-    scheduled = true;
-    queueMicrotask(() => {
-      scheduled = false;
-      ensurePanel();
-    });
-  }
-
   function ensurePanel() {
-    if (!isClientsRoute()) return;
+
     let panel = content.querySelector("#account-panel");
-    if (!panel) {
-      panel = document.createElement("section");
-      panel.id = "account-panel";
-      panel.className = "account-panel";
-      content.prepend(panel);
-    }
+    if (!panel) return;
     const installationPanel = content.querySelector("#installation-panel");
     if (installationPanel && panel.previousElementSibling !== installationPanel) {
       installationPanel.after(panel);
@@ -152,7 +133,7 @@
         </div>
         <div class="account-panel-actions">
           <button class="button ghost small" data-account-action="refresh" ${loading ? "disabled" : ""}>${loading ? "Checking…" : "Refresh accounts"}</button>
-          <button class="button primary small" data-account-action="preview" ${loading || selectable.length === 0 || status?.historyRecovery ? "disabled" : ""}>Sign in and sync${selectable.length ? ` (${selectable.length})` : ""}</button>
+          <button class="button primary small" data-account-action="preview" ${loading || selectable.length === 0 || status?.historyRecovery ? "disabled" : ""}>Open official sign-in flows${selectable.length ? ` (${selectable.length})` : ""}</button>
         </div>
       </div>
       ${status?.historyRecovery ? renderRecovery(status.historyRecovery) : ""}
@@ -339,7 +320,7 @@
       const value = await invoke("get_account_status");
       validateStatus(value);
       accountStatus = value;
-      if (!quiet) showToast("Account status refreshed");
+      if (!quiet) { showToast("Account status refreshed"); document.dispatchEvent(new Event("pilotweave:refresh-setup")); }
     } catch (error) {
       showToast(error?.message ?? String(error), "error");
     } finally {
@@ -366,9 +347,9 @@
       );
       return;
     }
-    const surfaces = Array.from(
-      content.querySelectorAll('input[name="account-surface"]:checked'),
-    ).map((input) => input.value);
+    const choices = content.querySelectorAll('input[name="account-surface"]');
+    const surfaces = choices.length ? Array.from(choices).filter((input) => input.checked).map((input) => input.value)
+      : (accountStatus.surfaces ?? []).filter((s) => !["notInstalled", "unsupported"].includes(s.state)).map((s) => s.surface);
     if (!surfaces.length) {
       showToast("Select at least one installed account surface", "error");
       return;
@@ -438,7 +419,7 @@
     modalRoot
       .querySelector("[data-account-target-confirm]")
       ?.addEventListener("change", (event) => {
-        if (confirm) confirm.disabled = !event.target.checked || supportedCount === 0;
+        if (confirm) confirm.disabled = !isDesktop || !event.target.checked || supportedCount === 0;
       });
     confirm?.addEventListener("click", () => applyPlan(plan));
   }
@@ -455,6 +436,7 @@
   }
 
   async function applyPlan(plan) {
+    if (!isDesktop) return;
     const confirm = modalRoot.querySelector("[data-account-confirm]");
     if (confirm) {
       confirm.disabled = true;
@@ -465,6 +447,7 @@
       validateStatus(result.accountStatus);
       currentPlan = null;
       accountStatus = result.accountStatus;
+      document.dispatchEvent(new Event("pilotweave:refresh-setup"));
       showResultModal(result.run);
       showToast("Official sign-in launch completed");
       markChanged();
@@ -634,22 +617,10 @@
     }
   });
 
-  const contentObserver = new MutationObserver(scheduleEnsurePanel);
-  contentObserver.observe(content, { childList: true });
-  const titleObserver = new MutationObserver(() => {
-    if (isClientsRoute()) {
-      ensurePanel();
-      if (!accountStatus && !loading) refreshStatus({ quiet: true });
-    }
-  });
-  titleObserver.observe(pageTitle, {
-    childList: true,
-    characterData: true,
-    subtree: true,
-  });
-
-  if (isClientsRoute()) {
-    ensurePanel();
-    refreshStatus({ quiet: true });
-  }
+  window.PilotWeaveAccount = {
+    hydrate(value) { accountStatus = value; renderVersion += 1; },
+    mount: ensurePanel,
+    previewStatus: () => structuredClone(browserState),
+    preview: previewLogin,
+  };
 })();

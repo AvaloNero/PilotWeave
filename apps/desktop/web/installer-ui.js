@@ -21,7 +21,6 @@
   let loading = false;
   let lastResult = null;
   let renderVersion = 0;
-  let scheduled = false;
 
   const browserObservations = [
     {
@@ -106,33 +105,15 @@
     );
   }
 
-  function isClientsRoute() {
-    return pageTitle.textContent?.trim() === "Clients";
-  }
-
   function markChanged() {
     renderVersion += 1;
     ensurePanel();
   }
 
-  function scheduleEnsurePanel() {
-    if (scheduled) return;
-    scheduled = true;
-    queueMicrotask(() => {
-      scheduled = false;
-      ensurePanel();
-    });
-  }
-
   function ensurePanel() {
-    if (!isClientsRoute()) return;
+
     let panel = content.querySelector("#installation-panel");
-    if (!panel) {
-      panel = document.createElement("section");
-      panel.id = "installation-panel";
-      panel.className = "install-panel";
-      content.prepend(panel);
-    }
+    if (!panel) return;
     if (panel.dataset.renderVersion === String(renderVersion)) return;
     panel.dataset.renderVersion = String(renderVersion);
     panel.innerHTML = renderPanel();
@@ -295,7 +276,7 @@
       if (!Array.isArray(observations)) {
         throw new Error("Installation discovery returned an invalid response");
       }
-      if (!quiet) showToast("Installation status refreshed");
+      if (!quiet) { showToast("Installation status refreshed"); document.dispatchEvent(new Event("pilotweave:refresh-setup")); }
     } catch (error) {
       showToast(error?.message ?? String(error), "error");
     } finally {
@@ -345,18 +326,18 @@
       <div class="modal-backdrop install-modal-backdrop" role="presentation">
         <section class="modal wide install-modal" role="dialog" aria-modal="true" aria-label="Review installation plan">
           <header class="modal-header">
-            <div><p class="eyebrow">ONE-SHOT NATIVE PLAN</p><h2>Review installation plan</h2></div>
+            <div><p class="eyebrow">REVIEW CHANGES</p><h2>Review installation plan</h2></div>
             <button class="icon-button" data-install-modal-close aria-label="Close">×</button>
           </header>
           <div class="modal-body">
-            <div class="install-plan-security">
-              Package identities and argument vectors are compiled into the Rust backend. This plan expires at ${escapeHtml(formatDateTime(plan.expiresAt))} and can be consumed once.
+            <div class="install-plan-security"><details><summary>Review safety details</summary>
+              Package identities and argument vectors are compiled into the Rust backend. This plan expires at ${escapeHtml(formatDateTime(plan.expiresAt))} and can be consumed once.</details>
             </div>
             <div class="install-plan-list">${operationRows}</div>
           </div>
           <footer class="modal-footer">
             <button class="button ghost" data-install-modal-close>Cancel</button>
-            <button class="button primary" data-install-confirm ${plan.operations.length === 0 ? "disabled" : ""}>Install and verify</button>
+            <button class="button primary" data-install-confirm ${!isDesktop || plan.operations.length === 0 ? "disabled" : ""}>Install and verify</button>
           </footer>
         </section>
       </div>`;
@@ -389,6 +370,7 @@
   }
 
   async function applyPlan(plan) {
+    if (!isDesktop) return;
     const confirm = modalRoot.querySelector("[data-install-confirm]");
     if (confirm) {
       confirm.disabled = true;
@@ -398,6 +380,7 @@
       const result = await invoke("apply_install_plan", { planId: plan.id });
       lastResult = result;
       observations = result.observations;
+      document.dispatchEvent(new Event("pilotweave:refresh-setup"));
       currentModalPlan = null;
       showResultModal(result);
       showToast("Installation run completed");
@@ -471,22 +454,10 @@
     }
   });
 
-  const contentObserver = new MutationObserver(scheduleEnsurePanel);
-  contentObserver.observe(content, { childList: true });
-  const titleObserver = new MutationObserver(() => {
-    if (isClientsRoute()) {
-      ensurePanel();
-      if (!observations && !loading) refreshStatus({ quiet: true });
-    }
-  });
-  titleObserver.observe(pageTitle, {
-    childList: true,
-    characterData: true,
-    subtree: true,
-  });
-
-  if (isClientsRoute()) {
-    ensurePanel();
-    refreshStatus({ quiet: true });
-  }
+  window.PilotWeaveInstaller = {
+    hydrate(value) { observations = value; renderVersion += 1; },
+    mount: ensurePanel,
+    previewStatus: () => structuredClone(browserObservations),
+    preview: previewInstall,
+  };
 })();

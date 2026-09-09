@@ -1,3 +1,5 @@
+#[cfg(windows)]
+use crate::adapters::github_app;
 use crate::error::{AppError, AppResult};
 #[cfg(windows)]
 use crate::native_process::CapturedOutput;
@@ -223,7 +225,7 @@ pub fn execute_plan(plan: InstallPlan) -> AppResult<InstallApplyResult> {
 fn discover_windows_components() -> Vec<InstallComponentObservation> {
     let code = find_code_executable();
     let copilot = find_on_path("copilot.exe").or_else(|| find_on_path("copilot.cmd"));
-    let app = github_copilot_app_path();
+    let app = github_app::installation_path();
     let extension_ready = code.as_deref().map(extension_installed).unwrap_or(false);
 
     vec![
@@ -540,18 +542,6 @@ fn find_code_executable() -> Option<PathBuf> {
                     .find(|path| path.is_file())
             })
     })
-}
-
-#[cfg(windows)]
-fn github_copilot_app_path() -> Option<PathBuf> {
-    let mut values = Vec::new();
-    if let Some(root) = std::env::var_os("LOCALAPPDATA") {
-        values.push(PathBuf::from(root).join("Programs/GitHub Copilot/GitHub Copilot.exe"));
-    }
-    if let Some(root) = std::env::var_os("PROGRAMFILES") {
-        values.push(PathBuf::from(root).join("GitHub Copilot/GitHub Copilot.exe"));
-    }
-    values.into_iter().find(|path| path.is_file())
 }
 
 #[cfg(windows)]

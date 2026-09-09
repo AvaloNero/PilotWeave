@@ -21,12 +21,12 @@ dirs = "5.0"
 json5 = "0.4"
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
 log = "0.4"
-libc = "0.2"
-sha2 = "0.10"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 rust_decimal = "1.42.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["arbitrary_precision", "preserve_order"] }
+# Cryptographic state/plan fingerprints; already present in the locked dependency graph.
+sha2 = "0.10.9"
 tauri = { version = "2.8.2", features = [] }
 tauri-plugin-log = "2"
 tauri-plugin-opener = "2"
@@ -37,7 +37,11 @@ uuid = { version = "1.11", features = ["v4", "serde"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 winreg = "0.52"
-windows-sys = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging", "Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging", "Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_Storage_FileSystem", "Win32_Security_Authorization", "Win32_System_Registry"] }
+
+[target.'cfg(unix)'.dependencies]
+# flock/O_NOFOLLOW without raising the workspace Rust 1.88 minimum.
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

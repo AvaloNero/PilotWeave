@@ -5,18 +5,23 @@ pub mod decimal;
 mod deployment;
 pub mod domain;
 pub mod error;
+mod fingerprint;
 pub mod github_auth;
 pub mod github_billing;
 pub mod github_billing_store;
 mod installer;
 mod native_process;
 mod redact;
+mod safe_file;
 mod safe_io;
 mod secrets;
+mod setup;
 mod state;
 mod transaction;
+mod usage;
 pub mod usage_db;
 mod validation;
+mod write_lock;
 
 use account::LoginStore;
 use commands::ManagedState;
@@ -27,12 +32,16 @@ use usage_db::UsageDb;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let store = StateStore::open().expect("failed to initialize PilotWeave state");
+    let store = StateStore::open().unwrap_or_else(StateStore::unavailable);
     let login_store = LoginStore::open();
     let github_authorization = GithubAuthorizationStore::open();
     // The usage database is isolated from connection management: when it
     // cannot be opened the app still runs and reports the unavailable state.
-    let (usage_db, usage_db_error) = match UsageDb::open() {
+    let (usage_db, usage_db_error) = match UsageDb::open().and_then(|db| {
+        usage::importer::initialize(&db)?;
+        usage::store::recover(&db)?;
+        Ok(db)
+    }) {
         Ok(db) => (Some(db), None),
         Err(error) => (None, Some(redact_text(&error.to_string()))),
     };
@@ -66,6 +75,23 @@ pub fn run() {
             commands::apply_deployment_plan,
             commands::preview_deployment_recovery,
             commands::apply_deployment_recovery,
+            usage::commands::get_usage_overview,
+            usage::commands::get_usage_sources,
+            usage::commands::get_usage_runs,
+            usage::commands::set_usage_source_enabled,
+            usage::commands::clear_local_usage,
+            usage::commands::sync_local_usage,
+            usage::commands::cancel_usage_sync,
+            usage::commands::get_price_catalog,
+            usage::commands::refresh_price_catalog,
+            usage::commands::get_official_runtime_usage,
+            usage::commands::refresh_official_runtime_usage,
+            usage::commands::get_github_billing,
+            usage::commands::refresh_personal_github_usage,
+            setup::get_setup_status,
+            setup::select_setup_connection,
+            setup::confirm_account_alignment,
+            setup::confirm_manual_provider,
         ])
         .run(tauri::generate_context!())
         .expect("error while running PilotWeave");

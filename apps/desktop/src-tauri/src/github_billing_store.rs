@@ -50,8 +50,8 @@ pub fn insert_snapshots(db: &mut UsageDb, snapshots: &[GithubBillingSnapshot]) -
         tx.execute(
             "INSERT INTO github_billing_snapshots
                 (id, account_hint, endpoint_family, api_version, period_start, period_end,
-                 fetched_at, coverage, status, error)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                 fetched_at, coverage, status, error, retry_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 snapshot.id,
                 snapshot.account_hint,
@@ -63,6 +63,7 @@ pub fn insert_snapshots(db: &mut UsageDb, snapshots: &[GithubBillingSnapshot]) -
                 snapshot.coverage.as_str(),
                 snapshot.status.as_str(),
                 snapshot.error,
+                snapshot.retry_at.map(|d| d.to_rfc3339()),
             ],
         )
         .map_err(sqlite_error)?;
@@ -100,6 +101,12 @@ pub fn insert_snapshots(db: &mut UsageDb, snapshots: &[GithubBillingSnapshot]) -
                 WHERE account_hint = ?1 AND endpoint_family = ?2
                 ORDER BY fetched_at DESC, rowid DESC
                 LIMIT -1 OFFSET ?3
+             ) AND id NOT IN (
+                SELECT id FROM (
+                  SELECT id, row_number() OVER (PARTITION BY period_start ORDER BY fetched_at DESC,rowid DESC) AS position
+                  FROM github_billing_snapshots WHERE account_hint=?1 AND endpoint_family=?2
+                    AND status IN ('available','successful-empty')
+                ) WHERE position=1
              )",
             params![
                 snapshot.account_hint,
@@ -115,18 +122,18 @@ pub fn insert_snapshots(db: &mut UsageDb, snapshots: &[GithubBillingSnapshot]) -
 pub fn family_views(
     db: &UsageDb,
     account_hint: &str,
-    period: GithubBillingPeriod,
+    period: Option<GithubBillingPeriod>,
 ) -> AppResult<Vec<GithubBillingFamilyView>> {
     check_text("Billing account", account_hint)?;
     GithubBillingEndpointFamily::ALL
         .into_iter()
         .map(|endpoint_family| {
-            let latest = load_snapshot(&db.conn, account_hint, endpoint_family, period, false)?;
+            let latest = load_snapshot(&db.conn, account_hint, endpoint_family, false, period)?;
             let last_successful = if latest
                 .as_ref()
                 .is_some_and(|snapshot| !snapshot.status.is_success())
             {
-                load_snapshot(&db.conn, account_hint, endpoint_family, period, true)?
+                load_snapshot(&db.conn, account_hint, endpoint_family, true, period)?
             } else {
                 None
             };
@@ -217,24 +224,22 @@ fn load_snapshot(
     conn: &SqliteConnection,
     account_hint: &str,
     endpoint_family: GithubBillingEndpointFamily,
-    period: GithubBillingPeriod,
     successful_only: bool,
+    period: Option<GithubBillingPeriod>,
 ) -> AppResult<Option<GithubBillingSnapshot>> {
     let sql = if successful_only {
         "SELECT id, account_hint, endpoint_family, api_version, period_start, period_end,
-                fetched_at, coverage, status, error
+                fetched_at, coverage, status, error, retry_at
          FROM github_billing_snapshots
-         WHERE account_hint = ?1 AND endpoint_family = ?2
-           AND period_start = ?3 AND period_end = ?4
+         WHERE account_hint = ?1 AND endpoint_family = ?2 AND (?3 IS NULL OR period_start=?3)
            AND status IN ('available', 'successful-empty')
          ORDER BY fetched_at DESC, rowid DESC
          LIMIT 1"
     } else {
         "SELECT id, account_hint, endpoint_family, api_version, period_start, period_end,
-                fetched_at, coverage, status, error
+                fetched_at, coverage, status, error, retry_at
          FROM github_billing_snapshots
-         WHERE account_hint = ?1 AND endpoint_family = ?2
-           AND period_start = ?3 AND period_end = ?4
+         WHERE account_hint = ?1 AND endpoint_family = ?2 AND (?3 IS NULL OR period_start=?3)
          ORDER BY fetched_at DESC, rowid DESC
          LIMIT 1"
     };
@@ -245,8 +250,7 @@ fn load_snapshot(
             params![
                 account_hint,
                 endpoint_family.as_str(),
-                period.start.to_rfc3339(),
-                period.end.to_rfc3339()
+                period.map(|p| p.start.to_rfc3339())
             ],
             |row| {
                 Ok((
@@ -260,6 +264,7 @@ fn load_snapshot(
                     row.get::<_, String>(7)?,
                     row.get::<_, String>(8)?,
                     row.get::<_, Option<String>>(9)?,
+                    row.get::<_, Option<String>>(10)?,
                 ))
             },
         )
@@ -277,6 +282,7 @@ fn load_snapshot(
         coverage,
         status,
         error,
+        retry_at,
     )) = row
     else {
         return Ok(None);
@@ -311,6 +317,9 @@ fn load_snapshot(
         coverage,
         status,
         error,
+        retry_at: retry_at
+            .map(|s| parse_datetime("Retry time", &s))
+            .transpose()?,
         items_truncated: total_item_count > items.len() as u64,
         total_item_count,
         items,
@@ -498,8 +507,8 @@ mod tests {
             account_hint: "octocat".to_string(),
             endpoint_family: family,
             api_version: "2026-03-10".to_string(),
-            period_start: GithubBillingPeriod::current().expect("period").start,
-            period_end: GithubBillingPeriod::current().expect("period").end,
+            period_start: fetched_at - Duration::days(1),
+            period_end: fetched_at + Duration::days(30),
             fetched_at,
             coverage: if status == GithubBillingSnapshotStatus::NotCovered {
                 GithubBillingCoverage::NotCovered
@@ -509,42 +518,12 @@ mod tests {
                 GithubBillingCoverage::Unknown
             },
             status,
+            retry_at: None,
             error: (!successful).then(|| "safe failure detail".to_string()),
             total_item_count: successful_items.len() as u64,
             items: successful_items,
             items_truncated: false,
         }
-    }
-
-    #[test]
-    fn failed_month_does_not_fall_back_to_a_different_month_or_account() {
-        let directory = tempfile::tempdir().expect("temp");
-        let mut db = UsageDb::open_at(&directory.path().join("usage.sqlite3")).expect("db");
-        let now = Utc::now();
-        let period = GithubBillingPeriod::current().expect("period");
-        let mut previous = snapshot(
-            "prior",
-            GithubBillingEndpointFamily::PremiumRequest,
-            GithubBillingSnapshotStatus::Available,
-            now,
-        );
-        previous.period_start = period.start - Duration::days(31);
-        previous.period_end = period.start;
-        insert_snapshots(&mut db, &[previous]).expect("prior");
-        let failed = snapshot(
-            "failed",
-            GithubBillingEndpointFamily::PremiumRequest,
-            GithubBillingSnapshotStatus::NetworkError,
-            now + Duration::seconds(1),
-        );
-        insert_snapshots(&mut db, &[failed]).expect("failure");
-        let current = family_views(&db, "octocat", period).expect("query");
-        assert_eq!(current[1].latest.as_ref().expect("latest").id, "failed");
-        assert!(current[1].last_successful.is_none());
-        assert!(family_views(&db, "other-user", period)
-            .expect("other")
-            .iter()
-            .all(|view| view.latest.is_none()));
     }
 
     #[test]
@@ -573,12 +552,7 @@ mod tests {
         )
         .expect("insert failure");
 
-        let views = family_views(
-            &db,
-            "octocat",
-            GithubBillingPeriod::current().expect("period"),
-        )
-        .expect("views");
+        let views = family_views(&db, "octocat", None).expect("views");
         let premium = views
             .iter()
             .find(|view| view.endpoint_family == GithubBillingEndpointFamily::PremiumRequest)
@@ -619,12 +593,7 @@ mod tests {
         )
         .expect("insert");
 
-        let views = family_views(
-            &db,
-            "octocat",
-            GithubBillingPeriod::current().expect("period"),
-        )
-        .expect("views");
+        let views = family_views(&db, "octocat", None).expect("views");
         assert_eq!(views.len(), 2);
         assert_eq!(
             views[0].latest.as_ref().expect("credit").endpoint_family,
@@ -653,12 +622,7 @@ mod tests {
         value.total_item_count = value.items.len() as u64;
         insert_snapshots(&mut db, &[value]).expect("insert");
 
-        let latest = family_views(
-            &db,
-            "octocat",
-            GithubBillingPeriod::current().expect("period"),
-        )
-        .expect("views")[1]
+        let latest = family_views(&db, "octocat", None).expect("views")[1]
             .latest
             .clone()
             .expect("latest");
@@ -708,7 +672,7 @@ mod tests {
             GithubBillingSnapshotStatus::SuccessfulEmpty,
             Utc::now(),
         );
-        insert_snapshots(&mut db, &[value.clone()]).expect("first insert");
+        insert_snapshots(&mut db, std::slice::from_ref(&value)).expect("first insert");
         assert!(insert_snapshots(&mut db, &[value]).is_err());
     }
 
@@ -717,5 +681,54 @@ mod tests {
         let mut value = item(&Uuid::new_v4().to_string());
         value.quantity = ExactDecimal::ZERO;
         validate_non_negative("quantity", value.quantity).expect("zero is valid");
+    }
+
+    #[test]
+    fn stale_fallback_is_scoped_to_account_and_month_and_survives_repeated_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = UsageDb::open_at(&dir.path().join("usage.sqlite3")).unwrap();
+        let period = GithubBillingPeriod::current().unwrap();
+        let now = Utc::now();
+        let mut good = snapshot(
+            "success",
+            GithubBillingEndpointFamily::PremiumRequest,
+            GithubBillingSnapshotStatus::Available,
+            now,
+        );
+        good.period_start = period.start;
+        good.period_end = period.end;
+        insert_snapshots(&mut db, std::slice::from_ref(&good)).unwrap();
+        for n in 1..=MAX_BILLING_SNAPSHOTS_PER_FAMILY + 2 {
+            let mut bad = good.clone();
+            bad.id = format!("failure-{n}");
+            bad.items.clear();
+            bad.total_item_count = 0;
+            bad.status = GithubBillingSnapshotStatus::NetworkError;
+            bad.error = Some("Safe fixture failure".into());
+            bad.fetched_at = now + Duration::seconds(n as i64);
+            insert_snapshots(&mut db, &[bad]).unwrap();
+        }
+        let view = family_views(&db, "octocat", Some(period)).unwrap();
+        assert_eq!(view[1].last_successful.as_ref().unwrap().id, "success");
+        let count: i64 = db
+            .conn
+            .query_row("SELECT count(*) FROM github_billing_snapshots", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, MAX_BILLING_SNAPSHOTS_PER_FAMILY as i64 + 1);
+        assert!(
+            family_views(&db, "different-account", Some(period)).unwrap()[1]
+                .latest
+                .is_none()
+        );
+        let different = GithubBillingPeriod {
+            start: period.start - Duration::days(40),
+            end: period.start - Duration::days(10),
+            ..period
+        };
+        assert!(family_views(&db, "octocat", Some(different)).unwrap()[1]
+            .last_successful
+            .is_none());
     }
 }

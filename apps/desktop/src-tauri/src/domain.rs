@@ -311,6 +311,10 @@ pub struct DeploymentRecord {
     pub status: DeploymentStatus,
     pub detail: String,
     pub created_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection_revision: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -385,6 +389,9 @@ pub struct DashboardSnapshot {
 pub struct PersistentState {
     #[serde(default = "default_state_version")]
     pub version: u32,
+    /// Legacy state receives an ID in memory, persisted with its next valid write.
+    #[serde(default = "new_owner_id")]
+    pub installation_owner_id: String,
     #[serde(default)]
     pub connections: Vec<Connection>,
     #[serde(default)]
@@ -395,10 +402,15 @@ fn default_state_version() -> u32 {
     STATE_VERSION
 }
 
+fn new_owner_id() -> String {
+    Uuid::new_v4().to_string()
+}
+
 impl Default for PersistentState {
     fn default() -> Self {
         Self {
             version: STATE_VERSION,
+            installation_owner_id: new_owner_id(),
             connections: Vec::new(),
             deployments: Vec::new(),
         }

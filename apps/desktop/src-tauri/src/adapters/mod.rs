@@ -39,12 +39,25 @@ pub fn preview(
     connection: &Connection,
     requested_target_ids: &[String],
 ) -> AppResult<DeploymentPlan> {
+    preview_resolved(connection, requested_target_ids, &discover_all())
+}
+
+/// All preview operations and their fingerprints use the same discovery snapshot.
+pub fn preview_resolved(
+    connection: &Connection,
+    requested_target_ids: &[String],
+    available: &[ClientTarget],
+) -> AppResult<DeploymentPlan> {
+    if requested_target_ids.len() > 64 || requested_target_ids.iter().any(|id| id.len() > 512) {
+        return Err(AppError::InvalidInput(
+            "Deployment target selection exceeds its bounds".into(),
+        ));
+    }
     if requested_target_ids.is_empty() {
         return Err(AppError::InvalidInput(
             "Select at least one deployment target".to_string(),
         ));
     }
-    let available = discover_all();
     let mut seen = HashSet::new();
     let mut operations = Vec::new();
     let mut canonical_ids = Vec::new();

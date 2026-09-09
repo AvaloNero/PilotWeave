@@ -193,6 +193,13 @@ pub fn validate_persisted_identities(state: &PersistentState) -> AppResult<()> {
 }
 
 pub fn validate_persistent_state(state: &PersistentState) -> AppResult<()> {
+    if state.installation_owner_id.len() != 36
+        || uuid::Uuid::parse_str(&state.installation_owner_id).map_or(true, |id| id.is_nil())
+    {
+        return Err(AppError::InvalidInput(
+            "Invalid installation ownership identity".into(),
+        ));
+    }
     if state.connections.len() > MAX_CONNECTIONS {
         return Err(AppError::InvalidInput(format!(
             "State contains more than {MAX_CONNECTIONS} connections"
@@ -440,6 +447,7 @@ mod tests {
         duplicate.name = "Duplicate".to_string();
         let mut state = PersistentState {
             version: STATE_VERSION,
+            installation_owner_id: uuid::Uuid::new_v4().to_string(),
             connections: vec![first.clone(), duplicate],
             deployments: Vec::new(),
         };
@@ -455,6 +463,8 @@ mod tests {
             status: DeploymentStatus::Applied,
             detail: "done".to_string(),
             created_at: Utc::now(),
+            target_fingerprint: None,
+            connection_revision: None,
         });
         assert!(validate_persistent_state(&state).is_err());
     }

@@ -3,7 +3,7 @@ use crate::account::{
     LoginSurface,
 };
 use crate::adapters;
-use crate::deployment::{self, PlanStore, StoredPlan};
+use crate::deployment::{self, PlanContext, PlanStore, StoredPlan};
 use crate::domain::{
     ApplyResult, Connection, ConnectionInput, DashboardSnapshot, DeploymentOperation,
     DeploymentPlan, DeploymentRecord, DeploymentStatus, UsageDbStatus, STATE_VERSION,
@@ -27,8 +27,17 @@ use uuid::Uuid;
 #[serde(rename_all = "camelCase")]
 pub struct RecoveryPlan {
     id: String,
+    action: RecoveryAction,
     view: crate::transaction::RecoveryView,
     expires_at: chrono::DateTime<Utc>,
+}
+
+#[derive(Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RecoveryAction {
+    #[default]
+    Restore,
+    KeepCurrent,
 }
 
 #[derive(Clone)]
@@ -43,7 +52,8 @@ pub struct ManagedState {
     login_plans: Arc<Mutex<LoginPlanStore>>,
     login_store: Arc<Mutex<LoginStore>>,
     github_authorization: Arc<Mutex<GithubAuthorizationStore>>,
-    usage_db: Arc<Mutex<Option<UsageDb>>>,
+    pub(crate) usage_db: Arc<Mutex<Option<UsageDb>>>,
+    pub(crate) usage_jobs: Arc<crate::usage::commands::UsageJobs>,
     usage_db_error: Option<String>,
 }
 
@@ -67,11 +77,12 @@ impl ManagedState {
             login_store: Arc::new(Mutex::new(login_store)),
             github_authorization: Arc::new(Mutex::new(github_authorization)),
             usage_db: Arc::new(Mutex::new(usage_db)),
+            usage_jobs: Arc::new(crate::usage::commands::UsageJobs::default()),
             usage_db_error,
         }
     }
 
-    fn store(&self) -> AppResult<MutexGuard<'_, StateStore>> {
+    pub(crate) fn store(&self) -> AppResult<MutexGuard<'_, StateStore>> {
         self.store.lock().map_err(|_| AppError::Lock)
     }
 
@@ -91,11 +102,13 @@ impl ManagedState {
         self.login_store.lock().map_err(|_| AppError::Lock)
     }
 
-    fn github_authorization(&self) -> AppResult<MutexGuard<'_, GithubAuthorizationStore>> {
+    pub(crate) fn github_authorization(
+        &self,
+    ) -> AppResult<MutexGuard<'_, GithubAuthorizationStore>> {
         self.github_authorization.lock().map_err(|_| AppError::Lock)
     }
 
-    fn usage_db_status(&self) -> AppResult<UsageDbStatus> {
+    pub(crate) fn usage_db_status(&self) -> AppResult<UsageDbStatus> {
         let guard = self.usage_db.lock().map_err(|_| AppError::Lock)?;
         Ok(match guard.as_ref() {
             Some(db) => db.status(),
@@ -130,7 +143,13 @@ pub async fn get_dashboard(state: State<'_, ManagedState>) -> Result<DashboardSn
             .map(|connection| {
                 (
                     connection.id.clone(),
-                    crate::secrets::observe(&connection.id),
+                    if state_recovery.is_some() {
+                        crate::domain::CredentialObservation {
+                            state: crate::domain::CredentialState::Unavailable,
+                        }
+                    } else {
+                        crate::secrets::observe(&connection.id)
+                    },
                 )
             })
             .collect::<std::collections::BTreeMap<_, _>>();
@@ -373,9 +392,7 @@ pub async fn upsert_connection(
             .try_lock()
             .map_err(|_| "Another managed write is active".to_string())?;
         let mut store = state.store().map_err(command_error)?;
-        let _lease =
-            crate::safe_io::Lease::acquire(&crate::safe_io::sibling(store.path(), ".write-lock"))
-                .map_err(command_error)?;
+        let _lease = crate::write_lock::WriteLock::acquire(store.path()).map_err(command_error)?;
         deployment::ensure_no_pending_journal(store.path()).map_err(command_error)?;
         store.upsert_connection(input).map_err(command_error)
     })
@@ -394,9 +411,7 @@ pub async fn delete_connection(
             .try_lock()
             .map_err(|_| "Another managed write is active".to_string())?;
         let mut store = state.store().map_err(command_error)?;
-        let _lease =
-            crate::safe_io::Lease::acquire(&crate::safe_io::sibling(store.path(), ".write-lock"))
-                .map_err(command_error)?;
+        let _lease = crate::write_lock::WriteLock::acquire(store.path()).map_err(command_error)?;
         deployment::ensure_no_pending_journal(store.path()).map_err(command_error)?;
         store
             .delete_connection(&connection_id)
@@ -413,19 +428,27 @@ pub async fn preview_deployment(
 ) -> Result<DeploymentPlan, String> {
     let state = state.inner().clone();
     native_job(move || {
-        let (connection, secret) = {
+        let (connection, secret, context) = {
             let store = state.store().map_err(command_error)?;
             store.ensure_writable().map_err(command_error)?;
             deployment::ensure_no_pending_journal(store.path()).map_err(command_error)?;
             let connection = store.connection(&connection_id).map_err(command_error)?;
             let secret = store.secret_for(&connection).map_err(command_error)?;
-            (connection, secret)
+            let context = PlanContext::new(
+                store.installation_owner_id(),
+                store.revision().map_err(command_error)?,
+                secret.as_deref(),
+            );
+            (connection, secret, context)
         };
-        let plan = adapters::preview(&connection, &target_ids).map_err(command_error)?;
         let targets = adapters::discover_all();
+        let plan = adapters::preview_resolved(&connection, &target_ids, &targets)
+            .map_err(command_error)?;
         state
             .plans()
-            .and_then(|mut plans| plans.insert(&connection, secret.as_deref(), plan, &targets))
+            .and_then(|mut plans| {
+                plans.insert(&connection, secret.as_deref(), plan, &targets, context)
+            })
             .map_err(command_error)
     })
     .await
@@ -439,13 +462,13 @@ pub async fn apply_deployment_plan(
 ) -> Result<ApplyResult, String> {
     let state = state.inner().clone();
     native_job(move || {
-        if !confirmed {
-            return Err("Explicit deployment confirmation is required".into());
-        }
         let stored = state
             .plans()
             .and_then(|mut plans| plans.consume(&plan_id))
             .map_err(command_error)?;
+        if !confirmed {
+            return Err("Explicit deployment confirmation is required".into());
+        }
         execute_stored_plan(&state, stored).map_err(command_error)
     })
     .await
@@ -456,23 +479,23 @@ fn execute_stored_plan(state: &ManagedState, stored: StoredPlan) -> AppResult<Ap
         .writes
         .try_lock()
         .map_err(|_| AppError::Config("Another managed write is active".into()))?;
-    let (connection, secret, state_path) = {
+    let state_path = state.store()?.path().to_path_buf();
+    let _lease = crate::write_lock::WriteLock::acquire(&state_path)?;
+    let (connection, secret, context) = {
         let store = state.store()?;
         store.ensure_writable()?;
         deployment::ensure_no_pending_journal(store.path())?;
         let connection = store.connection(&stored.plan.connection_id)?;
         let secret = store.secret_for(&connection)?;
-        (connection, secret, store.path().to_path_buf())
+        let context = PlanContext::new(
+            store.installation_owner_id(),
+            store.revision()?,
+            secret.as_deref(),
+        );
+        (connection, secret, context)
     };
-    let _lease =
-        crate::safe_io::Lease::acquire(&crate::safe_io::sibling(&state_path, ".write-lock"))?;
-    deployment::ensure_no_pending_journal(&state_path)?;
-    deployment::validate_plan(
-        &stored,
-        &connection,
-        secret.as_deref(),
-        &adapters::discover_all(),
-    )?;
+    let targets = adapters::discover_all();
+    deployment::validate_plan(&stored, &connection, &targets, &context)?;
     let mut tx = crate::transaction::Transaction::begin(
         deployment::journal_path(&state_path),
         &stored.plan.id,
@@ -500,7 +523,7 @@ fn execute_stored_plan(state: &ManagedState, stored: StoredPlan) -> AppResult<Ap
         .operations
         .iter()
         .map(|operation| {
-            record(
+            let mut record = record(
                 &stored.plan,
                 operation,
                 if !operation.supported {
@@ -515,10 +538,36 @@ fn execute_stored_plan(state: &ManagedState, stored: StoredPlan) -> AppResult<Ap
                 } else {
                     operation.description.clone()
                 },
-            )
+            );
+            if record.status == DeploymentStatus::Applied {
+                record.target_fingerprint =
+                    stored.after_fingerprints.get(&record.target_id).cloned();
+                record.connection_revision = Some(crate::fingerprint::json(
+                    "setup-connection-v1",
+                    &connection,
+                )?);
+            }
+            Ok(record)
         })
-        .collect::<Vec<_>>();
-    if let Err(error) = state.store()?.record_deployments(records.clone()) {
+        .collect::<AppResult<Vec<_>>>();
+    let recorded = records.and_then(|records| {
+        for record in records
+            .iter()
+            .filter(|record| record.status == DeploymentStatus::Applied)
+        {
+            let target = targets
+                .iter()
+                .find(|target| target.id == record.target_id)
+                .ok_or(AppError::PlanChanged)?;
+            if record.target_fingerprint.as_ref() != Some(&deployment::fingerprint_target(target)?)
+            {
+                return Err(AppError::PlanChanged);
+            }
+        }
+        state.store()?.record_deployments(records.clone())?;
+        Ok(records)
+    });
+    if let Err(error) = &recorded {
         let rollback = tx.rollback();
         return Err(AppError::Config(format!(
             "Final deployment audit could not be saved; recovery journal retained. Audit: {}; compensation: {}",
@@ -526,6 +575,7 @@ fn execute_stored_plan(state: &ManagedState, stored: StoredPlan) -> AppResult<Ap
             if rollback.is_ok() { "restored" } else { "incomplete; inspect recovery" }
         )));
     }
+    let records = recorded?;
     if !recovery_failed {
         if failed {
             tx.clear()?;
@@ -559,19 +609,27 @@ fn record(
         status,
         detail: redact::redact_text(&detail),
         created_at: Utc::now(),
+        target_fingerprint: None,
+        connection_revision: None,
     }
 }
 
 #[tauri::command]
 pub async fn preview_deployment_recovery(
     state: State<'_, ManagedState>,
+    action: Option<RecoveryAction>,
 ) -> Result<RecoveryPlan, String> {
     let state = state.inner().clone();
     native_job(move || {
         let path = deployment::journal_path(state.store().map_err(command_error)?.path());
-        let allowed = deployment::recovery_resources().map_err(command_error)?;
+        let action = action.unwrap_or_default();
+        let allowed = match action {
+            RecoveryAction::Restore => deployment::recovery_resources().unwrap_or_default(),
+            RecoveryAction::KeepCurrent => Vec::new(),
+        };
         let plan = RecoveryPlan {
             id: Uuid::new_v4().to_string(),
+            action,
             view: crate::transaction::recovery_view(&path, &allowed).map_err(command_error)?,
             expires_at: Utc::now() + chrono::Duration::minutes(15),
         };
@@ -611,12 +669,18 @@ pub async fn apply_deployment_recovery(
             .try_lock()
             .map_err(|_| "Another managed write is active".to_string())?;
         let store = state.store().map_err(command_error)?;
-        let _lease =
-            crate::safe_io::Lease::acquire(&crate::safe_io::sibling(store.path(), ".write-lock"))
-                .map_err(command_error)?;
+        let _lease = crate::write_lock::WriteLock::acquire(store.path()).map_err(command_error)?;
         let path = deployment::journal_path(store.path());
-        let allowed = deployment::recovery_resources().map_err(command_error)?;
-        crate::transaction::recover(&path, &plan.view.digest, &allowed).map_err(command_error)?;
+        match plan.action {
+            RecoveryAction::Restore => {
+                let allowed = deployment::recovery_resources().unwrap_or_default();
+                crate::transaction::recover(&path, &plan.view.digest, &allowed)
+            }
+            RecoveryAction::KeepCurrent => {
+                crate::transaction::keep_current(&path, &plan.view.digest)
+            }
+        }
+        .map_err(command_error)?;
         Ok(true)
     })
     .await
@@ -628,72 +692,15 @@ pub async fn get_github_billing_overview(
     year: i32,
     month: u32,
 ) -> Result<crate::github_billing::GithubBillingOverview, String> {
-    let state = state.inner().clone();
-    native_job(move || {
-        let period =
-            crate::github_billing::GithubBillingPeriod::new(year, month).map_err(command_error)?;
-        billing_overview(&state, period).map_err(command_error)
-    })
-    .await
+    crate::usage::commands::get_github_billing(state, Some(year), Some(month))
 }
-
 #[tauri::command(rename_all = "camelCase")]
 pub async fn refresh_github_billing(
     state: State<'_, ManagedState>,
     year: i32,
     month: u32,
 ) -> Result<crate::github_billing::GithubBillingOverview, String> {
-    let state = state.inner().clone();
-    native_job(move || {
-        let period = crate::github_billing::GithubBillingPeriod::new(year, month).map_err(command_error)?;
-        let (revision, identity, token) = {
-            let auth = state.github_authorization().map_err(command_error)?;
-            let status = auth.status();
-            if status.state != crate::github_auth::GithubAuthorizationState::Verified {
-                return Err("Validate PilotWeave's separate GitHub authorization before refreshing personal Billing".into());
-            }
-            let identity = status.identity.ok_or_else(|| "No verified GitHub account".to_string())?;
-            let token = auth.secret_for_refresh().map_err(command_error)?.ok_or_else(|| "GitHub credential is missing".to_string())?;
-            (auth.revision(), identity, token)
-        };
-        let snapshots = crate::github_billing::fetch_personal_billing(&token, &identity, period).map_err(command_error)?;
-        drop(token);
-        {
-            let auth = state.github_authorization().map_err(command_error)?;
-            auth.ensure_current(revision).map_err(command_error)?;
-            let same_account = auth.status().identity.is_some_and(|current| current.host == identity.host && current.user_id == identity.user_id);
-            if !same_account { return Err("GitHub account changed during Billing refresh; response discarded".into()); }
-            let mut db = state.usage_db.lock().map_err(|_| "Usage database lock failed".to_string())?;
-            let db = db.as_mut().ok_or_else(|| "Usage database unavailable; no snapshot was saved".to_string())?;
-            crate::github_billing_store::insert_snapshots(db, &snapshots).map_err(command_error)?;
-        }
-        billing_overview(&state, period).map_err(command_error)
-    }).await
-}
-
-fn billing_overview(
-    state: &ManagedState,
-    period: crate::github_billing::GithubBillingPeriod,
-) -> AppResult<crate::github_billing::GithubBillingOverview> {
-    let authorization = state.github_authorization()?.status();
-    let account = authorization.identity.clone();
-    let storage = state.usage_db_status()?;
-    let db = state.usage_db.lock().map_err(|_| AppError::Lock)?;
-    let families = match (db.as_ref(), account.as_ref()) {
-        (Some(db), Some(identity)) => crate::github_billing_store::family_views(
-            db,
-            &crate::github_billing::account_key(identity),
-            period,
-        )?,
-        _ => crate::github_billing::empty_family_views(),
-    };
-    Ok(crate::github_billing::GithubBillingOverview {
-        authorization,
-        storage,
-        account,
-        families,
-        observed_at: Utc::now(),
-    })
+    crate::usage::commands::refresh_personal_github_usage(state, year, month).await
 }
 
 async fn native_job<T: Send + 'static>(

@@ -23,60 +23,70 @@ pub struct DeleteConnectionResult {
 pub struct StateStore {
     path: PathBuf,
     state: PersistentState,
+    loaded_bytes: Option<Vec<u8>>,
     /// When set, the primary state file could not be loaded and the store is
-    /// in explicit read-only recovery: reads return empty defaults and writes
-    /// are rejected so the unreadable file is never overwritten.
+    /// in explicit read-only recovery: reads return validated last-known-good
+    /// data when available and writes cannot overwrite the unreadable file.
     recovery: Option<String>,
-    observed_bytes: Option<Vec<u8>>,
 }
 
 impl StateStore {
+    pub fn unavailable(error: AppError) -> Self {
+        Self {
+            path: PathBuf::new(),
+            state: PersistentState::default(),
+            loaded_bytes: None,
+            recovery: Some(error.to_string()),
+        }
+    }
     pub fn open() -> AppResult<Self> {
         let config_dir = dirs::config_dir()
             .ok_or_else(|| AppError::Config("Cannot resolve the user config directory".into()))?
             .join("PilotWeave");
+        // Loading remains pure, including recovery. Dashboard observations report
+        // credential availability separately, without changing persisted intent.
         Ok(Self::open_at(config_dir.join("state.json")))
     }
 
     pub fn open_at(path: PathBuf) -> Self {
-        let observed_bytes = crate::safe_io::read_optional(&path, MAX_STATE_BYTES)
-            .ok()
-            .flatten();
-        match Self::try_load(&path) {
+        let primary = crate::safe_file::read_optional(&path, MAX_STATE_BYTES);
+        let loaded_bytes = primary.as_ref().ok().cloned().flatten();
+        match Self::try_load(&path, primary) {
             Ok((state, recovery)) => Self {
                 path,
                 state,
+                loaded_bytes,
                 recovery,
-                observed_bytes,
             },
             Err(error) => Self {
                 path,
                 state: PersistentState::default(),
+                loaded_bytes,
                 recovery: Some(error.to_string()),
-                observed_bytes,
             },
         }
     }
 
-    fn try_load(path: &Path) -> AppResult<(PersistentState, Option<String>)> {
-        let backup = crate::safe_io::sibling(path, ".last-good");
-        let primary = if !path.exists() && backup.exists() {
-            Err(AppError::Config("Primary state is missing".to_string()))
-        } else {
-            load_validated_state(path)
+    fn try_load(
+        path: &Path,
+        primary: AppResult<Option<Vec<u8>>>,
+    ) -> AppResult<(PersistentState, Option<String>)> {
+        let primary_error = match primary.and_then(|bytes| parse_state(path, bytes.as_deref())) {
+            Ok(Some(state)) => return Ok((state, None)),
+            Ok(None) => None,
+            Err(error) => Some(error.to_string()),
         };
-        match primary {
-            Ok(state) => Ok((state, None)),
-            Err(error) => {
-                if backup.exists() {
-                    if let Ok(state) = load_validated_state(&backup) {
-                        return Ok((state, Some(format!(
-                            "{error}; showing the validated last-known-good snapshot read-only; primary state was not overwritten"
-                        ))));
-                    }
-                }
-                Err(error)
-            }
+        match load_state(&last_good_path(path)) {
+            Ok(Some(state)) => Ok((state, Some(format!(
+                "The primary state is missing or invalid; showing validated last-known-good data in read-only recovery. {}",
+                primary_error.as_deref().unwrap_or("The primary file is missing.")
+            )))),
+            Ok(None) if primary_error.is_none() => Ok((PersistentState::default(), None)),
+            Ok(None) => Err(AppError::Config(primary_error.unwrap_or_default())),
+            Err(error) => Err(AppError::Config(format!(
+                "Primary and last-known-good state are unavailable; read-only recovery is required. Primary: {}. Backup: {error}",
+                primary_error.as_deref().unwrap_or("missing")
+            ))),
         }
     }
 
@@ -86,13 +96,28 @@ impl StateStore {
         self.recovery.as_deref()
     }
 
-    pub fn ensure_writable(&self) -> AppResult<()> {
+    pub(crate) fn ensure_writable(&self) -> AppResult<()> {
         if let Some(reason) = &self.recovery {
             return Err(AppError::Unsupported(format!(
-                "PilotWeave state is in read-only recovery ({reason}); fix or remove the state file and restart"
+                "PilotWeave state is in read-only recovery ({reason}); review recovery before resuming managed writes"
             )));
         }
+        if crate::safe_file::read_optional(&self.path, MAX_STATE_BYTES)? != self.loaded_bytes {
+            return Err(AppError::InvalidInput(
+                "Application state changed outside PilotWeave; reopen and review before writing"
+                    .into(),
+            ));
+        }
         Ok(())
+    }
+
+    pub fn installation_owner_id(&self) -> &str {
+        &self.state.installation_owner_id
+    }
+
+    pub fn revision(&self) -> AppResult<String> {
+        self.ensure_writable()?;
+        crate::fingerprint::json("application-state-v1", &self.state)
     }
 
     pub fn path(&self) -> &Path {
@@ -300,39 +325,41 @@ impl StateStore {
     }
 
     fn persist(&mut self) -> AppResult<()> {
-        let bytes = serialized_state(&self.state)?;
-        if crate::safe_io::read_optional(&self.path, MAX_STATE_BYTES)? != self.observed_bytes {
-            return Err(AppError::Config(
-                "State changed outside this process; reload before writing".into(),
-            ));
-        }
-        write_state(&self.path, &self.state)?;
-        self.observed_bytes = Some(bytes);
+        let bytes = write_state_checked(&self.path, &self.state, self.loaded_bytes.as_deref())?;
+        self.loaded_bytes = Some(bytes);
         Ok(())
     }
 }
 
-fn load_state(path: &Path) -> AppResult<PersistentState> {
-    let Some(bytes) = crate::safe_io::read_optional(path, MAX_STATE_BYTES)? else {
-        return Ok(PersistentState::default());
-    };
-    serde_json::from_slice(&bytes).map_err(|error| AppError::json(path, error))
+fn last_good_path(path: &Path) -> PathBuf {
+    path.with_file_name("state.json.last-good")
 }
 
-fn load_validated_state(path: &Path) -> AppResult<PersistentState> {
-    let mut state = load_state(path)?;
+fn load_state(path: &Path) -> AppResult<Option<PersistentState>> {
+    let bytes = crate::safe_file::read_optional(path, MAX_STATE_BYTES)?;
+    parse_state(path, bytes.as_deref())
+}
+
+fn parse_state(path: &Path, bytes: Option<&[u8]>) -> AppResult<Option<PersistentState>> {
+    let Some(bytes) = bytes else {
+        return Ok(None);
+    };
+    let mut state: PersistentState =
+        serde_json::from_slice(bytes).map_err(|error| AppError::json(path, error))?;
     if state.version > STATE_VERSION {
-        return Err(AppError::Config(
-            "State version is newer than this build supports".into(),
-        ));
+        return Err(AppError::Config(format!(
+            "State version {} is newer than this PilotWeave build supports ({STATE_VERSION})",
+            state.version
+        )));
     }
     validation::validate_persisted_identities(&state)?;
     state.version = STATE_VERSION;
     for connection in &mut state.connections {
         connection.normalize();
+        validation::validate_connection(connection)?;
     }
     validation::validate_persistent_state(&state)?;
-    Ok(state)
+    Ok(Some(state))
 }
 
 fn serialized_state(state: &PersistentState) -> AppResult<Vec<u8>> {
@@ -347,13 +374,49 @@ fn serialized_state(state: &PersistentState) -> AppResult<Vec<u8>> {
     Ok(bytes)
 }
 
-fn write_state(path: &Path, state: &PersistentState) -> AppResult<()> {
-    let bytes = serialized_state(state)?;
-    if let Some(previous) = crate::safe_io::read_optional(path, MAX_STATE_BYTES)? {
-        load_validated_state(path)?;
-        crate::safe_io::write_private(&crate::safe_io::sibling(path, ".last-good"), &previous)?;
+fn write_state_checked(
+    path: &Path,
+    state: &PersistentState,
+    expected: Option<&[u8]>,
+) -> AppResult<Vec<u8>> {
+    validation::validate_persistent_state(state)?;
+    let bytes = serde_json::to_vec_pretty(state)
+        .map_err(|error| AppError::Config(format!("Failed to serialize state: {error}")))?;
+    if bytes.len() as u64 > MAX_STATE_BYTES {
+        return Err(AppError::InvalidInput(
+            "State exceeds its storage limit".into(),
+        ));
     }
-    crate::safe_io::write_private(path, &bytes)
+    // Preserve the validated previous revision before touching the primary.
+    // Backup failure therefore cannot be reported after a successful commit.
+    if crate::safe_file::read_optional(path, MAX_STATE_BYTES)?.as_deref() != expected {
+        return Err(AppError::InvalidInput("State changed before commit".into()));
+    }
+    let mut previous = parse_state(path, expected)?.unwrap_or_else(|| PersistentState {
+        installation_owner_id: state.installation_owner_id.clone(),
+        ..PersistentState::default()
+    });
+    if let Some(expected) = expected {
+        let document: serde_json::Value =
+            serde_json::from_slice(expected).map_err(|error| AppError::json(path, error))?;
+        if document.get("installationOwnerId").is_none() {
+            previous.installation_owner_id = state.installation_owner_id.clone();
+        }
+    }
+    let previous = serde_json::to_vec_pretty(&previous).map_err(|error| {
+        AppError::Config(format!(
+            "Failed to serialize last-known-good state: {error}"
+        ))
+    })?;
+    crate::safe_file::atomic_write_private(&last_good_path(path), &previous)?;
+    crate::safe_file::atomic_write_private_if(path, &bytes, expected)?;
+    Ok(bytes)
+}
+
+#[cfg(test)]
+fn write_state(path: &Path, state: &PersistentState) -> AppResult<()> {
+    let before = crate::safe_file::read_optional(path, MAX_STATE_BYTES)?;
+    write_state_checked(path, state, before.as_deref()).map(|_| ())
 }
 
 #[cfg(test)]
@@ -389,6 +452,140 @@ mod tests {
         }
         assert!(validation::validate_persistent_state(&state).is_ok());
         assert!(serialized_state(&state).is_err());
+    }
+
+    #[test]
+    fn external_state_changes_and_deletions_are_not_overwritten() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("state.json");
+        write_state(&path, &fixture_state("Original")).unwrap();
+        let mut store = StateStore::open_at(path.clone());
+        let mut external = fixture_state("External");
+        external.installation_owner_id = store.installation_owner_id().to_string();
+        let bytes = serde_json::to_vec_pretty(&external).unwrap();
+        fs::write(&path, &bytes).unwrap();
+        assert!(store.ensure_writable().is_err());
+        assert!(store.record_deployments(Vec::new()).is_err());
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        fs::remove_file(&path).unwrap();
+        assert!(store.record_deployments(Vec::new()).is_err());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn legacy_owner_identity_is_persisted_once_and_survives_reopen_and_recovery() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("state.json");
+        let mut legacy = serde_json::to_value(fixture_state("Legacy")).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("installationOwnerId");
+        fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let mut store = StateStore::open_at(path.clone());
+        let owner = store.installation_owner_id().to_string();
+        store.record_deployments(Vec::new()).unwrap();
+        assert_eq!(
+            StateStore::open_at(path.clone()).installation_owner_id(),
+            owner
+        );
+        fs::write(&path, b"broken").unwrap();
+        let recovered = StateStore::open_at(path);
+        assert_eq!(recovered.installation_owner_id(), owner);
+        assert!(recovered.ensure_writable().is_err());
+    }
+
+    #[test]
+    fn missing_config_directory_opens_read_only_instead_of_panicking() {
+        let store = StateStore::unavailable(AppError::Config("No config directory".into()));
+        assert!(store.ensure_writable().is_err());
+        assert!(store.connections().is_empty());
+    }
+
+    fn fixture_state(name: &str) -> PersistentState {
+        let now = Utc::now();
+        PersistentState {
+            connections: vec![Connection {
+                id: "fixture".into(),
+                name: name.into(),
+                base_url: "https://example.invalid/v1".into(),
+                provider_kind: crate::domain::ProviderKind::Openai,
+                protocol: crate::domain::ApiProtocol::ChatCompletions,
+                headers: Default::default(),
+                models: vec![ModelSpec {
+                    id: "fixture-model".into(),
+                    model_id: "fixture-model".into(),
+                    name: "Fixture".into(),
+                    enabled: true,
+                    capabilities: Default::default(),
+                }],
+                secret_ref: "connection:fixture".into(),
+                has_secret: false,
+                created_at: now,
+                updated_at: now,
+            }],
+            ..PersistentState::default()
+        }
+    }
+
+    #[test]
+    fn corrupt_primary_shows_validated_previous_revision_without_writes_or_keyring_reads() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("state.json");
+        write_state(&path, &fixture_state("Previous")).unwrap();
+        write_state(&path, &fixture_state("Current")).unwrap();
+        assert_eq!(
+            load_state(&path).unwrap().unwrap().connections[0].name,
+            "Current"
+        );
+        fs::write(&path, b"corrupt").unwrap();
+        let mut store = StateStore::open_at(path.clone());
+        assert_eq!(store.connections()[0].name, "Previous");
+        assert!(store.recovery().unwrap().contains("last-known-good"));
+        assert!(store.record_deployments(Vec::new()).is_err());
+        assert_eq!(fs::read(path).unwrap(), b"corrupt");
+    }
+
+    #[test]
+    fn missing_primary_with_backup_does_not_open_empty_writable_state() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("state.json");
+        fs::write(
+            last_good_path(&path),
+            serde_json::to_vec(&fixture_state("Recovered")).unwrap(),
+        )
+        .unwrap();
+        let store = StateStore::open_at(path.clone());
+        assert_eq!(store.connections()[0].name, "Recovered");
+        assert!(store.recovery().is_some());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn invalid_backup_is_never_used_or_overwritten() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("state.json");
+        fs::write(&path, b"corrupt primary").unwrap();
+        let mut invalid = fixture_state("Invalid");
+        invalid.connections[0].base_url = "http://remote.example/v1".into();
+        let bytes = serde_json::to_vec(&invalid).unwrap();
+        fs::write(last_good_path(&path), &bytes).unwrap();
+        let store = StateStore::open_at(path.clone());
+        assert!(store.connections().is_empty());
+        assert!(store.recovery().unwrap().contains("loopback"));
+        assert_eq!(fs::read(last_good_path(&path)).unwrap(), bytes);
+        assert_eq!(fs::read(path).unwrap(), b"corrupt primary");
+    }
+
+    #[test]
+    fn backup_failure_leaves_primary_unchanged() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("state.json");
+        let before = serde_json::to_vec(&fixture_state("Original")).unwrap();
+        fs::write(&path, &before).unwrap();
+        fs::create_dir(last_good_path(&path)).unwrap();
+        assert!(write_state(&path, &fixture_state("New")).is_err());
+        assert_eq!(fs::read(path).unwrap(), before);
     }
 
     #[test]

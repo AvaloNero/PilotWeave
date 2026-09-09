@@ -13,7 +13,6 @@
   let status = null;
   let loading = false;
   let renderVersion = 0;
-  let scheduled = false;
 
   const browserStatus = {
     state: "missing",
@@ -46,33 +45,15 @@
     setTimeout(() => toast.remove(), 4200);
   }
 
-  function isSettingsRoute() {
-    return pageTitle.textContent?.trim() === "Settings";
-  }
-
   function markChanged() {
     renderVersion += 1;
     ensurePanel();
   }
 
-  function scheduleEnsurePanel() {
-    if (scheduled) return;
-    scheduled = true;
-    queueMicrotask(() => {
-      scheduled = false;
-      ensurePanel();
-    });
-  }
-
   function ensurePanel() {
-    if (!isSettingsRoute()) return;
+
     let panel = content.querySelector("#github-authorization-panel");
-    if (!panel) {
-      panel = document.createElement("section");
-      panel.id = "github-authorization-panel";
-      panel.className = "github-authorization-panel";
-      content.prepend(panel);
-    }
+    if (!panel) return;
     if (panel.dataset.renderVersion === String(renderVersion)) return;
     panel.dataset.renderVersion = String(renderVersion);
     panel.innerHTML = renderPanel();
@@ -211,6 +192,7 @@
       const value = await invoke("get_github_authorization_status");
       validateStatus(value);
       status = value;
+      document.dispatchEvent(new Event("pilotweave:refresh-setup"));
       if (!quiet) showToast("GitHub authorization status refreshed");
     } catch (error) {
       showToast(error?.message ?? String(error), "error");
@@ -283,6 +265,7 @@
       tokenInput.value = "";
       validateStatus(value);
       status = value;
+      document.dispatchEvent(new Event("pilotweave:refresh-setup"));
       closeModal();
       showToast(
         value.state === "verified"
@@ -325,6 +308,7 @@
       const value = await invoke("clear_github_authorization");
       validateStatus(value);
       status = value;
+      document.dispatchEvent(new Event("pilotweave:refresh-setup"));
       closeModal();
       showToast(
         value.cleanupWarning ?? "Separate GitHub authorization cleared",
@@ -345,6 +329,7 @@
       const value = await invoke("refresh_github_authorization");
       validateStatus(value);
       status = value;
+      document.dispatchEvent(new Event("pilotweave:refresh-setup"));
       showToast(
         value.state === "verified" ? "Authorization validated" : value.detail,
         value.state === "verified" ? "success" : "error",
@@ -445,22 +430,11 @@
     }
   });
 
-  const contentObserver = new MutationObserver(scheduleEnsurePanel);
-  contentObserver.observe(content, { childList: true });
-  const titleObserver = new MutationObserver(() => {
-    if (isSettingsRoute()) {
-      ensurePanel();
-      if (!status && !loading) refreshStatus({ quiet: true });
-    }
-  });
-  titleObserver.observe(pageTitle, {
-    childList: true,
-    characterData: true,
-    subtree: true,
-  });
-
-  if (isSettingsRoute()) {
-    ensurePanel();
-    refreshStatus({ quiet: true });
-  }
+  window.PilotWeaveGithubAuth = {
+    hydrate(value) { status = value; renderVersion += 1; },
+    mount: ensurePanel,
+    previewStatus: () => structuredClone(browserStatus),
+    preview: openAuthorizeModal,
+    openAuthorize: openAuthorizeModal,
+  };
 })();

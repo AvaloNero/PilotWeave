@@ -211,7 +211,7 @@ pub fn spawn_detached(executable: &Path, args: &[&OsStr]) -> AppResult<()> {
     Ok(())
 }
 
-fn sanitize_child_environment(command: &mut Command, interactive: bool) {
+pub(crate) fn sanitize_child_environment(command: &mut Command, interactive: bool) {
     for name in SENSITIVE_CHILD_ENV {
         command.env_remove(name);
     }
