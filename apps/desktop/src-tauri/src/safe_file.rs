@@ -147,7 +147,7 @@ pub fn atomic_write_private_if(
     write_expected(path, bytes, false, expected, replace_file)
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 pub fn atomic_write_preserving_mode(path: &Path, bytes: &[u8]) -> AppResult<()> {
     write_with(path, bytes, true, replace_file)
 }
