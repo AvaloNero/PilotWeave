@@ -126,7 +126,10 @@ pub fn commit_batch(
         }
     }
     tx.execute("INSERT INTO usage_file_cursors VALUES (?1,?2,?3) ON CONFLICT(source_id,file_key) DO UPDATE SET cursor_json=excluded.cursor_json",params![source,file,encode(cursor)?]).map_err(db_error)?;
-    tx.commit().map_err(db_error)
+    tx.commit().map_err(db_error)?;
+    #[cfg(feature = "local-e2e")]
+    crate::test_support::fault("import-commit")?;
+    Ok(())
 }
 
 pub fn existing(db: &UsageDb, id: &str) -> AppResult<Option<Observation>> {
@@ -161,6 +164,35 @@ pub fn runs(db: &UsageDb) -> AppResult<Vec<SyncRun>> {
     rows
 }
 
+/// Best-effort failure finalization for a live worker that exited early. The
+/// conditional update cannot overwrite a terminal outcome from another worker.
+pub fn finish_abandoned(db: &UsageDb, id: &str) -> AppResult<()> {
+    let pending = encode(&DataStatus::InProgress)?;
+    let payload: Option<String> = db
+        .conn
+        .query_row(
+            "SELECT payload FROM usage_jobs WHERE id=?1 AND status=?2",
+            params![id, pending],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(db_error)?;
+    if let Some(payload) = payload {
+        let mut run: SyncRun = decode(payload)?;
+        run.status = DataStatus::Unavailable;
+        run.finished_at = Some(Utc::now());
+        run.detail =
+            "Refresh failed before completion; previous committed snapshots retained".into();
+        db.conn
+            .execute(
+                "UPDATE usage_jobs SET status=?1,payload=?2 WHERE id=?3 AND status=?4",
+                params![encode(&run.status)?, encode(&run)?, id, pending],
+            )
+            .map_err(db_error)?;
+    }
+    Ok(())
+}
+
 pub fn recover(db: &UsageDb) -> AppResult<()> {
     for mut run in runs(db)? {
         if run.status == DataStatus::InProgress {
@@ -173,4 +205,39 @@ pub fn recover(db: &UsageDb) -> AppResult<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod job_finalization_tests {
+    use super::*;
+    #[test]
+    fn abandoned_jobs_finish_without_rewriting_terminal_outcomes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = UsageDb::open_at(&dir.path().join("usage.sqlite3")).unwrap();
+        let mut run = SyncRun {
+            id: "job".into(),
+            source_id: "price-catalog".into(),
+            started_at: Utc::now(),
+            finished_at: None,
+            status: DataStatus::InProgress,
+            files_seen: 0,
+            records_seen: 0,
+            bytes_read: 0,
+            detail: "Started".into(),
+        };
+        save_run(&db, &run).unwrap();
+        finish_abandoned(&db, "job").unwrap();
+        assert_eq!(runs(&db).unwrap()[0].status, DataStatus::Unavailable);
+        assert!(runs(&db).unwrap()[0].finished_at.is_some());
+        for status in [
+            DataStatus::Available,
+            DataStatus::Canceled,
+            DataStatus::NetworkError,
+        ] {
+            run.status = status;
+            save_run(&db, &run).unwrap();
+            finish_abandoned(&db, "job").unwrap();
+            assert_eq!(runs(&db).unwrap()[0].status, status);
+        }
+    }
 }

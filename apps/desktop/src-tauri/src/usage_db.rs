@@ -313,7 +313,7 @@ pub struct UsageDb {
 
 impl UsageDb {
     pub fn open() -> AppResult<Self> {
-        let config_dir = dirs::config_dir()
+        let config_dir = crate::platform::config_dir()
             .ok_or_else(|| AppError::Config("Cannot resolve the user config directory".into()))?;
         Self::open_at(&config_dir.join("PilotWeave").join("usage.sqlite3"))
     }

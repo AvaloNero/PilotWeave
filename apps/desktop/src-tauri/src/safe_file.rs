@@ -25,6 +25,10 @@ pub(crate) fn is_link(metadata: &Metadata) -> bool {
 /// Check the requested path before canonicalization, including every existing
 /// parent. Canonicalizing first would conceal a junction or symbolic link.
 pub fn ensure_regular_or_missing(path: &Path) -> AppResult<()> {
+    #[cfg(feature = "local-e2e")]
+    if crate::test_support::active() {
+        crate::test_support::constrain(path)?;
+    }
     if !path.is_absolute()
         || path.components().count() > MAX_PATH_COMPONENTS
         || path

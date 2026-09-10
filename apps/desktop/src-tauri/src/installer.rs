@@ -533,6 +533,11 @@ fn extension_installed(code: &Path) -> bool {
 
 #[cfg(windows)]
 fn find_code_executable() -> Option<PathBuf> {
+    #[cfg(feature = "local-e2e")]
+    if crate::test_support::active() {
+        return crate::test_support::executable("code.exe");
+    }
+
     find_on_path("code.exe").or_else(|| {
         std::env::var_os("LOCALAPPDATA")
             .map(PathBuf::from)
@@ -546,6 +551,11 @@ fn find_code_executable() -> Option<PathBuf> {
 
 #[cfg(windows)]
 fn find_on_path(name: &str) -> Option<PathBuf> {
+    #[cfg(feature = "local-e2e")]
+    if crate::test_support::active() {
+        return crate::test_support::executable(name);
+    }
+
     if let Some(path) = std::env::var_os("PATH") {
         if let Some(found) = std::env::split_paths(&path)
             .map(|root| root.join(name))

@@ -551,6 +551,8 @@ fn execute_stored_plan(state: &ManagedState, stored: StoredPlan) -> AppResult<Ap
         })
         .collect::<AppResult<Vec<_>>>();
     let recorded = records.and_then(|records| {
+        #[cfg(feature = "local-e2e")]
+        crate::test_support::fault("audit")?;
         for record in records
             .iter()
             .filter(|record| record.status == DeploymentStatus::Applied)

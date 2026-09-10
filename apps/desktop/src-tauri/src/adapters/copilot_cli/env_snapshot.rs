@@ -39,6 +39,23 @@ fn snapshot_with(
 
 #[cfg(windows)]
 pub(super) fn native_snapshot() -> AppResult<BTreeMap<String, Option<RawValue>>> {
+    #[cfg(feature = "local-e2e")]
+    if crate::test_support::active() {
+        return snapshot_with(|name| {
+            crate::test_support::registry(name, None)?
+                .map(|bytes| {
+                    if bytes.len() < 4 {
+                        return Err(AppError::Config("Invalid fixture registry value".into()));
+                    }
+                    Ok(RawValue {
+                        value_type: u32::from_le_bytes(bytes[..4].try_into().unwrap()),
+                        bytes: bytes[4..].to_vec(),
+                    })
+                })
+                .transpose()
+        });
+    }
+
     use winreg::enums::{HKEY_CURRENT_USER, KEY_READ};
     let key = match winreg::RegKey::predef(HKEY_CURRENT_USER)
         .open_subkey_with_flags("Environment", KEY_READ)

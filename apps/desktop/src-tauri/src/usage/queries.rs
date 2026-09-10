@@ -40,7 +40,10 @@ pub fn validate(q: &UsageQuery) -> AppResult<(String, String)> {
             "Usage queries allow at most 366 days and 100 rows per page",
         ));
     }
-    for value in [&q.surface, &q.connection_id, &q.model, &q.source_id]
+    if let Some(model) = &q.model {
+        super::bounded_model_id(model)?;
+    }
+    for value in [&q.surface, &q.connection_id, &q.source_id]
         .into_iter()
         .flatten()
     {

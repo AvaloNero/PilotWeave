@@ -43,6 +43,10 @@ impl Resource {
             Self::File(path) => safe_io::read_optional(path, MAX_RESOURCE_BYTES),
             #[cfg(windows)]
             Self::UserEnvironment(name) => {
+                #[cfg(feature = "local-e2e")]
+                if crate::test_support::active() {
+                    return crate::test_support::registry(name, None);
+                }
                 use winreg::enums::{HKEY_CURRENT_USER, KEY_READ};
                 let root = winreg::RegKey::predef(HKEY_CURRENT_USER);
                 let key = match root.open_subkey_with_flags("Environment", KEY_READ) {
@@ -99,6 +103,10 @@ impl Resource {
             },
             #[cfg(windows)]
             Self::UserEnvironment(name) => {
+                #[cfg(feature = "local-e2e")]
+                if crate::test_support::active() {
+                    return crate::test_support::registry(name, Some(bytes)).map(|_| ());
+                }
                 use winreg::enums::{HKEY_CURRENT_USER, REG_EXPAND_SZ, REG_SZ};
                 let (key, _) = winreg::RegKey::predef(HKEY_CURRENT_USER)
                     .create_subkey("Environment")
@@ -294,6 +302,8 @@ impl Transaction {
             },
         };
         value.persist()?;
+        #[cfg(feature = "local-e2e")]
+        crate::test_support::fault("journal")?;
         Ok(value)
     }
 
@@ -311,10 +321,18 @@ impl Transaction {
             self.journal.phase = Phase::Applying;
             self.persist()?;
             let write = &self.journal.writes[index];
+            #[cfg(feature = "local-e2e")]
+            if index == 1 {
+                crate::test_support::fault("second-write")?;
+            }
             if write.changed() {
                 write
                     .resource
                     .write(write.after.as_deref(), write.write_mode)?;
+                #[cfg(feature = "local-e2e")]
+                if index == 0 {
+                    crate::test_support::fault("first-write")?;
+                }
                 if write.resource.read()? != write.after {
                     return Err(AppError::Config("Post-write verification failed".into()));
                 }

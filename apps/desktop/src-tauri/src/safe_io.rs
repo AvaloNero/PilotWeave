@@ -8,6 +8,11 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 pub fn ensure_regular_or_missing(path: &Path) -> AppResult<()> {
+    #[cfg(feature = "local-e2e")]
+    if crate::test_support::active() {
+        crate::test_support::constrain(path)?;
+    }
+
     match fs::symlink_metadata(path) {
         Ok(metadata) => {
             #[cfg(windows)]

@@ -40,7 +40,7 @@ impl StateStore {
         }
     }
     pub fn open() -> AppResult<Self> {
-        let config_dir = dirs::config_dir()
+        let config_dir = crate::platform::config_dir()
             .ok_or_else(|| AppError::Config("Cannot resolve the user config directory".into()))?
             .join("PilotWeave");
         // Loading remains pure, including recovery. Dashboard observations report

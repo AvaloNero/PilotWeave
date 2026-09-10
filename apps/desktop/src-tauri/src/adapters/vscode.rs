@@ -236,7 +236,7 @@ pub(crate) fn original_backup(
 }
 
 fn default_user_roots() -> Vec<(Edition, PathBuf)> {
-    let Some(config_dir) = dirs::config_dir() else {
+    let Some(config_dir) = crate::platform::config_dir() else {
         return Vec::new();
     };
     vec![

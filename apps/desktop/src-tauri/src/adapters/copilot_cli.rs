@@ -24,8 +24,8 @@ fn validate_existing_configuration() -> AppResult<()> {
     }
     #[cfg(unix)]
     {
-        let home =
-            dirs::home_dir().ok_or_else(|| AppError::Config("Cannot resolve user home".into()))?;
+        let home = crate::platform::home_dir()
+            .ok_or_else(|| AppError::Config("Cannot resolve user home".into()))?;
         for path in unix_paths(&home) {
             crate::safe_file::read_optional(&path, 1024 * 1024)?;
         }
@@ -236,8 +236,8 @@ pub(crate) fn prepare(
     }
     #[cfg(unix)]
     {
-        let home =
-            dirs::home_dir().ok_or_else(|| AppError::Config("Cannot resolve home".into()))?;
+        let home = crate::platform::home_dir()
+            .ok_or_else(|| AppError::Config("Cannot resolve home".into()))?;
         prepare_unix_at(&home, &values)
     }
 }
@@ -252,8 +252,8 @@ pub(crate) fn observed_resources() -> AppResult<Vec<crate::transaction::Resource
     }
     #[cfg(unix)]
     {
-        let home =
-            dirs::home_dir().ok_or_else(|| AppError::Config("Cannot resolve home".into()))?;
+        let home = crate::platform::home_dir()
+            .ok_or_else(|| AppError::Config("Cannot resolve home".into()))?;
         unix_paths(&home)
             .into_iter()
             .map(|path| {
@@ -341,6 +341,11 @@ fn render_headers(connection: &Connection, secret: Option<&str>) -> String {
 }
 
 fn find_executable(name: &str) -> Option<PathBuf> {
+    #[cfg(feature = "local-e2e")]
+    if crate::test_support::active() {
+        return crate::test_support::executable(name);
+    }
+
     let path = env::var_os("PATH")?;
     let extensions = executable_extensions();
     for directory in env::split_paths(&path) {
@@ -449,6 +454,13 @@ impl UserEnvStore for RegistryEnvStore {
 
 #[cfg(windows)]
 fn apply_windows(values: &BTreeMap<String, Option<String>>) -> AppResult<()> {
+    #[cfg(feature = "local-e2e")]
+    if crate::test_support::active() {
+        return Err(AppError::Unsupported(
+            "Isolated deployment requires the transactional path".into(),
+        ));
+    }
+
     use winreg::enums::HKEY_CURRENT_USER;
     let (key, _) = winreg::RegKey::predef(HKEY_CURRENT_USER)
         .create_subkey("Environment")
@@ -463,6 +475,11 @@ fn apply_windows(values: &BTreeMap<String, Option<String>>) -> AppResult<()> {
 
 #[cfg(windows)]
 fn broadcast_environment_change() -> AppResult<()> {
+    #[cfg(feature = "local-e2e")]
+    if crate::test_support::active() {
+        return Ok(());
+    }
+
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         SendMessageTimeoutW, HWND_BROADCAST, SMTO_ABORTIFHUNG, WM_SETTINGCHANGE,
@@ -493,7 +510,7 @@ fn broadcast_environment_change() -> AppResult<()> {
 
 #[cfg(unix)]
 fn apply_unix(values: &BTreeMap<String, Option<String>>) -> AppResult<()> {
-    let home = dirs::home_dir()
+    let home = crate::platform::home_dir()
         .ok_or_else(|| AppError::Config("Cannot resolve the user home directory".into()))?;
     apply_unix_at(&home, values)
 }

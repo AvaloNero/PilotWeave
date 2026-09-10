@@ -154,7 +154,7 @@ fn cli(v: &Value, state: &mut ParserState) -> AppResult<Vec<Observation>> {
     for (model, metric) in metrics {
         let mut record = base(
             "copilot-session-events",
-            bounded_id(model)?,
+            super::bounded_model_id(model)?,
             started,
             finished,
         )?;
@@ -225,7 +225,7 @@ fn vscode(v: &Value) -> AppResult<Vec<Observation>> {
         .ok_or_else(|| invalid("Missing OTel model"))?;
     let mut r = base(
         "vscode-otel",
-        bounded_id(model)?,
+        super::bounded_model_id(model)?,
         timestamp(&v["startTime"])?,
         timestamp(&v["endTime"])?,
     )?;

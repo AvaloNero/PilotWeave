@@ -45,6 +45,13 @@ pub struct CapturedOutput {
 }
 
 pub fn resolve_on_path(names: &[&str]) -> Option<PathBuf> {
+    #[cfg(feature = "local-e2e")]
+    if crate::test_support::active() {
+        return names
+            .iter()
+            .find_map(|name| crate::test_support::executable(name));
+    }
+
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)
         .filter(|path| path.is_absolute())
@@ -118,6 +125,11 @@ pub fn run_capture_bounded(
     timeout: Duration,
     max_output_bytes: usize,
 ) -> AppResult<CapturedOutput> {
+    #[cfg(feature = "local-e2e")]
+    if crate::test_support::active() {
+        return crate::test_support::process(executable, args);
+    }
+
     if timeout.is_zero() || max_output_bytes == 0 || max_output_bytes > MAX_CAPTURE_BYTES {
         return Err(AppError::InvalidInput(
             "Invalid process timeout or capture limit".into(),
@@ -193,6 +205,12 @@ pub fn run_capture_bounded(
 }
 
 pub fn spawn_detached(executable: &Path, args: &[&OsStr]) -> AppResult<()> {
+    #[cfg(feature = "local-e2e")]
+    if crate::test_support::active() {
+        crate::test_support::constrain(executable)?;
+        return crate::test_support::fault("login");
+    }
+
     let executable = resolve_regular_file(executable)
         .ok_or_else(|| AppError::InvalidInput("Missing or non-regular executable".into()))?;
     let mut command = Command::new(&executable);

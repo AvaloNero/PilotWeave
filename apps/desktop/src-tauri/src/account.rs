@@ -353,7 +353,7 @@ fn default_history_version() -> u32 {
 
 impl LoginStore {
     pub fn open() -> Self {
-        let Some(config_dir) = dirs::config_dir() else {
+        let Some(config_dir) = crate::platform::config_dir() else {
             return Self {
                 path: None,
                 state: LoginHistoryState::default(),
@@ -863,6 +863,11 @@ fn canonical_surfaces(values: &[LoginSurface]) -> AppResult<Vec<LoginSurface>> {
 }
 
 fn present_auth_environment() -> Vec<String> {
+    #[cfg(feature = "local-e2e")]
+    if crate::test_support::active() {
+        return vec![];
+    }
+
     GITHUB_AUTH_ENVIRONMENT
         .iter()
         .filter(|name| std::env::var_os(name).is_some())
@@ -906,6 +911,11 @@ fn find_copilot_executable() -> Option<PathBuf> {
 }
 
 fn find_vscode_executable() -> Option<PathBuf> {
+    #[cfg(feature = "local-e2e")]
+    if crate::test_support::active() {
+        return crate::test_support::executable("code.exe");
+    }
+
     #[cfg(windows)]
     {
         let mut candidates = Vec::new();
@@ -940,6 +950,11 @@ fn find_vscode_executable() -> Option<PathBuf> {
 }
 
 fn find_copilot_app_executable() -> Option<PathBuf> {
+    #[cfg(feature = "local-e2e")]
+    if crate::test_support::active() {
+        return crate::test_support::executable("github-copilot.exe");
+    }
+
     #[cfg(windows)]
     {
         let mut candidates = Vec::new();
@@ -965,7 +980,7 @@ fn find_copilot_app_executable() -> Option<PathBuf> {
             PathBuf::from("/opt/GitHub Copilot/github-copilot"),
             PathBuf::from("/usr/bin/github-copilot"),
         ];
-        if let Some(home) = dirs::home_dir() {
+        if let Some(home) = crate::platform::home_dir() {
             candidates.push(home.join(".local/bin/github-copilot"));
             candidates.push(home.join("Applications/GitHub-Copilot.AppImage"));
         }

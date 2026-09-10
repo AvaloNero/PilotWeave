@@ -33,3 +33,21 @@ pub fn bounded_id(value: &str) -> AppResult<String> {
     }
     Ok(value.into())
 }
+
+/// OpenRouter latest aliases have one leading tilde and a provider/model slug.
+/// They remain distinct from the concrete model to which they currently route.
+pub fn bounded_model_id(value: &str) -> AppResult<String> {
+    if let Some(alias) = value.strip_prefix('~') {
+        if value.len() > 160
+            || alias
+                .split_once('/')
+                .is_none_or(|(provider, model)| provider.is_empty() || model.is_empty())
+        {
+            return Err(invalid("Unsupported model alias identity"));
+        }
+        bounded_id(alias)?;
+        Ok(value.into())
+    } else {
+        bounded_id(value)
+    }
+}

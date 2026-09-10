@@ -11,12 +11,15 @@ pub mod github_billing;
 pub mod github_billing_store;
 mod installer;
 mod native_process;
+mod platform;
 mod redact;
 mod safe_file;
 mod safe_io;
 mod secrets;
 mod setup;
 mod state;
+#[cfg(feature = "local-e2e")]
+mod test_support;
 mod transaction;
 mod usage;
 pub mod usage_db;
@@ -32,6 +35,31 @@ use usage_db::UsageDb;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    #[cfg(feature = "local-e2e")]
+    if let Err(error) = test_support::initialize() {
+        eprintln!(
+            "Isolated validation initialization failed: {}",
+            redact::redact_text(&error.to_string())
+        );
+        std::process::exit(2);
+    }
+    #[cfg(not(feature = "local-e2e"))]
+    if std::env::args()
+        .skip(1)
+        .any(|a| a.starts_with("--local-e2e"))
+    {
+        eprintln!("Validation arguments are not supported in this build");
+        std::process::exit(2);
+    }
+    let context = tauri::generate_context!();
+    #[cfg(feature = "local-e2e")]
+    let context = {
+        let mut context = context;
+        context.config_mut().identifier = "dev.pilotweave.local-validation".into();
+        // Build the test window in setup so its absolute WebView directory is native-owned.
+        context.config_mut().app.windows.clear();
+        context
+    };
     let store = StateStore::open().unwrap_or_else(StateStore::unavailable);
     let login_store = LoginStore::open();
     let github_authorization = GithubAuthorizationStore::open();
@@ -46,7 +74,26 @@ pub fn run() {
         Err(error) => (None, Some(redact_text(&error.to_string()))),
     };
     tauri::Builder::default()
-        .plugin(tauri_plugin_log::Builder::new().build())
+        .setup(|app| {
+            #[cfg(feature = "local-e2e")]
+            tauri::WebviewWindowBuilder::new(
+                app,
+                "main",
+                tauri::WebviewUrl::App("index.html".into()),
+            )
+            .title("PilotWeave — ISOLATED VALIDATION")
+            .inner_size(1180.0, 820.0)
+            .data_directory(
+                test_support::root()
+                    .expect("validated context")
+                    .join("webview"),
+            )
+            .build()?;
+            #[cfg(not(feature = "local-e2e"))]
+            app.handle()
+                .plugin(tauri_plugin_log::Builder::new().build())?;
+            Ok(())
+        })
         .plugin(tauri_plugin_opener::init())
         .manage(ManagedState::new(
             store,
@@ -93,6 +140,6 @@ pub fn run() {
             setup::confirm_account_alignment,
             setup::confirm_manual_provider,
         ])
-        .run(tauri::generate_context!())
+        .run(context)
         .expect("error while running PilotWeave");
 }

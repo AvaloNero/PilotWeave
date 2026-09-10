@@ -383,15 +383,16 @@ pub async fn confirm_account_alignment(
     })
 }
 fn resolve_public_identity(login: &str) -> AppResult<GithubIdentity> {
-    let agent: ureq::Agent = ureq::Agent::config_builder()
+    let agent: ureq::Agent = crate::platform::http_config()
         .timeout_global(Some(std::time::Duration::from_secs(15)))
         .max_redirects(0)
-        .https_only(true)
         .user_agent("PilotWeave/0.1")
         .build()
         .into();
     let mut response = agent
-        .get(format!("https://api.github.com/users/{login}"))
+        .get(crate::platform::endpoint(&format!(
+            "https://api.github.com/users/{login}"
+        )))
         .header("Accept", "application/vnd.github+json")
         .header("X-GitHub-Api-Version", "2026-03-10")
         .call()

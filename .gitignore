@@ -1,5 +1,6 @@
 /target
 /node_modules
+/tests/native-e2e/node_modules
 /apps/desktop/src-tauri/gen
 /apps/desktop/src-tauri/target
 .DS_Store

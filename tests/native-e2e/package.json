@@ -1,0 +1,7 @@
+{
+  "name": "pilotweave-native-validation",
+  "private": true,
+  "type": "module",
+  "scripts": { "test": "node --test tests/*.test.mjs" },
+  "devDependencies": { "webdriverio": "9.31.7" }
+}

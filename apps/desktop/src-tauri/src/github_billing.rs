@@ -273,10 +273,9 @@ pub fn fetch_personal_billing(
 ) -> AppResult<Vec<GithubBillingSnapshot>> {
     validate_token(token)?;
     validate_identity(identity)?;
-    let agent: ureq::Agent = ureq::Agent::config_builder()
+    let agent: ureq::Agent = crate::platform::http_config()
         .timeout_global(Some(Duration::from_secs(REQUEST_TIMEOUT_SECONDS)))
         .http_status_as_error(false)
-        .https_only(true)
         .max_redirects(0)
         .user_agent("PilotWeave/0.1")
         .build()
@@ -312,7 +311,7 @@ fn fetch_family(
         }
     };
     let mut response = match agent
-        .get(url.as_str())
+        .get(crate::platform::endpoint(url.as_str()))
         .header("Accept", "application/vnd.github+json")
         .header("Authorization", authorization)
         .header("X-GitHub-Api-Version", GITHUB_BILLING_API_VERSION)

@@ -28,16 +28,28 @@ pub struct UsageJobs {
     pub billing_cancel: Arc<AtomicBool>,
     pub refresh_times: Mutex<[Option<std::time::Instant>; 3]>,
 }
-struct JobGuard(Arc<AtomicBool>);
+struct JobGuard(Arc<AtomicBool>, Option<(std::path::PathBuf, String)>);
 impl JobGuard {
     fn begin(flag: Arc<AtomicBool>) -> AppResult<Self> {
         flag.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .map_err(|_| AppError::Busy)?;
-        Ok(Self(flag))
+        Ok(Self(flag, None))
     }
 }
 impl Drop for JobGuard {
     fn drop(&mut self) {
+        // A failed fetch, save, worker panic or canceled future must not leave
+        // an InProgress row. Do this before releasing the in-process job slot.
+        if let Some((path, id)) = &self.1 {
+            if let Ok(db) = UsageDb::open_at(path) {
+                if let Err(e) = store::finish_abandoned(&db, id) {
+                    log::error!(
+                        "Could not finalize usage job: {}",
+                        redact::redact_text(&e.to_string())
+                    );
+                }
+            }
+        }
         self.0.store(false, Ordering::SeqCst);
     }
 }
@@ -186,6 +198,8 @@ fn begin_remote(
         Ok(db.path().to_path_buf())
     })?;
     times[index] = Some(std::time::Instant::now());
+    let mut job = job;
+    job.1 = Some((path.clone(), run.id.clone()));
     Ok((job, run, path))
 }
 fn finish_remote(

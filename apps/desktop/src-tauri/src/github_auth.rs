@@ -175,7 +175,7 @@ pub struct GithubAuthorizationStore {
 
 impl GithubAuthorizationStore {
     pub fn open() -> Self {
-        let Some(config_dir) = dirs::config_dir() else {
+        let Some(config_dir) = crate::platform::config_dir() else {
             return Self {
                 path: PathBuf::new(),
                 state: GithubAuthorizationFile::default(),
@@ -485,9 +485,8 @@ impl GithubAuthorizationStore {
 
 pub fn validate_token_native(token: &str) -> AppResult<GithubValidationOutcome> {
     validate_token_input(token)?;
-    let agent: ureq::Agent = ureq::Agent::config_builder()
+    let agent: ureq::Agent = crate::platform::http_config()
         .timeout_global(Some(Duration::from_secs(REQUEST_TIMEOUT_SECONDS)))
-        .https_only(true)
         .max_redirects(0)
         .user_agent("PilotWeave/0.1")
         .build()
@@ -495,7 +494,7 @@ pub fn validate_token_native(token: &str) -> AppResult<GithubValidationOutcome> 
     let authorization = format!("Bearer {token}");
 
     let mut response = match agent
-        .get(USER_ENDPOINT)
+        .get(crate::platform::endpoint(USER_ENDPOINT))
         .header("Accept", "application/vnd.github+json")
         .header("Authorization", &authorization)
         .header("X-GitHub-Api-Version", API_VERSION)
@@ -595,7 +594,7 @@ fn probe_personal_billing(
         now.month()
     );
     let mut response = match agent
-        .get(&endpoint)
+        .get(crate::platform::endpoint(&endpoint))
         .header("Accept", "application/vnd.github+json")
         .header("Authorization", authorization)
         .header("X-GitHub-Api-Version", API_VERSION)

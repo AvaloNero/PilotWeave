@@ -110,3 +110,9 @@ Fixture: `openrouter-text-prices-v1.json`, a sanitized reduction of the public r
 P2 still requires actual supported Windows client builds, official account flows, real personal Billing capability and clean-machine installation validation. This implementation was tested with temporary source files, fake RPC/accounts, sanitized HTTP schemas and isolated browser fixtures. It does not certify a real user's runtime, token, client logs or subscription.
 
 Current CLI input semantics, missing VS Code cache-write buckets, absent separate Copilot app usage and ambiguous historical Connection attribution are explicit source limitations. The next implementation step for any of these is a newly verified official interface/schema, a versioned parser branch and sanitized success/failure fixtures. No missing value is fabricated to make setup or usage look complete.
+
+### Price parser v2: latest aliases (verified 2026-09-10)
+
+The live OpenRouter model catalog response now includes IDs such as ~openai/gpt-latest. [OpenRouter's official quickstart](https://openrouter.ai/docs/quickstart) documents these as moving latest-model aliases. Parser v2 accepts one leading tilde followed by a bounded provider/model slug; it retains the tilde as part of the identity and does not infer an unqualified or concrete-model mapping. Existing v1 snapshots remain readable and immutable. Unknown identifiers still produce SchemaError rather than silently dropping rows.
+
+The openrouter-latest-aliases-v2.json fixture retains only the public alias ID/pricing fields from that response plus the existing synthetic concrete-model fixture. Tests cover v1/v2 coexistence, stored parser version, malformed identities and alias separation. Import model identity validation accepts the same bounded spelling without changing the versioned log envelopes.

@@ -808,3 +808,39 @@ fn sensitive_usage_symlink_is_refused_without_reading_its_content() {
     assert!(!runs[0].detail.contains(f.dir.path().to_str().unwrap()));
     assert_eq!(f.db.record_count("vscode-otel").unwrap(), 0);
 }
+
+#[test]
+fn openrouter_latest_alias_v2_keeps_concrete_identity_and_history_separate() {
+    let bytes = include_bytes!("../../tests/fixtures/usage/openrouter-latest-aliases-v2.json");
+    let parsed = pricing::parse(bytes, fixture_time()).unwrap();
+    assert_eq!(parsed.parser_version, 2);
+    assert!(parsed
+        .models
+        .iter()
+        .any(|m| m.model == "~openai/gpt-latest"));
+    assert!(!parsed.aliases.contains_key("gpt-latest"));
+    assert_eq!(catalog().parser_version, 1);
+    for bad in [
+        "~~openai/gpt-latest",
+        "~",
+        "~/model",
+        "~provider/",
+        "~provider/model?secret=x",
+        "~provider/<script>",
+    ] {
+        assert!(super::bounded_model_id(bad).is_err());
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = UsageDb::open_at(&dir.path().join("usage.sqlite3")).unwrap();
+    pricing::save(&mut db, &parsed).unwrap();
+    let version: i64 = db
+        .conn
+        .query_row(
+            "SELECT parser_version FROM price_snapshots WHERE id=?1",
+            [&parsed.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(version, 2);
+    assert_eq!(pricing::latest(&db).unwrap().unwrap().parser_version, 2);
+}

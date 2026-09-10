@@ -8,6 +8,11 @@ fn entry(secret_ref: &str) -> AppResult<Entry> {
 }
 
 pub fn set(secret_ref: &str, value: &str) -> AppResult<()> {
+    #[cfg(feature = "local-e2e")]
+    if crate::test_support::active() {
+        return crate::test_support::credential(secret_ref, Some(Some(value))).map(|_| ());
+    }
+
     if value.contains(['\r', '\n']) {
         return Err(AppError::InvalidInput(
             "API keys must not contain newlines".to_string(),
@@ -19,6 +24,11 @@ pub fn set(secret_ref: &str, value: &str) -> AppResult<()> {
 }
 
 pub fn get(secret_ref: &str) -> AppResult<Option<String>> {
+    #[cfg(feature = "local-e2e")]
+    if crate::test_support::active() {
+        return crate::test_support::credential(secret_ref, None);
+    }
+
     match entry(secret_ref)?.get_password() {
         Ok(value) => Ok(Some(value)),
         Err(KeyringError::NoEntry) => Ok(None),
@@ -37,6 +47,11 @@ pub fn observe(connection_id: &str) -> crate::domain::CredentialObservation {
 }
 
 pub fn delete(secret_ref: &str) -> AppResult<()> {
+    #[cfg(feature = "local-e2e")]
+    if crate::test_support::active() {
+        return crate::test_support::credential(secret_ref, Some(None)).map(|_| ());
+    }
+
     match entry(secret_ref)?.delete_credential() {
         Ok(()) | Err(KeyringError::NoEntry) => Ok(()),
         Err(error) => Err(AppError::Secret(error.to_string())),

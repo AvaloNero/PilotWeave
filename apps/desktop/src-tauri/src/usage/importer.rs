@@ -28,10 +28,10 @@ pub struct UsageRoots {
 }
 impl UsageRoots {
     pub fn native() -> AppResult<Self> {
-        let home =
-            dirs::home_dir().ok_or_else(|| invalid("Cannot locate the user home directory"))?;
-        let config =
-            dirs::config_dir().ok_or_else(|| invalid("Cannot locate local application storage"))?;
+        let home = crate::platform::home_dir()
+            .ok_or_else(|| invalid("Cannot locate the user home directory"))?;
+        let config = crate::platform::config_dir()
+            .ok_or_else(|| invalid("Cannot locate local application storage"))?;
         Ok(Self {
             sessions: home.join(".copilot/session-state"),
             vscode_otel: config.join("PilotWeave/usage-inbox/vscode-otel.jsonl"),

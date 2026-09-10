@@ -221,7 +221,8 @@ fn parse_models(v: &Value) -> RpcResult<Vec<RuntimeModel>> {
     rows.iter()
         .map(|m| {
             Ok(RuntimeModel {
-                id: bounded_id(m["id"].as_str().ok_or_else(schema)?).map_err(|_| schema())?,
+                id: super::bounded_model_id(m["id"].as_str().ok_or_else(schema)?)
+                    .map_err(|_| schema())?,
                 name: crate::redact::redact_text(
                     m["name"]
                         .as_str()
@@ -239,6 +240,11 @@ fn parse_models(v: &Value) -> RpcResult<Vec<RuntimeModel>> {
 }
 
 pub fn save(db: &mut UsageDb, s: &RuntimeSnapshot) -> AppResult<()> {
+    #[cfg(feature = "local-e2e")]
+    if crate::test_support::active() {
+        crate::test_support::fault("runtime-save")?;
+    }
+
     let tx = db.conn.transaction().map_err(db_error)?;
     tx.execute("INSERT INTO official_quota_snapshots(id,account_hint,runtime_version,parser_version,fetched_at,status,error) VALUES (?1,?2,?3,1,?4,?5,?6)",params![s.id,s.account,s.runtime_version,s.fetched_at.to_rfc3339(),store::encode(&s.status)?,(!s.status.successful()).then_some(&s.detail)]).map_err(db_error)?;
     tx.execute(
@@ -277,6 +283,11 @@ pub fn view(db: &UsageDb) -> AppResult<RuntimeView> {
 }
 
 pub fn refresh(cancel: &AtomicBool) -> RuntimeSnapshot {
+    #[cfg(feature = "local-e2e")]
+    if crate::test_support::active() {
+        return snapshot(&mut crate::test_support::Rpc);
+    }
+
     match StdioRpc::start(cancel) {
         Ok(mut rpc) => snapshot(&mut rpc),
         Err(e) => RuntimeSnapshot {

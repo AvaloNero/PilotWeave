@@ -1,4 +1,4 @@
-use super::{bounded_id, db_error, invalid, store, types::*};
+use super::{bounded_model_id, db_error, invalid, store, types::*};
 use crate::{decimal::ExactDecimal, error::AppResult, fingerprint, usage_db::UsageDb};
 use chrono::{DateTime, Utc};
 use rusqlite::{params, OptionalExtension};
@@ -178,21 +178,26 @@ pub fn parse(bytes: &[u8], fetched_at: DateTime<Utc>) -> AppResult<PriceCatalog>
         .as_array()
         .filter(|a| !a.is_empty() && a.len() <= 4096)
         .ok_or_else(|| invalid("Price catalog model list is missing or oversized"))?;
+    let mut parser_version = 1;
     let mut models = vec![];
     let mut aliases: BTreeMap<String, Option<String>> = BTreeMap::new();
     let mut seen = std::collections::HashSet::new();
     for item in data {
-        let model = bounded_id(
+        let model = bounded_model_id(
             item["id"]
                 .as_str()
                 .ok_or_else(|| invalid("Price model identity is missing"))?,
         )?;
+        if model.starts_with('~') {
+            parser_version = 2;
+        }
         if !seen.insert(model.clone()) {
             return Err(invalid("Price catalog has duplicate model identities"));
         }
         let p = &item["pricing"];
         let (tiers, supported) = parse_tiers(p).unwrap_or_default();
-        if let Some((_, raw)) = model.split_once('/') {
+        // Floating routing aliases must not create unqualified aliases.
+        if let Some((_, raw)) = model.split_once('/').filter(|_| !model.starts_with('~')) {
             aliases
                 .entry(raw.into())
                 .and_modify(|entry| *entry = None)
@@ -210,25 +215,35 @@ pub fn parse(bytes: &[u8], fetched_at: DateTime<Utc>) -> AppResult<PriceCatalog>
         ));
     }
     models.sort_by(|a, b| a.model.cmp(&b.model));
-    let version = fingerprint::json("openrouter-text-price-v1", &models)?;
-    Ok(PriceCatalog{id:version.clone(),source:CATALOG_URL.into(),source_version:version,parser_version:1,fetched_at,currency:"USD".into(),
+    let version = fingerprint::json(
+        if parser_version == 1 {
+            "openrouter-text-price-v1"
+        } else {
+            "openrouter-text-price-v2"
+        },
+        &models,
+    )?;
+    Ok(PriceCatalog{id:version.clone(),source:CATALOG_URL.into(),source_version:version,parser_version,fetched_at,currency:"USD".into(),
         detail:"OpenRouter published minimum-provider catalog rates, USD per million text tokens. A catalog-price comparison, not an invoice or a direct-provider quote. Non-token fees are excluded; actual routing, cache retention and context tiers may change the price. Fetch time is not an asserted historical effective date.".into(),
         models,aliases:aliases.into_iter().filter_map(|(k,v)|v.map(|v|(k,v))).collect()})
 }
 
 pub fn fetch() -> Result<PriceCatalog, (DataStatus, String)> {
-    let agent: ureq::Agent = ureq::Agent::config_builder()
+    let agent: ureq::Agent = crate::platform::http_config()
         .timeout_global(Some(Duration::from_secs(25)))
         .max_redirects(0)
-        .https_only(true)
         .build()
         .into();
-    let mut response = agent.get(CATALOG_URL).call().map_err(|_| {
-        (
-            DataStatus::NetworkError,
-            "Official OpenRouter price catalog is unavailable; previous snapshot retained".into(),
-        )
-    })?;
+    let mut response = agent
+        .get(crate::platform::endpoint(CATALOG_URL))
+        .call()
+        .map_err(|_| {
+            (
+                DataStatus::NetworkError,
+                "Official OpenRouter price catalog is unavailable; previous snapshot retained"
+                    .into(),
+            )
+        })?;
     let bytes = response
         .body_mut()
         .with_config()
@@ -244,8 +259,13 @@ pub fn fetch() -> Result<PriceCatalog, (DataStatus, String)> {
 }
 
 pub fn save(db: &mut UsageDb, catalog: &PriceCatalog) -> AppResult<()> {
+    #[cfg(feature = "local-e2e")]
+    if crate::test_support::active() {
+        crate::test_support::fault("price-save")?;
+    }
+
     let tx = db.conn.transaction().map_err(db_error)?;
-    let inserted=tx.execute("INSERT OR IGNORE INTO price_snapshots(id,source,source_version,fetched_at,currency,provenance,parser_version) VALUES (?1,?2,?3,?4,'USD',?5,1)",params![catalog.id,catalog.source,catalog.source_version,catalog.fetched_at.to_rfc3339(),catalog.detail]).map_err(db_error)?;
+    let inserted=tx.execute("INSERT OR IGNORE INTO price_snapshots(id,source,source_version,fetched_at,currency,provenance,parser_version) VALUES (?1,?2,?3,?4,'USD',?5,?6)",params![catalog.id,catalog.source,catalog.source_version,catalog.fetched_at.to_rfc3339(),catalog.detail,catalog.parser_version]).map_err(db_error)?;
     if inserted == 1 {
         tx.execute(
             "INSERT INTO price_catalog_payloads VALUES (?1,?2)",

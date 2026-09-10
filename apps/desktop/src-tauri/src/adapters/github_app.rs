@@ -33,6 +33,11 @@ pub fn discover_target() -> ClientTarget {
 }
 
 pub(crate) fn installation_path() -> Option<PathBuf> {
+    #[cfg(feature = "local-e2e")]
+    if crate::test_support::active() {
+        return crate::test_support::executable("github-copilot.exe");
+    }
+
     find_installed_candidate(installation_candidates())
 }
 
@@ -95,7 +100,7 @@ fn installation_candidates() -> Vec<PathBuf> {
     #[cfg(target_os = "macos")]
     {
         candidates.push(PathBuf::from("/Applications/GitHub Copilot.app"));
-        if let Some(home) = dirs::home_dir() {
+        if let Some(home) = crate::platform::home_dir() {
             candidates.push(home.join("Applications").join("GitHub Copilot.app"));
         }
     }
@@ -104,7 +109,7 @@ fn installation_candidates() -> Vec<PathBuf> {
     {
         candidates.push(PathBuf::from("/opt/GitHub Copilot/github-copilot"));
         candidates.push(PathBuf::from("/usr/bin/github-copilot"));
-        if let Some(home) = dirs::home_dir() {
+        if let Some(home) = crate::platform::home_dir() {
             candidates.push(home.join(".local").join("bin").join("github-copilot"));
             candidates.push(home.join("Applications").join("GitHub-Copilot.AppImage"));
         }
