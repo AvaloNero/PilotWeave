@@ -1,0 +1,15 @@
+# VS Code installation and Copilot capability detection
+
+The Windows adapter recognizes the official `code.cmd` launcher as data, then invokes the verified adjacent `Code.exe` with the installed `cli.js` as the first argument. It sets `ELECTRON_RUN_AS_NODE=1` only in that child, removes `VSCODE_DEV` and inherited sensitive variables, and uses `CREATE_NO_WINDOW`. It never executes the wrapper or a shell command. Interactive sign-in continues to use the GUI entry point and clears the Electron CLI variable.
+
+Wrapper parser **v1** supports the legacy `resources/app/out/cli.js` layout and the versioned `<10-or-40-hex-commit>/resources/app/out/cli.js` layout. The latter must match the adjacent product metadata commit. Executable, wrapper and metadata paths reject symlinks/reparse points; reads, extension counts, versions and process output are bounded. Unknown layouts, failed probes and malformed metadata return Unknown and cannot authorize installation. Updating VS Code during detection may therefore require a rescan.
+
+Capability metadata parser **v1** recognizes the exact `GitHub.copilot` and `GitHub.copilot-chat` identities. Bundled manifests are checked first because `--list-extensions --show-versions` lists user-installed extensions and may omit bundled Copilot. A matching bundled manifest requires no process launch. Otherwise the bounded CLI list and registered named-profile extension manifests are inspected; profile names are never passed to `--profile`, which could create a profile. Missing non-inherited profile metadata remains Unknown. Installed capability describes package presence, not enabled state or verified authentication. With multiple editions present, the observation names the selected installation (Stable before Insiders); it is not proof of readiness in every profile/edition.
+
+Source verification on 2026-09-10:
+
+- [Official Windows launcher](https://github.com/microsoft/vscode/blob/main/resources/win32/bin/code.cmd) defines child-local Electron Node mode and the CLI entry point.
+- [Official Copilot Chat manifest](https://github.com/microsoft/vscode-copilot-chat/blob/main/package.json) identifies `GitHub.copilot-chat`; it is the backend-owned installation ID. Legacy `GitHub.copilot` is also recognized for presence.
+- Installed VS Code 1.137.0, commit `645f29cc3176500b4b5762ba887cf2a7f0ffdf2c`, uses the versioned wrapper and bundles Copilot Chat 0.65.0 under `extensions/copilot`. Sanitized fixtures retain only launcher syntax and allowlisted manifest fields. No account, workspace, prompt, extension configuration or authentication data is retained.
+
+Regression coverage includes legacy/versioned resolution, bundled detection without launching a process, both extension identities, profile-only installs, malformed/oversized metadata, path traversal/junctions, failed/truncated CLI output, and Unknown blocking installation. Native-isolated validation rejects calls to the GUI executable that omit CLI mode or the script. Host observation additionally monitors visible Code/Insiders windows around direct desktop startup, repeated discovery and restart; any new VS Code window fails acceptance.

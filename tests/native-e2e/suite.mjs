@@ -53,6 +53,15 @@ export async function nativeSuite(options, record) {
       assert.ok(result.observations.every(r => r.status === 'ready'));
       assert.equal((await d.ipc('preview_install', { componentIds: [] })).operations.length, 0);
     });
+    await step('B26 VS Code probe errors cannot offer installation', async () => {
+      write('private/installed-vscode-probe-error','1');
+      const status = await d.ipc('get_installation_status');
+      assert.equal(status.find(c => c.id === 'vscode-copilot-extension').status, 'unknown');
+      await assert.rejects(d.ipc('preview_install', { componentIds: ['vscode-copilot-extension'] }));
+      await assert.rejects(d.ipc('preview_install', { componentIds: [] }));
+      fs.unlinkSync(file('private/installed-vscode-probe-error'));
+      assert.equal((await d.ipc('get_installation_status')).find(c => c.id === 'vscode-copilot-extension').status, 'ready');
+    });
     await step('B03 Connection UI to Rust validation and credential isolation', async () => {
       await d.click('#primary-nav [data-route="connections"]');
       await d.click('[data-action="add-connection"]');

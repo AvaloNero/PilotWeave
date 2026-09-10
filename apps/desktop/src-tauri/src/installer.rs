@@ -1,8 +1,10 @@
 #[cfg(windows)]
 use crate::adapters::github_app;
+#[cfg(windows)]
+use crate::adapters::vscode_install::{self, InstalledCopilot, VsCodeCli};
 use crate::error::{AppError, AppResult};
 #[cfg(windows)]
-use crate::native_process::CapturedOutput;
+use crate::native_process::{CaptureMode, CapturedOutput};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -11,8 +13,6 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 const INSTALL_PLAN_TTL_SECONDS: i64 = 15 * 60;
-#[cfg(windows)]
-const COPILOT_EXTENSION_ID: &str = "GitHub.copilot";
 
 pub const COMPONENT_VSCODE: &str = "vscode";
 pub const COMPONENT_VSCODE_COPILOT: &str = "vscode-copilot-extension";
@@ -26,6 +26,7 @@ pub enum InstallComponentStatus {
     Missing,
     Unsupported,
     Broken,
+    Unknown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -118,7 +119,7 @@ impl InstallPlanStore {
         let mut operations = Vec::new();
         for component_id in &requested {
             let observation = observation(&observations, component_id)?;
-            if observation.status == InstallComponentStatus::Ready {
+            if !requires_install(observation.status)? {
                 continue;
             }
             operations.push(operation_for(component_id)?);
@@ -223,31 +224,56 @@ pub fn execute_plan(plan: InstallPlan) -> AppResult<InstallApplyResult> {
 
 #[cfg(windows)]
 fn discover_windows_components() -> Vec<InstallComponentObservation> {
-    let code = find_code_executable();
+    let code = vscode_install::find_executable();
     let copilot = find_on_path("copilot.exe").or_else(|| find_on_path("copilot.cmd"));
     let app = github_app::installation_path();
-    let extension_ready = code.as_deref().map(extension_installed).unwrap_or(false);
+    let cli = code.as_deref().map(VsCodeCli::resolve);
+    let extension = match cli.as_ref() {
+        None => extension_observation(Ok(None)),
+        Some(Ok(cli)) => extension_observation(cli.copilot()),
+        Some(Err(_)) => extension_observation(Err(AppError::Unsupported(
+            "VS Code CLI layout could not be verified; rescan after its update finishes".into(),
+        ))),
+    };
+    let mut code_observation = observation_from_path(COMPONENT_VSCODE, "Visual Studio Code", code);
+    if let Some(Ok(cli)) = cli {
+        code_observation.version = Some(cli.version);
+    }
 
     vec![
-        observation_from_path(COMPONENT_VSCODE, "Visual Studio Code", code),
-        InstallComponentObservation {
-            id: COMPONENT_VSCODE_COPILOT.to_string(),
-            name: "GitHub Copilot extension".to_string(),
-            status: if extension_ready {
-                InstallComponentStatus::Ready
-            } else {
-                InstallComponentStatus::Missing
-            },
-            detail: if extension_ready {
-                format!("VS Code extension {COPILOT_EXTENSION_ID} is installed")
-            } else {
-                format!("VS Code extension {COPILOT_EXTENSION_ID} is not installed")
-            },
-            version: None,
-        },
+        code_observation,
+        extension,
         observation_from_path(COMPONENT_COPILOT_CLI, "GitHub Copilot CLI", copilot),
         observation_from_path(COMPONENT_COPILOT_APP, "GitHub Copilot app", app),
     ]
+}
+
+fn requires_install(status: InstallComponentStatus) -> AppResult<bool> {
+    match status {
+        InstallComponentStatus::Ready => Ok(false),
+        InstallComponentStatus::Missing | InstallComponentStatus::Broken => Ok(true),
+        InstallComponentStatus::Unknown | InstallComponentStatus::Unsupported => Err(AppError::Unsupported(
+            "Component status is unknown or unsupported; refresh and resolve detection before creating an installation plan".into(),
+        )),
+    }
+}
+
+#[cfg(windows)]
+fn extension_observation(
+    result: AppResult<Option<InstalledCopilot>>,
+) -> InstallComponentObservation {
+    let (status, detail, version) = match result {
+        Ok(Some(extension)) => (InstallComponentStatus::Ready, extension.detail, Some(extension.version)),
+        Ok(None) => (InstallComponentStatus::Missing, "Copilot was not found in the selected VS Code installation or its registered profiles".into(), None),
+        Err(_) => (InstallComponentStatus::Unknown, "Copilot installation could not be verified. Refresh after VS Code finishes updating; detection failure does not mean it is missing.".into(), None),
+    };
+    InstallComponentObservation {
+        id: COMPONENT_VSCODE_COPILOT.into(),
+        name: "GitHub Copilot capability".into(),
+        status,
+        detail,
+        version,
+    }
 }
 
 fn operation_for(component_id: &str) -> AppResult<InstallOperation> {
@@ -262,9 +288,9 @@ fn operation_for(component_id: &str) -> AppResult<InstallOperation> {
         COMPONENT_VSCODE_COPILOT => (
             "GitHub Copilot extension",
             InstallStrategy::VsCodeExtension,
-            "Visual Studio Marketplace: GitHub.copilot",
+            "Visual Studio Marketplace: GitHub.copilot-chat",
             false,
-            "Use the verified VS Code executable to install the exact GitHub.copilot extension",
+            "Use the verified VS Code CLI to install GitHub.copilot-chat in the default profile",
         ),
         COMPONENT_COPILOT_CLI => (
             "GitHub Copilot CLI",
@@ -384,7 +410,12 @@ fn observation_from_path(
 
 #[cfg(windows)]
 trait ProcessRunner {
-    fn run(&mut self, executable: &Path, args: &[&str]) -> AppResult<CapturedOutput>;
+    fn run(
+        &mut self,
+        executable: &Path,
+        args: &[&std::ffi::OsStr],
+        mode: CaptureMode,
+    ) -> AppResult<CapturedOutput>;
 }
 
 #[cfg(windows)]
@@ -392,13 +423,18 @@ struct NativeRunner;
 
 #[cfg(windows)]
 impl ProcessRunner for NativeRunner {
-    fn run(&mut self, executable: &Path, args: &[&str]) -> AppResult<CapturedOutput> {
-        let args = args.iter().map(std::ffi::OsStr::new).collect::<Vec<_>>();
-        crate::native_process::run_capture_bounded(
+    fn run(
+        &mut self,
+        executable: &Path,
+        args: &[&std::ffi::OsStr],
+        mode: CaptureMode,
+    ) -> AppResult<CapturedOutput> {
+        crate::native_process::run_capture_with_mode(
             executable,
-            &args,
+            args,
             std::time::Duration::from_secs(20 * 60),
             128 * 1024,
+            mode,
         )
     }
 }
@@ -418,6 +454,14 @@ fn apply_windows_plan(
                 component_id: operation.component_id.clone(),
                 status: InstallResultStatus::SkippedAlreadyReady,
                 detail: "Component became ready before this operation ran".to_string(),
+            });
+            continue;
+        }
+        if requires_install(observation(&before, &operation.component_id)?.status).is_err() {
+            results.push(InstallOperationResult {
+                component_id: operation.component_id.clone(),
+                status: InstallResultStatus::Failed,
+                detail: "Component detection became unknown; no installer was launched".into(),
             });
             continue;
         }
@@ -455,11 +499,15 @@ fn apply_windows_plan(
                         "--accept-package-agreements",
                         "--accept-source-agreements",
                         "--disable-interactivity",
-                    ],
+                    ]
+                    .iter()
+                    .map(std::ffi::OsStr::new)
+                    .collect::<Vec<_>>(),
+                    CaptureMode::Standard,
                 )
             }
             InstallStrategy::VsCodeExtension => {
-                let Some(code) = find_code_executable() else {
+                let Some(code) = vscode_install::find_executable() else {
                     results.push(InstallOperationResult {
                         component_id: operation.component_id.clone(),
                         status: InstallResultStatus::SkippedDependencyFailed,
@@ -469,7 +517,20 @@ fn apply_windows_plan(
                     });
                     continue;
                 };
-                runner.run(&code, &["--install-extension", COPILOT_EXTENSION_ID])
+                match VsCodeCli::resolve(&code) {
+                    Ok(cli) => {
+                        let args = cli.args(&[
+                            std::ffi::OsStr::new("--install-extension"),
+                            std::ffi::OsStr::new(vscode_install::INSTALL_EXTENSION_ID),
+                        ]);
+                        runner.run(
+                            &cli.executable,
+                            &args.iter().map(|a| a.as_os_str()).collect::<Vec<_>>(),
+                            CaptureMode::VsCodeCli,
+                        )
+                    }
+                    Err(error) => Err(error),
+                }
             }
         };
         let output = match output {
@@ -513,43 +574,6 @@ fn apply_windows_plan(
 }
 
 #[cfg(windows)]
-fn extension_installed(code: &Path) -> bool {
-    crate::native_process::run_capture_bounded(
-        code,
-        &[std::ffi::OsStr::new("--list-extensions")],
-        std::time::Duration::from_secs(15),
-        128 * 1024,
-    )
-    .ok()
-    .filter(|output| output.status.success() && !output.stdout_truncated)
-    .map(|output| {
-        output
-            .stdout
-            .lines()
-            .any(|line| line.trim().eq_ignore_ascii_case(COPILOT_EXTENSION_ID))
-    })
-    .unwrap_or(false)
-}
-
-#[cfg(windows)]
-fn find_code_executable() -> Option<PathBuf> {
-    #[cfg(feature = "local-e2e")]
-    if crate::test_support::active() {
-        return crate::test_support::executable("code.exe");
-    }
-
-    find_on_path("code.exe").or_else(|| {
-        std::env::var_os("LOCALAPPDATA")
-            .map(PathBuf::from)
-            .and_then(|root| {
-                [root.join("Programs/Microsoft VS Code/Code.exe")]
-                    .into_iter()
-                    .find(|path| path.is_file())
-            })
-    })
-}
-
-#[cfg(windows)]
 fn find_on_path(name: &str) -> Option<PathBuf> {
     #[cfg(feature = "local-e2e")]
     if crate::test_support::active() {
@@ -587,6 +611,23 @@ mod tests {
         assert!(values.contains(&COMPONENT_COPILOT_CLI.to_string()));
         assert!(values.contains(&COMPONENT_VSCODE.to_string()));
         assert!(values.contains(&COMPONENT_VSCODE_COPILOT.to_string()));
+    }
+
+    #[test]
+    fn failed_discovery_never_authorizes_installation() {
+        for status in [
+            InstallComponentStatus::Unknown,
+            InstallComponentStatus::Unsupported,
+        ] {
+            assert!(requires_install(status).is_err());
+        }
+        assert!(!requires_install(InstallComponentStatus::Ready).unwrap());
+        assert!(requires_install(InstallComponentStatus::Missing).unwrap());
+        #[cfg(windows)]
+        assert_eq!(
+            extension_observation(Err(AppError::Config("probe failed".into()))).status,
+            InstallComponentStatus::Unknown
+        );
     }
 
     #[test]

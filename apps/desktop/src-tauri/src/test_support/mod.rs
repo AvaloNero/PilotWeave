@@ -86,6 +86,18 @@ pub fn initialize() -> AppResult<()> {
             safe_io::write_private(&path, b"PilotWeave inert local fixture executable")?;
         }
     }
+    for name in ["bin/vscode/bin", "bin/vscode/resources/app/out"] {
+        std::fs::create_dir_all(checked(name)?).map_err(|_| invalid())?;
+    }
+    for (name, bytes) in [
+        ("bin/vscode/Code.exe", "PilotWeave inert VS Code fixture"),
+        ("bin/vscode/resources/app/out/cli.js", "// Inert fixture, never executed"),
+        ("bin/vscode/bin/code.cmd", "@echo off\nsetlocal\nset VSCODE_DEV=\nset ELECTRON_RUN_AS_NODE=1\n\"%~dp0..\\Code.exe\" \"%~dp0..\\resources\\app\\out\\cli.js\" %*\nIF %ERRORLEVEL% NEQ 0 EXIT /b %ERRORLEVEL%\nendlocal\n"),
+        ("bin/vscode/resources/app/product.json", r#"{"applicationName":"code","version":"1.137.0","commit":"645f29cc3176500b4b5762ba887cf2a7f0ffdf2c"}"#),
+    ] {
+        let path = checked(name)?;
+        if !path.exists() { safe_io::write_private(&path, bytes.as_bytes())?; }
+    }
     Ok(())
 }
 
@@ -199,7 +211,7 @@ pub fn executable(name: &str) -> Option<PathBuf> {
         "winget.exe" => "winget.exe",
         "gh.exe" | "gh" => "gh.exe",
         "copilot.exe" | "copilot" | "copilot.cmd" if installed("copilot-cli") => "copilot.exe",
-        "code.exe" | "code" if installed("vscode") => "code.exe",
+        "code.exe" | "code" if installed("vscode") => "vscode/Code.exe",
         "github-copilot.exe" if installed("copilot-app") => "github-copilot.exe",
         _ => return None,
     };
@@ -208,12 +220,29 @@ pub fn executable(name: &str) -> Option<PathBuf> {
 pub fn process(
     executable: &Path,
     args: &[&std::ffi::OsStr],
+    mode: crate::native_process::CaptureMode,
 ) -> AppResult<crate::native_process::CapturedOutput> {
     constrain(executable)?;
     let args: Vec<_> = args
         .iter()
         .map(|a| a.to_string_lossy().into_owned())
         .collect();
+    #[cfg(windows)]
+    let args = {
+        let mut args = args;
+        if executable.file_name().is_some_and(|n| n == "Code.exe") {
+            if mode != crate::native_process::CaptureMode::VsCodeCli
+                || args.first().map(Path::new)
+                    != Some(checked("bin/vscode/resources/app/out/cli.js")?.as_path())
+            {
+                return Err(invalid());
+            }
+            args.remove(0);
+        }
+        args
+    };
+    #[cfg(not(windows))]
+    let _ = mode;
     let mut stdout = String::new();
     let mut code = 0;
     if args.first().map(String::as_str) == Some("install") {
@@ -232,13 +261,16 @@ pub fn process(
                 .map_err(|_| invalid())?;
         }
     } else if args.first().map(String::as_str) == Some("--install-extension") {
-        if args.get(1).map(String::as_str) != Some("GitHub.copilot") {
+        if args.get(1).map(String::as_str) != Some("GitHub.copilot-chat") {
             return Err(invalid());
         }
         safe_io::write_private(&checked("private/installed-vscode-copilot")?, b"1")?;
     } else if args.first().map(String::as_str) == Some("--list-extensions") {
+        if installed("vscode-probe-error") {
+            return Err(invalid());
+        }
         if installed("vscode-copilot") {
-            stdout = "GitHub.copilot\n".into();
+            stdout = "GitHub.copilot-chat@0.65.0\n".into();
         }
     } else if args.first().map(String::as_str) == Some("api") {
         if installed("signed-in") {

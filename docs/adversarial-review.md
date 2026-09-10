@@ -229,6 +229,8 @@ Required mitigation:
 
 ### False success
 
+VS Code's GUI executable is not its noninteractive CLI. Calling it directly with `--list-extensions` can open user windows and an empty capture cannot prove absence. Use the validated launcher layout with child-local Electron Node mode, check bundled Copilot manifests separately, preserve Unknown on failures, and reject installation plans for Unknown observations. Regression acceptance must monitor new VS Code windows across normal startup and repeated discovery.
+
 Installer exit code zero may not mean the client is usable.
 
 Required mitigation:

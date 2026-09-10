@@ -26,6 +26,15 @@ test("money rendering preserves decimal precision and unknown is distinct from e
   assert.equal(usage.value(0), "0"); assert.match(usage.value(null), /Unknown/);
 });
 
+test("unknown Copilot detection is an issue to review, never an installation action", () => {
+  const d = data(); d.components[1].status = "unknown";
+  const state = setup.derive(snapshot, d);
+  assert.equal(state.installed, false);
+  assert.equal(state.missing.length, 0);
+  assert.equal(state.next.route, "clients");
+  assert.notEqual(state.next.action, "setup-install");
+});
+
 test("interrupted deployment and read-only recovery cannot report core setup ready", () => {
   const pending = { ...snapshot, deploymentRecovery: "An interrupted write needs review" };
   assert.equal(setup.derive(pending, data()).deployed, false);

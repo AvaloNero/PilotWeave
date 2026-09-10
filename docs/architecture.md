@@ -274,6 +274,8 @@ A surface may require more than one component:
 
 Observed states include installed, missing, broken, unsupported, unknown, and update-required. A shared package may satisfy more than one surface and must be deduplicated in the plan.
 
+Windows VS Code capability detection separates bundled Copilot metadata from user-installed extensions. CLI probes and extension installs run the installed CLI entry point in child-local Electron Node mode, never the GUI entry point alone. Probe errors remain Unknown and block installation plans. See [VS Code detection](vscode-detection.md) for versioned schemas and evidence boundaries.
+
 ### Install plan
 
 The backend owns an immutable plan containing:

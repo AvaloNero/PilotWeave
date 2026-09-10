@@ -76,6 +76,7 @@
       missing: "Missing",
       unsupported: "Unsupported",
       broken: "Needs repair",
+      unknown: "Detection unavailable",
       completedAndVerified: "Installed and verified",
       processSucceededVerificationFailed: "Verification failed",
       skippedAlreadyReady: "Already ready",

@@ -3,6 +3,7 @@ import path from 'node:path';
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
 import { NativeDriver } from './driver.mjs';
+import { HostWindowWatch } from './host-windows.mjs';
 import { digest } from '../../scripts/validation-report.mjs';
 
 export function acceptGate(manifest, action, completedAction, detail) {
@@ -40,6 +41,7 @@ export function enrollDedicatedProfile({ profile, appData, runId, readSid = () =
 export async function liveAcceptance({ runRoot, manifest, completedAction }, record) {
   const save = () => fs.writeFileSync(path.join(runRoot,'live-manifest.json'),JSON.stringify(manifest,null,2));
   let driver;
+  let windows;
   const start = async application => { driver = new NativeDriver({ application,...manifest.driverOptions }); await driver.start(); return driver; };
   const gate = (action, detail) => {
     if (acceptGate(manifest,action,completedAction,detail)) { save(); return true; }
@@ -47,11 +49,28 @@ export async function liveAcceptance({ runRoot, manifest, completedAction }, rec
   };
   try {
     if (manifest.target === 'HostObserve') {
+      windows = new HostWindowWatch();
+      await windows.start();
+      await windows.normalStartup(manifest.artifact.application);
+      record('C1 Normal desktop startup without VS Code windows','PASS',{transport:'Direct EXE, no arguments, no WebDriver',newCodeWindows:windows.added.size});
       await start(manifest.artifact.application);
       await assert.rejects(driver.ipc('local_e2e_status'));
       record('C1 Default EXE startup and no test IPC','PASS',{sha256:manifest.artifact.sha256,webviewVersion:driver.browser.capabilities.browserVersion,driverInitialUrl:driver.initialUrl});
       const installs=await driver.ipc('get_installation_status');
-      record('C1 Real installed components','PASS',states(installs));
+      record('C1 Real installed components',installs.every(c=>c.status==='ready')?'PASS':'BLOCKED',states(installs));
+      for (let i=0;i<3;i++) {
+        assert.deepEqual(await driver.ipc('get_installation_status'),installs);
+        windows.assertClean();
+      }
+      if (manifest.expectedComponents) {
+        for (const expected of manifest.expectedComponents) {
+          const actual = installs.find(c=>c.id===expected.id);
+          assert.equal(actual?.status,expected.status);
+          assert.equal(actual?.version,expected.version);
+        }
+        record('C1 Components match independently recorded host evidence','PASS',manifest.expectedComponents);
+      }
+      record('C1 Repeated discovery without VS Code windows','PASS',{repeats:3,newCodeWindows:windows.added.size});
       const accounts=await driver.ipc('get_account_status');
       record('C1 Official account observations','PASS',{anchor:accounts.anchor.state,surfaces:accounts.surfaces.map(s=>({surface:s.surface,state:s.state,evidence:s.evidence}))});
       const before=await driver.ipc('get_dashboard');
@@ -71,6 +90,8 @@ export async function liveAcceptance({ runRoot, manifest, completedAction }, rec
       record('C1 Restart and host configuration boundary','PASS','Connections, deployment history and source opt-in unchanged; runtime observation persisted');
       record('C1 Live installation / login / historical import','SKIPPED','Existing-host observation scope: no component install, login launch, target write, or historical log import was requested by this run');
       record('C2 Clean environment acceptance','BLOCKED','Requires a dedicated user or clean VM; deferred by maintainer. No new user was created.');
+      windows.assertClean();
+      record('C1 Window boundary across startup, refresh and restart','PASS',{newCodeWindows:windows.added.size});
       return;
     }
     // A separately invoked path, never a fallback from HostObserve. Only a
@@ -129,5 +150,5 @@ export async function liveAcceptance({ runRoot, manifest, completedAction }, rec
     await driver.stop();await start(installed);assert.deepEqual((await driver.ipc('get_usage_overview')).totals,two.totals);
     record('C2 Installed application restart','PASS','Native metadata and estimates persisted');
     record('C2 Real paid requests','SKIPPED','Runner never submits model prompts; any independently authorized test requests are completed in official clients');
-  } finally { await driver?.stop();save();record('C Cleanup','PASS','Stopped only this run’s driver/application tree; client data retained'); }
+  } finally { await driver?.stop(); await windows?.stop(); save();record('C Cleanup','PASS','Stopped only this run’s driver/application tree and read-only observer; client data retained'); }
 }

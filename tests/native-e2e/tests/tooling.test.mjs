@@ -5,6 +5,13 @@ import os from 'node:os';
 import path from 'node:path';
 import { Report, redact } from '../../../scripts/validation-report.mjs';
 import { acceptGate, enrollDedicatedProfile } from '../live.mjs';
+import { addedCodeWindows } from '../host-windows.mjs';
+
+test('window guard ignores existing windows and detects new windows even in an existing process',()=>{
+  const before=['code:10:100','pilotweave:20:200'];
+  assert.deepEqual(addedCodeWindows(before,['code:10:100','pilotweave:21:201']),[]);
+  assert.deepEqual(addedCodeWindows(before,['code:10:101','code - insiders:30:300']),['code:10:101','code - insiders:30:300']);
+});
 
 test('report escapes hostile fields and does not count blockers as passes',()=>{
   const root=fs.mkdtempSync(path.join(os.tmpdir(),'pilotweave-report-'));

@@ -33,7 +33,16 @@ pub const SENSITIVE_CHILD_ENV: &[&str] = &[
     "ANTHROPIC_API_KEY",
     "GH_DEBUG",
     "NODE_OPTIONS",
+    "ELECTRON_RUN_AS_NODE",
+    "VSCODE_DEV",
 ];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CaptureMode {
+    Standard,
+    #[cfg(windows)]
+    VsCodeCli,
+}
 
 #[derive(Debug)]
 pub struct CapturedOutput {
@@ -125,9 +134,25 @@ pub fn run_capture_bounded(
     timeout: Duration,
     max_output_bytes: usize,
 ) -> AppResult<CapturedOutput> {
+    run_capture_with_mode(
+        executable,
+        args,
+        timeout,
+        max_output_bytes,
+        CaptureMode::Standard,
+    )
+}
+
+pub(crate) fn run_capture_with_mode(
+    executable: &Path,
+    args: &[&OsStr],
+    timeout: Duration,
+    max_output_bytes: usize,
+    mode: CaptureMode,
+) -> AppResult<CapturedOutput> {
     #[cfg(feature = "local-e2e")]
     if crate::test_support::active() {
-        return crate::test_support::process(executable, args);
+        return crate::test_support::process(executable, args, mode);
     }
 
     if timeout.is_zero() || max_output_bytes == 0 || max_output_bytes > MAX_CAPTURE_BYTES {
@@ -143,7 +168,7 @@ pub fn run_capture_bounded(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    sanitize_child_environment(&mut command, false);
+    configure_capture(&mut command, mode);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -202,6 +227,23 @@ pub fn run_capture_bounded(
     }
     let _ = child.wait();
     result
+}
+
+fn configure_capture(command: &mut Command, mode: CaptureMode) {
+    sanitize_child_environment(command, false);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+        command.creation_flags(CREATE_NO_WINDOW);
+        if mode == CaptureMode::VsCodeCli {
+            // Mirror the official code.cmd without running a shell or changing
+            // the parent's environment. Code.exe alone is the GUI entry point.
+            command.env("ELECTRON_RUN_AS_NODE", "1");
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = mode;
 }
 
 pub fn spawn_detached(executable: &Path, args: &[&OsStr]) -> AppResult<()> {
@@ -347,6 +389,24 @@ impl Drop for ProcessTree {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn electron_mode_is_child_scoped_and_graphical_login_clears_it() {
+        let mut capture = Command::new("not-executed");
+        configure_capture(&mut capture, CaptureMode::VsCodeCli);
+        let env: std::collections::BTreeMap<_, _> = capture.get_envs().collect();
+        assert_eq!(
+            env[OsStr::new("ELECTRON_RUN_AS_NODE")],
+            Some(OsStr::new("1"))
+        );
+        assert_eq!(env[OsStr::new("VSCODE_DEV")], None);
+        assert_eq!(env[OsStr::new("NODE_OPTIONS")], None);
+        let mut login = Command::new("not-executed");
+        sanitize_child_environment(&mut login, true);
+        let env: std::collections::BTreeMap<_, _> = login.get_envs().collect();
+        assert_eq!(env[OsStr::new("ELECTRON_RUN_AS_NODE")], None);
+    }
     use std::io::Cursor;
 
     #[test]
