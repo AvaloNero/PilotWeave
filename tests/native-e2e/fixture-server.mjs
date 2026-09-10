@@ -5,7 +5,7 @@ import path from 'node:path';
 export async function fixtures(repo) {
   const read = name => fs.readFileSync(path.join(repo, 'apps/desktop/src-tauri/tests/fixtures/usage', name));
   const scenario = { prices: 200, billing: 200, runtime: 'available', delay: 0, multiplier: 1 };
-  const methods = [];
+  const methods = [], modelRequests = [];
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, 'http://127.0.0.1');
     methods.push(url.pathname);
@@ -13,7 +13,17 @@ export async function fixtures(repo) {
     if (scenario.delay) await new Promise(resolve => setTimeout(resolve, scenario.delay));
     if (res.destroyed) return;
     let body = {}, status = 200;
-    if (url.pathname === '/prices') {
+    if (url.pathname.startsWith('/model-discovery/')) {
+      modelRequests.push({path:url.pathname, method:req.method, bearer:req.headers.authorization === 'Bearer fixture-discovery-key',
+        anthropic:req.headers['x-api-key'] === 'fixture-discovery-key', version:req.headers['anthropic-version'] === '2023-06-01'});
+      if (url.pathname.includes('/delayed/')) await new Promise(resolve=>setTimeout(resolve,1000));
+      if (url.pathname.includes('/unauthorized/')) {status=401;body={error:'PRIVATE_DISCOVERY_ERROR'};}
+      else if (url.pathname.includes('/schema/')) body = {changed:true,error:'PRIVATE_DISCOVERY_ERROR'};
+      else if (url.pathname.includes('/redirect/')) {res.writeHead(302,{Location:`http://127.0.0.1:${server.address().port}/stolen-key`});res.end();return;}
+      else if (url.pathname.includes('/anthropic/')) body=JSON.parse(fs.readFileSync(path.join(repo,'apps/desktop/src-tauri/tests/fixtures/models',url.searchParams.has('after_id')?'anthropic-last-v1.json':'anthropic-list-v1.json')));
+      else if (url.pathname.endsWith('/models')) body=JSON.parse(fs.readFileSync(path.join(repo,'apps/desktop/src-tauri/tests/fixtures/models/openai-list-v1.json')));
+      else status=404;
+    } else if (url.pathname === '/prices') {
       status = scenario.prices;
       body = JSON.parse(read(scenario.latestAliases ? 'openrouter-latest-aliases-v2.json' : 'openrouter-text-prices-v1.json'));
       if (scenario.multiplier !== 1) for (const item of body.data) for (const key of Object.keys(item.pricing)) {
@@ -44,6 +54,6 @@ export async function fixtures(repo) {
     res.end(JSON.stringify(body));
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
-  return { port: server.address().port, scenario, methods, read,
+  return { port: server.address().port, scenario, methods, modelRequests, read,
     close: async () => { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); } };
 }

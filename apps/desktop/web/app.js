@@ -577,7 +577,10 @@
       </div>`;
   }
 
+  let modalCleanup = null;
   function openModal({ title, body, footer = "", wide = false, onOpen }) {
+    modalCleanup?.();
+    modalCleanup = null;
     modalRoot.innerHTML = `
       <div class="modal-backdrop" role="presentation">
         <section class="modal ${wide ? "wide" : ""}" role="dialog" aria-modal="true" aria-label="${escapeHtml(title)}">
@@ -595,10 +598,13 @@
   }
 
   function closeModal() {
+    modalCleanup?.();
+    modalCleanup = null;
     modalRoot.innerHTML = "";
   }
 
   function openConnectionForm(connection = null) {
+    const openedFromHome = route === "overview";
     if (snapshot.stateRecovery || snapshot.deploymentRecovery) {
       showToast("Connection changes are disabled during read-only recovery", "error");
       return;
@@ -644,6 +650,16 @@
             <small>The desktop backend stores this in the OS credential store.</small>
           </div>
           ${connection ? `<div class="form-field full"><label><input name="clearSecret" type="checkbox" style="width:auto;height:auto;margin-right:7px" />Remove the stored credential</label></div>` : ""}
+          <div class="form-field full model-discovery" id="model-discovery">
+            <div class="model-discovery-actions"><strong>Discover models</strong><button type="button" class="button ghost small" data-model-fetch>Fetch models</button></div>
+            <small data-model-status role="status" aria-live="polite"></small>
+            <small>Uses your key to read the model catalog at this endpoint. No chat request is sent.</small>
+            <div data-model-results hidden>
+              <input type="search" data-model-search aria-label="Filter discovered models" placeholder="Filter by model name or ID" />
+              <div class="discovered-models" data-model-list></div>
+              <button type="button" class="button ghost small" data-model-add disabled>Add selected (0)</button>
+            </div>
+          </div>
           <div class="form-field full">
             <label for="models">Models</label>
             <textarea id="models" name="models" required placeholder="model-id | Display Name">${escapeHtml(modelsText)}</textarea>
@@ -657,21 +673,36 @@
         </form>`,
       footer: `<button class="button ghost" data-modal-close>Cancel</button><button class="button primary" id="save-connection">${connection ? "Save changes" : "Add connection"}</button>`,
       onOpen(root) {
+        const discovery = window.ModelDiscovery.mount(root.querySelector("#connection-form"), { invoke, native: Boolean(window.__TAURI__?.core?.invoke), connection });
+        modalCleanup = () => discovery.dispose();
         root.querySelectorAll("[data-modal-close]").forEach((button) =>
           button.addEventListener("click", closeModal),
         );
-        root.querySelector("#save-connection").addEventListener("click", async () => {
+        let saving = false;
+        root.querySelector("#save-connection").addEventListener("click", async (event) => {
+          if (saving) return;
           const form = root.querySelector("#connection-form");
           if (!form.reportValidity()) return;
           const data = new FormData(form);
+          const saveButton = event.currentTarget;
+          saving = true;
+          saveButton.disabled = true;
           try {
-            const input = parseConnectionForm(data, connection);
-            await invoke("upsert_connection", { input });
-            closeModal();
-            showToast(connection ? "Connection updated" : "Connection added");
+            const input = parseConnectionForm(data, connection, discovery.discoveredIds);
+            const saved = await invoke("upsert_connection", { input });
+            let selectionFailed = false;
+            if (openedFromHome) {
+              try { await invoke("select_setup_connection", { connectionId: saved.id }); }
+              catch { selectionFailed = true; }
+            }
+            if (form.isConnected) closeModal();
+            showToast(selectionFailed ? "Connection saved. Select it on Home after setup storage becomes available." : connection ? "Connection updated; review deployment to apply changes" : "Connection added; review deployment when ready", selectionFailed ? "error" : "success");
             await refresh();
           } catch (error) {
             showToast(error?.message ?? String(error), "error");
+          } finally {
+            saving = false;
+            if (saveButton.isConnected) saveButton.disabled = false;
           }
         });
       },
@@ -686,7 +717,7 @@
       .join("");
   }
 
-  function parseConnectionForm(data, existing) {
+  function parseConnectionForm(data, existing, discoveredIds = new Set()) {
     const modelLines = String(data.get("models") ?? "")
       .split(/\r?\n/)
       .map((line) => line.trim())
@@ -706,7 +737,7 @@
         name,
         enabled: existingByModelId[modelId]?.enabled ?? true,
         capabilities: existingByModelId[modelId]?.capabilities ?? {
-          toolCalling: true,
+          toolCalling: discoveredIds.has(modelId) ? null : true,
           vision: null,
           reasoning: null,
           contextWindow: null,
@@ -714,18 +745,7 @@
         },
       };
     });
-    const headers = {};
-    String(data.get("headers") ?? "")
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .filter(Boolean)
-      .forEach((line) => {
-        const index = line.indexOf(":");
-        if (index <= 0) throw new Error(`Header must contain a colon: ${line}`);
-        const name = line.slice(0, index).trim();
-        const value = line.slice(index + 1).trim();
-        headers[name] = value;
-      });
+    const headers = window.ModelDiscovery.parseHeaders(String(data.get("headers") ?? ""));
     const id = String(data.get("id") ?? "").trim();
     return {
       id: id || null,
@@ -938,7 +958,7 @@
     switch (action.dataset.action) {
       case "setup-install":
         window.PilotWeaveInstaller.preview((data.components ?? []).filter((c) => ["missing", "broken"].includes(c.status)).map((c) => c.id)); break;
-      case "setup-signin": window.PilotWeaveAccount.preview(); break;
+      case "setup-signin": window.PilotWeaveAccount.preview(action.dataset.surface ? [action.dataset.surface] : undefined); break;
       case "setup-accounts": openAccountConfirmation(); break;
       case "setup-deploy": {
         const selected = window.PilotWeaveSetup.derive(snapshot, data, isDesktop).selected;
@@ -972,8 +992,11 @@
 
   content.addEventListener("change", async (event) => {
     if (event.target.id !== "setup-connection") return;
-    try { await invoke("select_setup_connection", { connectionId: event.target.value }); await refresh(); }
-    catch (error) { showToast(error?.message ?? String(error), "error"); }
+    const select = event.target;
+    select.disabled = true;
+    try { await invoke("select_setup_connection", { connectionId: select.value }); await refresh(); }
+    catch (error) { select.value = window.PilotWeaveSetup.derive(snapshot, data, isDesktop).selected?.id ?? ""; showToast(error?.message ?? String(error), "error"); }
+    finally { if (select.isConnected) select.disabled = false; }
   });
   document.addEventListener("pilotweave:refresh-setup", () => refresh());
   window.PilotWeaveUsage.configure({ invoke, refresh: refreshUsage, render, showToast, openModal, closeModal, getData: () => data, native: isDesktop });

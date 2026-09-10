@@ -26,6 +26,20 @@ test("money rendering preserves decimal precision and unknown is distinct from e
   assert.equal(usage.value(0), "0"); assert.match(usage.value(null), /Unknown/);
 });
 
+test("Home puts editable connection controls first and scopes sign-in per client", () => {
+  const d = data();
+  d.setup.accounts = {surfaces:[{surface:'vsCodeCopilot',state:'actionRequired'}]};
+  const html = setup.render(snapshot,d,true);
+  assert.ok(html.indexOf('Connection and models') < html.indexOf('Scan this computer'));
+  assert.match(html, /data-action="edit-connection" data-id="connection"/);
+  assert.match(html, /data-action="add-connection"/);
+  assert.match(html, /data-action="setup-signin" data-surface="vsCodeCopilot"/);
+  assert.doesNotMatch(html, /Open official sign-in flows/);
+  assert.match(html, /Provider setup confirmed by you/);
+  const recovery=setup.render({...snapshot,stateRecovery:'Needs recovery'},d,true);
+  assert.match(recovery,/data-action="edit-connection" data-id="connection" disabled/);
+});
+
 test("unknown Copilot detection is an issue to review, never an installation action", () => {
   const d = data(); d.components[1].status = "unknown";
   const state = setup.derive(snapshot, d);

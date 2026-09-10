@@ -338,7 +338,7 @@
     }
   }
 
-  async function previewLogin() {
+  async function previewLogin(requestedSurfaces) {
     if (loading || !accountStatus) return;
     if (accountStatus.historyRecovery) {
       showToast(
@@ -348,7 +348,7 @@
       return;
     }
     const choices = content.querySelectorAll('input[name="account-surface"]');
-    const surfaces = choices.length ? Array.from(choices).filter((input) => input.checked).map((input) => input.value)
+    const surfaces = Array.isArray(requestedSurfaces) ? requestedSurfaces.filter(s => surfaceOrder.includes(s)) : choices.length ? Array.from(choices).filter((input) => input.checked).map((input) => input.value)
       : (accountStatus.surfaces ?? []).filter((s) => !["notInstalled", "unsupported"].includes(s.state)).map((s) => s.surface);
     if (!surfaces.length) {
       showToast("Select at least one installed account surface", "error");
@@ -389,12 +389,12 @@
             <div class="account-plan-target">
               <span>Target github.com identity</span>
               <strong>${target ? `${escapeHtml(target.login)} · ${escapeHtml(target.host)}` : "Not verified"}</strong>
-              <p>${target ? "Use this same identity in every official client flow." : "PilotWeave cannot prove a common target yet. The run will only open official flows and will remain Action required until you verify the same github.com account."}</p>
+              <p>${target ? "Use this same identity in every official client flow." : "PilotWeave cannot prove a common target yet. Follow the instructions below and verify the same github.com account in each selected client."}</p>
             </div>
             ${needsManualTargetConfirmation ? `
               <label class="account-confirmation">
                 <input type="checkbox" data-account-target-confirm />
-                <span>I will select and verify the same github.com account in every launched client flow.</span>
+                <span>I will select and verify the same github.com account in every selected client.</span>
               </label>` : ""}
             <div class="account-plan-list">
               ${plan.operations.map(renderPlanOperation).join("")}
@@ -402,7 +402,7 @@
           </div>
           <footer class="modal-footer">
             <button class="button ghost" data-account-modal-close>Cancel</button>
-            <button class="button primary" data-account-confirm ${supportedCount === 0 || needsManualTargetConfirmation ? "disabled" : ""}>Open official sign-in flows</button>
+            <button class="button primary" data-account-confirm ${supportedCount === 0 || needsManualTargetConfirmation ? "disabled" : ""}>Continue with sign-in</button>
           </footer>
         </section>
       </div>`;
@@ -427,7 +427,7 @@
   function renderPlanOperation(operation) {
     return `
       <div class="account-plan-operation">
-        <span class="account-status ${operation.supported ? "action" : "unsupported"}">${operation.supported ? "Will open" : "Unavailable"}</span>
+        <span class="account-status ${operation.supported ? "action" : "unsupported"}">${operation.supported ? operation.surface === "vsCodeCopilot" ? "Instructions" : "Will open" : "Unavailable"}</span>
         <div>
           <strong>${escapeHtml(operation.title)}</strong>
           <p>${escapeHtml(operation.description)}</p>
@@ -440,7 +440,7 @@
     const confirm = modalRoot.querySelector("[data-account-confirm]");
     if (confirm) {
       confirm.disabled = true;
-      confirm.textContent = "Opening…";
+      confirm.textContent = "Preparing…";
     }
     try {
       const result = await invoke("apply_login_plan", { planId: plan.id });
@@ -449,7 +449,7 @@
       accountStatus = result.accountStatus;
       document.dispatchEvent(new Event("pilotweave:refresh-setup"));
       showResultModal(result.run);
-      showToast("Official sign-in launch completed");
+      showToast("Account instructions ready; follow each client's result");
       markChanged();
     } catch (error) {
     closeModal();

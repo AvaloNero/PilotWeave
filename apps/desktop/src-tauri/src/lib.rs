@@ -10,6 +10,7 @@ pub mod github_auth;
 pub mod github_billing;
 pub mod github_billing_store;
 mod installer;
+mod model_discovery;
 mod native_process;
 mod platform;
 mod redact;
@@ -117,6 +118,7 @@ pub fn run() {
             commands::refresh_github_authorization,
             commands::clear_github_authorization,
             commands::upsert_connection,
+            model_discovery::discover_connection_models,
             commands::delete_connection,
             commands::preview_deployment,
             commands::apply_deployment_plan,

@@ -1,6 +1,6 @@
 use crate::domain::{Connection, DeploymentRecord, PersistentState};
 use crate::error::{AppError, AppResult};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use url::{Host, Url};
 
 pub const MAX_CONNECTIONS: usize = 128;
@@ -87,13 +87,28 @@ pub fn validate_connection(connection: &Connection) -> AppResult<()> {
         }
     }
 
-    if connection.headers.len() > MAX_HEADERS_PER_CONNECTION {
+    validate_headers(&connection.headers)?;
+
+    let serialized = serde_json::to_vec(connection).map_err(|error| {
+        AppError::Config(format!("Failed to size the connection record: {error}"))
+    })?;
+    if serialized.len() > MAX_CONNECTION_JSON_BYTES {
+        return Err(AppError::InvalidInput(format!(
+            "Connection configuration exceeds {} KiB",
+            MAX_CONNECTION_JSON_BYTES / 1_024
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_headers(headers: &BTreeMap<String, String>) -> AppResult<()> {
+    if headers.len() > MAX_HEADERS_PER_CONNECTION {
         return Err(AppError::InvalidInput(format!(
             "A connection may define at most {MAX_HEADERS_PER_CONNECTION} headers"
         )));
     }
     let mut header_names = HashSet::new();
-    for (name, value) in &connection.headers {
+    for (name, value) in headers {
         validate_header_name(name)?;
         validate_bounded_text("Header value", value, MAX_HEADER_VALUE_BYTES)?;
         if value.contains(['\r', '\n', '\0']) {
@@ -116,15 +131,6 @@ pub fn validate_connection(connection: &Connection) -> AppResult<()> {
         }
     }
 
-    let serialized = serde_json::to_vec(connection).map_err(|error| {
-        AppError::Config(format!("Failed to size the connection record: {error}"))
-    })?;
-    if serialized.len() > MAX_CONNECTION_JSON_BYTES {
-        return Err(AppError::InvalidInput(format!(
-            "Connection configuration exceeds {} KiB",
-            MAX_CONNECTION_JSON_BYTES / 1_024
-        )));
-    }
     Ok(())
 }
 
@@ -271,7 +277,7 @@ fn validate_deployment_record(record: &DeploymentRecord) -> AppResult<()> {
     Ok(())
 }
 
-fn validate_endpoint(value: &str) -> AppResult<()> {
+pub(crate) fn validate_endpoint(value: &str) -> AppResult<()> {
     validate_required_text("Endpoint URL", value, MAX_ENDPOINT_BYTES)?;
     let url = Url::parse(value)
         .map_err(|error| AppError::InvalidInput(format!("Invalid endpoint URL: {error}")))?;

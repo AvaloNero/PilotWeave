@@ -232,7 +232,7 @@ export async function nativeSuite(options, record) {
       for (const name of fs.readdirSync(directory)) if (/state|usage\.sqlite3/.test(name) && fs.statSync(path.join(directory, name)).isFile()) {
         assert.doesNotMatch(fs.readFileSync(path.join(directory, name)).toString('latin1'), /PRIVATE_PROMPT|PRIVATE_TOKEN|PRIVATE_ENV|PRIVATE_TOOL|SENTINEL|ROTATED/);
       }
-      assert.ok(server.methods.every(p => /^\/(rpc|prices|github)\b/.test(p)));
+      assert.ok(server.methods.every(p => /^\/(rpc|prices|github|rejected)\b/.test(p)));
     });
     await step('B16 Clear and delete require explicit operation; source files preserved', async () => {
       await assert.rejects(d.ipc('clear_local_usage', { sourceId: 'vscode-otel', confirmed: false }));
@@ -339,6 +339,99 @@ export async function nativeSuite(options, record) {
       const selected=await overview({sourceId:'vscode-otel',model:'~openai/gpt-latest'});
       assert.equal(selected.totalRecords,1);assert.equal(selected.records[0].canonicalModel,'~openai/gpt-latest');
       assert.equal(selected.records[0].priceSnapshotId,prices.catalog.id);
+    });
+    await step('B27 Automatic provider model discovery, selection and saved credentials through real IPC', async () => {
+      await d.click('#primary-nav [data-route="connections"]');
+      await d.click('[data-action="add-connection"]');
+      for (const [selector,value] of [['#connection-name','Discovered connection'],['#base-url','https://models.example.invalid/v1'],['#api-key','fixture-discovery-key'],['#models','manual-model | Keep this name']]) await d.browser.$(selector).setValue(value);
+      await until(async()=>await d.browser.$('#model-discovery').getAttribute('data-status')==='available','Automatic model discovery did not finish');
+      assert.equal((await d.browser.$$('[data-model-list] label')).length,2);
+      assert.ok(server.modelRequests.some(r=>r.method==='GET'&&r.bearer&&r.path==='/model-discovery/v1/models'));
+      await d.click('[data-model-list] input[type="checkbox"]');
+      await d.click('[data-model-add]');
+      assert.equal(await d.browser.$('#models').getValue(),'manual-model | Keep this name\nfixture/chat | fixture/chat');
+      if(options.evidenceRoot) await d.browser.saveScreenshot(path.join(options.evidenceRoot,'native-model-discovery.png'));
+      await d.click('#save-connection');
+      await until(async()=>(await d.ipc('get_dashboard')).connections.some(c=>c.name==='Discovered connection'),'Discovered connection did not save');
+      const saved=(await d.ipc('get_dashboard')).connections.find(c=>c.name==='Discovered connection');
+      assert.equal(saved.hasSecret,true);assert.equal(saved.models.find(m=>m.modelId==='fixture/chat').capabilities.toolCalling,undefined);
+      const input={connectionId:saved.id,baseUrl:saved.baseUrl,providerKind:saved.providerKind,protocol:saved.protocol,headers:{},apiKey:null,clearSecret:false};
+      assert.equal((await d.ipc('discover_connection_models',{input})).status,'available');
+      const before=server.modelRequests.length;
+      assert.equal((await d.ipc('discover_connection_models',{input:{...input,baseUrl:'https://models.example.invalid/other'}})).status,'credentialRequired');
+      assert.equal(server.modelRequests.length,before);
+      for(const [route,status] of [['unauthorized','unauthorized'],['schema','schemaError'],['redirect','unsupported']]) {
+        const result=await d.ipc('discover_connection_models',{input:{...input,apiKey:'fixture-discovery-key',baseUrl:`https://models.example.invalid/${route}/v1`}});
+        assert.equal(result.status,status);assert.equal(result.models.length,0);assert.doesNotMatch(JSON.stringify(result),/PRIVATE_DISCOVERY|fixture-discovery-key/);
+      }
+      const anthropic=await d.ipc('discover_connection_models',{input:{...input,apiKey:'fixture-discovery-key',baseUrl:'https://models.example.invalid/anthropic/v1/messages',protocol:'messages',providerKind:'anthropic'}});
+      assert.equal(anthropic.status,'available');assert.equal(anthropic.models.length,2);
+      assert.equal(server.modelRequests.filter(r=>r.anthropic&&r.version).length,2);
+      assert.ok(!server.methods.includes('/stolen-key'));
+      await d.click(`[data-action="edit-connection"][data-id="${saved.id}"]`);
+      await d.browser.$('#api-key').setValue('fixture-discovery-key');
+      await d.browser.$('#base-url').setValue('https://models.example.invalid/unauthorized/v1');
+      await d.click('[data-model-fetch]');
+      await until(async()=>await d.browser.$('#model-discovery').getAttribute('data-status')==='unauthorized','Failure status was not shown');
+      assert.match(await d.browser.$('#models').getValue(),/manual-model \| Keep this name/);
+      await d.browser.$('#base-url').setValue('https://models.example.invalid/delayed/v1');
+      await d.click('[data-model-fetch]');
+      await d.browser.$('#base-url').setValue('');
+      await new Promise(resolve=>setTimeout(resolve,1400));
+      assert.equal(await d.browser.$('#model-discovery').getAttribute('data-status'),'idle');
+      assert.equal(await d.browser.$('[data-model-results]').isDisplayed(),false);
+      await d.click('.modal-header [data-modal-close]');
+      await d.ipc('delete_connection',{connectionId:saved.id});
+      return {native:'WebView2 -> Tauri IPC -> Rust GET -> local HTTP fixtures',credentials:'synthetic only',requests:server.modelRequests.length};
+    });
+    await step('B28 Home add/edit/select/deployment preview stays on Home without automatic deployment', async () => {
+      await d.click('#primary-nav [data-route="overview"]');
+      const before=(await d.ipc('get_dashboard')).deployments.length;
+      await d.click('.setup-connection-card [data-action="add-connection"]');
+      for(const [selector,value] of [['#connection-name','Home connection'],['#base-url','https://models.example.invalid/v1'],['#models','home-model | Home Model']]) await d.browser.$(selector).setValue(value);
+      await d.click('#save-connection');
+      await until(async()=>(await d.ipc('get_dashboard')).connections.some(c=>c.name==='Home connection'),'Home connection did not save');
+      let current=(await d.ipc('get_dashboard')).connections.find(c=>c.name==='Home connection');
+      await until(async()=>(await d.ipc('get_setup_status')).preferences.connectionId===current.id,'Home did not select newly saved connection');
+      await until(async()=>await d.browser.$('#setup-connection').getValue()===current.id,'Home selection was not rendered');
+      assert.equal(await d.browser.$('#content').getAttribute('data-route'),'overview');
+      await d.click('.setup-connection-card [data-action="edit-connection"]');
+      assert.equal(await d.browser.$('#base-url').getValue(),current.baseUrl);
+      await d.browser.$('#models').setValue('home-model | Renamed Home Model\nsecond-model | Second Model');
+      await d.click('#save-connection');
+      await until(async()=>(await d.ipc('get_dashboard')).connections.find(c=>c.id===current.id).models.length===2,'Home edit did not save');
+      await until(async()=>(await d.browser.$('.setup-connection-card').getText()).includes('2 enabled models'),'Home model summary did not refresh');
+      assert.equal((await d.ipc('get_dashboard')).deployments.length,before);
+      if(options.evidenceRoot) await d.browser.saveScreenshot(path.join(options.evidenceRoot,'native-home-connections.png'));
+      await d.click('.setup-connection-card [data-action="setup-deploy"]');
+      await d.click('#preview-deployment');
+      await d.browser.$('button=Apply supported changes').waitForExist();
+      assert.equal((await d.ipc('get_dashboard')).deployments.length,before);
+      await d.click('.modal-header [data-modal-close]');
+      await d.ipc('delete_connection',{connectionId:current.id});
+    });
+    await step('B29 VS Code sign-in never spawns and scopes the reviewed client', async () => {
+      await d.click('#primary-nav [data-route="overview"]');
+      const checks=await d.browser.$('.setup-checks');
+      if(await checks.getAttribute('open')===null) await d.click('.setup-checks > summary');
+      await d.click('[data-action="setup-signin"][data-surface="vsCodeCopilot"]');
+      await d.browser.$('.account-plan-operation').waitForExist();
+      assert.equal((await d.browser.$$('.account-plan-operation')).length,1);
+      await d.click('.account-modal .modal-header [data-account-modal-close]');
+      for(const open of [false,true,false]) {
+        if(open) write('private/vscode-window-open','1');
+        else if(fs.existsSync(file('private/vscode-window-open'))) fs.unlinkSync(file('private/vscode-window-open'));
+        // The spawn fault must remain unconsumed throughout all VS Code actions.
+        fault('fail:login');
+        const plan=await d.ipc('preview_login',{surfaces:['vsCodeCopilot']});
+        assert.equal(plan.operations.length,1);
+        const result=await d.ipc('apply_login_plan',{planId:plan.id});
+        assert.equal(result.run.steps[0].status,'actionRequired');
+        assert.match(result.run.steps[0].detail,open?/existing VS Code window/:/Open VS Code yourself/);
+        assert.equal(fs.existsSync(file('fault.json')),true);
+        await assert.rejects(d.ipc('apply_login_plan',{planId:plan.id}));
+        fs.unlinkSync(file('fault.json'));
+      }
     });
   } finally {
     try { await d?.stop(); await server.close(); record('B cleanup: owned driver, app and loopback ports', 'PASS', 'Closed owned process tree; fixtures retained privately'); }

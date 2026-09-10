@@ -326,6 +326,10 @@ A login display name alone is insufficient. Inferred identity requires confirmat
 
 PilotWeave does not silently sign out a client and never copies authentication material between clients.
 
+Home exposes a separate reviewed sign-in action for each client. On Windows, VS Code account actions only focus an existing visible editor window whose process executable matches the resolved installation. They never spawn VS Code: an initial launch can restore multiple saved windows and hot-exit backups, even with `--new-window`. If no matching window exists (or on another platform), the result gives manual Accounts instructions and remains ActionRequired. No window titles, editor state, authentication stores, or restore settings are read or changed. Other clients retain their bounded, backend-owned official launch plans. An installed client without a safe launcher is Unsupported, distinct from NotInstalled. See [local validation](local-validation-plan.md) for the failure and regression scope.
+
+Home places the current Connection and enabled models before installation/account checks. Add and Edit open the same validated connection form in place; saving selects that Connection on Home without applying it to clients. Model discovery, editing, and deployment preview are separate actions. In-sync deployment details and completed installation/account checks can be collapsed, while unavailable evidence and manual confirmations remain explicit.
+
 ### PilotWeave GitHub authorization
 
 Official personal usage/Billing retrieval uses PilotWeave-owned authorization, separate from all client sign-ins. Store the token in the OS credential store and persist only host, login, scopes/capabilities, last validation, and secret reference.
@@ -458,6 +462,8 @@ Provider projection remains detection/manual guidance until a stable external in
 CLI and app may share runtime/session data. Deduplication must use physical source identity so the same record is not counted twice.
 
 ## Command boundary
+
+Connection catalog discovery is a separate read-only native module. The editor can query an unsaved endpoint and add selected results to its existing model form without a persistence migration or deployment. Its saved-credential binding, provider schemas, bounds and failure states are documented in [provider model discovery](provider-model-discovery.md).
 
 Tauri commands are thin, validated entry points. Long-running install, login, and usage sync operations expose:
 

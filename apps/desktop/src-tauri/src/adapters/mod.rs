@@ -3,6 +3,7 @@ pub mod github_app;
 pub mod vscode;
 #[cfg(windows)]
 pub(crate) mod vscode_install;
+pub(crate) mod vscode_window;
 
 use crate::domain::{ClientKind, ClientStatus, ClientTarget, Connection, DeploymentPlan};
 use crate::error::{AppError, AppResult};

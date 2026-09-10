@@ -57,6 +57,9 @@ B 覆盖表（具体通过情况见每次报告）：
 | B19–B22 | 损坏/未来 SQLite 不重建、主状态与 last-good 恢复、跨进程写锁、退出成功但组件未发现仍为失败 |
 | B23–B25 | 用户确认与 Verified 区分、确认过期/证据变化、授权更改丢弃迟到 Billing、模型别名 v2 的导入/过滤/绑定 |
 | B26 | VS Code CLI 替身强制检查入口脚本和 Node 模式；探测失败为 Unknown，单项/全量安装计划均拒绝 |
+| B27 | 实际 Tauri IPC 请求本地模型目录夹具；URL/key 发现、筛选追加、保存/凭据复用、HTTP 错误及关闭后的迟到响应 |
+| B28 | 首页原位新增/编辑连接、保存后选中、模型摘要刷新；预览部署前后均不产生配置部署 |
+| B29 | 首页只预览选定客户端；VS Code 关闭/已打开/重复登录操作均不调用进程启动，保持原生计划一次性消费 |
 
 计划 TTL、更多目标消失/不可读的恢复组合、客户端输入语义/共享 runtime 去重、价格旧响应等还有既有 Rust/浏览器回归；并非每项都另有原生 UI 重复用例。结果应引用相应层级。
 
@@ -69,6 +72,10 @@ B 覆盖表（具体通过情况见每次报告）：
 2026-09-10 补充：旧 C1 仅记录组件状态，漏掉了 GUI 探测打开 VS Code 窗口以及内置 Copilot 被误报为缺失的问题，不能作为这两项已验证的证据。现在 C1 先直接启动无参数默认 EXE（不经 WebDriver），再执行原有 IPC 验收，并用只读窗口观察器覆盖启动、三次重复检测和重启。观察器每 100 ms 枚举可见顶层窗口，只返回程序名/PID/窗口句柄；既有 VS Code 窗口作为基线保留，出现新增 VS Code/Insiders 窗口即失败。未知/缺失组件记录 BLOCKED。可在私有验收清单的 `expectedComponents` 中记录独立核对的组件 ID/status/version，并与实际 IPC 结果逐项比对。检测实现和已核对版本见 [VS Code 检测](vscode-detection.md)。
 
 当前 CLI 导入只能选择 source，日期查询不能限制导入时读取旧日志；因此真实新日志导入仍放在 C2 的空白用户内执行。
+
+2026-09-11 登录路径补充：启动/重扫时没有新增窗口，不能证明点击登录同样安全。实际旧版登录调用一次 `Code.exe --reuse-window` 后，VS Code 恢复了大量保存窗口。官方 [windowsMainService](https://github.com/microsoft/vscode/blob/main/src/vs/platform/windows/electron-main/windowsMainService.ts) 的初始启动逻辑还会恢复 hot-exit 备份；[app.ts](https://github.com/microsoft/vscode/blob/main/src/vs/code/electron-main/app.ts) 的 `--new-window` 不能覆盖这些恢复分支。已与本机 1.137.0 / 645f29cc3176500b4b5762ba887cf2a7f0ffdf2c 安装代码核对。修复后登录不再启动 VS Code，只定位已有窗口；未打开时显示手动指引。B29 的已打开窗口为替身；真实环境另测关闭状态的重复登录并观察新增窗口/进程，不据此宣称真实登录或已打开窗口的聚焦通过。既有恢复设置和用户文件保持原状。
+
+窗口适配器先检查窗口类，不查询标题或标题长度；[GetWindowTextLengthW](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getwindowtextlengthw) 对本进程窗口可能发送同步消息。恢复最小化窗口使用 [ShowWindowAsync](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-showwindowasync)，避免等待无响应的客户端。Windows 单元回归创建本测试进程拥有的离屏窗口，故意不处理消息，验证定位在 2 秒内返回并由窗口所属线程清理；不创建或操作真实客户端窗口。
 
 ## C2：后续专用用户验收
 

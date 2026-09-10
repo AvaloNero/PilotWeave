@@ -202,6 +202,7 @@ pub struct StoredLoginPlan {
     pub plan: LoginPlan,
     account_fingerprint: String,
     executables: BTreeMap<LoginSurface, ExecutableLoginOperation>,
+    skip_statuses: BTreeMap<LoginSurface, LoginStepStatus>,
 }
 
 #[derive(Default)]
@@ -221,6 +222,7 @@ impl LoginPlanStore {
         let status = discover_status(Vec::new(), None);
         let mut operations = Vec::new();
         let mut executables = BTreeMap::new();
+        let mut skip_statuses = BTreeMap::new();
 
         for surface in &surfaces {
             let installed = status
@@ -230,6 +232,7 @@ impl LoginPlanStore {
                 .map(|item| item.state != AccountObservationState::NotInstalled)
                 .unwrap_or(false);
             if !installed {
+                skip_statuses.insert(*surface, LoginStepStatus::SkippedNotInstalled);
                 operations.push(LoginOperation {
                     surface: *surface,
                     title: format!("Sign in to {}", surface.display_name()),
@@ -244,18 +247,25 @@ impl LoginPlanStore {
                 Ok(executable) => {
                     operations.push(LoginOperation {
                         surface: *surface,
-                        title: format!("Open {} sign-in", surface.display_name()),
+                        title: if *surface == LoginSurface::VsCodeCopilot {
+                            "VS Code account instructions".to_string()
+                        } else {
+                            format!("Open {} sign-in", surface.display_name())
+                        },
                         description: operation_description(*surface).to_string(),
                         supported: true,
                     });
                     executables.insert(*surface, executable);
                 }
-                Err(error) => operations.push(LoginOperation {
-                    surface: *surface,
-                    title: format!("Sign in to {}", surface.display_name()),
-                    description: redact::redact_text(&error.to_string()),
-                    supported: false,
-                }),
+                Err(error) => {
+                    skip_statuses.insert(*surface, LoginStepStatus::Unsupported);
+                    operations.push(LoginOperation {
+                        surface: *surface,
+                        title: format!("Sign in to {}", surface.display_name()),
+                        description: redact::redact_text(&error.to_string()),
+                        supported: false,
+                    });
+                }
             }
         }
 
@@ -277,6 +287,7 @@ impl LoginPlanStore {
                 plan: plan.clone(),
                 account_fingerprint: account_fingerprint(&status),
                 executables,
+                skip_statuses,
             },
         );
         Ok(plan)
@@ -523,11 +534,18 @@ pub fn execute_plan(stored: &StoredLoginPlan, mut run: LoginRunRecord) -> LoginR
                     .iter()
                     .map(OsStr::new)
                     .collect::<Vec<_>>();
-                match native_process::spawn_detached(&executable.path, &arguments) {
-                    Ok(()) => LoginStepResult {
+                let result = execute_account_action(
+                    operation.surface,
+                    &executable.path,
+                    &arguments,
+                    native_process::spawn_detached,
+                    adapters::vscode_window::focus_existing,
+                );
+                match result {
+                    Ok(detail) => LoginStepResult {
                         surface: operation.surface,
                         status: LoginStepStatus::ActionRequired,
-                        detail: launched_detail(operation.surface).to_string(),
+                        detail: detail.to_string(),
                     },
                     Err(error) => LoginStepResult {
                         surface: operation.surface,
@@ -537,15 +555,11 @@ pub fn execute_plan(stored: &StoredLoginPlan, mut run: LoginRunRecord) -> LoginR
                 }
             }
             None => {
-                let status = if operation
-                    .description
-                    .to_ascii_lowercase()
-                    .contains("install")
-                {
-                    LoginStepStatus::SkippedNotInstalled
-                } else {
-                    LoginStepStatus::Unsupported
-                };
+                let status = stored
+                    .skip_statuses
+                    .get(&operation.surface)
+                    .copied()
+                    .unwrap_or(LoginStepStatus::Unsupported);
                 LoginStepResult {
                     surface: operation.surface,
                     status,
@@ -572,11 +586,10 @@ pub fn execute_plan(stored: &StoredLoginPlan, mut run: LoginRunRecord) -> LoginR
     };
     run.summary = match run.status {
         LoginRunStatus::ActionRequired => {
-            "Official sign-in flows were opened; complete them in each client, then refresh account status"
-                .to_string()
+            "Follow the account instructions below, then refresh account status".to_string()
         }
         LoginRunStatus::Partial => {
-            "Some sign-in flows opened while other clients could not be launched".to_string()
+            "Some account actions require attention; follow each client's result below".to_string()
         }
         LoginRunStatus::Failed => "No sign-in flow could be launched".to_string(),
         _ => "Sign-in run finished".to_string(),
@@ -798,7 +811,7 @@ fn executable_operation(surface: LoginSurface) -> AppResult<ExecutableLoginOpera
     })?;
     let fingerprint = native_process::fingerprint_regular_file(&path)?;
     let arguments = match surface {
-        LoginSurface::VsCodeCopilot => vec!["--reuse-window".to_string()],
+        LoginSurface::VsCodeCopilot => Vec::new(),
         LoginSurface::CopilotCli => vec![
             "login".to_string(),
             "--host".to_string(),
@@ -817,7 +830,7 @@ fn executable_operation(surface: LoginSurface) -> AppResult<ExecutableLoginOpera
 fn operation_description(surface: LoginSurface) -> &'static str {
     match surface {
         LoginSurface::VsCodeCopilot => {
-            "Launch the discovered VS Code application; complete sign-in through its official Accounts interface"
+            "Focus an already-open VS Code window and use Accounts. If VS Code is closed, open it yourself; PilotWeave will not restore its saved windows"
         }
         LoginSurface::CopilotCli => {
             "Launch the discovered Copilot CLI with its official github.com browser sign-in flow"
@@ -831,7 +844,7 @@ fn operation_description(surface: LoginSurface) -> &'static str {
 fn launched_detail(surface: LoginSurface) -> &'static str {
     match surface {
         LoginSurface::VsCodeCopilot => {
-            "VS Code was opened. Complete or verify GitHub sign-in in the Accounts interface; no credential was copied"
+            adapters::vscode_window::SWITCH
         }
         LoginSurface::CopilotCli => {
             "Copilot CLI browser sign-in was launched with github.com fixed by the backend; complete the browser flow and verify with /user"
@@ -840,6 +853,20 @@ fn launched_detail(surface: LoginSurface) -> &'static str {
             "GitHub Copilot app was opened. Complete its Sign in to GitHub flow; no private app state was read or written"
         }
     }
+}
+
+fn execute_account_action(
+    surface: LoginSurface,
+    path: &Path,
+    arguments: &[&OsStr],
+    spawn: impl FnOnce(&Path, &[&OsStr]) -> AppResult<()>,
+    focus: impl FnOnce(&Path) -> &'static str,
+) -> AppResult<&'static str> {
+    if surface == LoginSurface::VsCodeCopilot {
+        return Ok(focus(path));
+    }
+    spawn(path, arguments)?;
+    Ok(launched_detail(surface))
 }
 
 fn canonical_surfaces(values: &[LoginSurface]) -> AppResult<Vec<LoginSurface>> {
@@ -1104,6 +1131,7 @@ mod tests {
                 plan: plan.clone(),
                 account_fingerprint: "test".to_string(),
                 executables: BTreeMap::new(),
+                skip_statuses: BTreeMap::new(),
             },
         );
         let _ = store.take(&plan.id).expect("consume");
@@ -1117,6 +1145,78 @@ mod tests {
         assert!(values.contains(&LoginSurface::VsCodeCopilot));
         assert!(values.contains(&LoginSurface::CopilotCli));
         assert!(values.contains(&LoginSurface::GithubCopilotApp));
+    }
+
+    #[test]
+    fn vscode_account_actions_never_spawn_even_when_closed_or_repeated() {
+        for detail in [
+            adapters::vscode_window::MANUAL,
+            adapters::vscode_window::FOCUSED,
+            adapters::vscode_window::SWITCH,
+        ] {
+            for _ in 0..3 {
+                let result = execute_account_action(
+                    LoginSurface::VsCodeCopilot,
+                    Path::new("fixture.exe"),
+                    &[],
+                    |_, _| panic!("VS Code must never be cold-started"),
+                    |_| detail,
+                )
+                .unwrap();
+                assert_eq!(result, detail);
+            }
+        }
+    }
+
+    #[test]
+    fn installed_but_unlaunchable_is_not_classified_from_description_text() {
+        let now = Utc::now();
+        for (surface, status, description) in [
+            (
+                LoginSurface::GithubCopilotApp,
+                LoginStepStatus::Unsupported,
+                "The app is installed but a safe regular launcher was not resolved",
+            ),
+            (
+                LoginSurface::CopilotCli,
+                LoginStepStatus::SkippedNotInstalled,
+                "Component missing",
+            ),
+        ] {
+            let plan = LoginPlan {
+                id: "typed-skip".into(),
+                target_identity: None,
+                requested_surfaces: vec![surface],
+                operations: vec![LoginOperation {
+                    surface,
+                    title: "Sign in".into(),
+                    description: description.into(),
+                    supported: false,
+                }],
+                created_at: now,
+                expires_at: now + ChronoDuration::minutes(15),
+            };
+            let run = LoginRunRecord {
+                id: "run".into(),
+                plan_id: plan.id.clone(),
+                target_identity: None,
+                requested_surfaces: vec![surface],
+                status: LoginRunStatus::InProgress,
+                steps: Vec::new(),
+                summary: String::new(),
+                started_at: now,
+                finished_at: None,
+            };
+            let stored = StoredLoginPlan {
+                plan,
+                account_fingerprint: "fixture".into(),
+                executables: BTreeMap::new(),
+                skip_statuses: BTreeMap::from([(surface, status)]),
+            };
+            let result = execute_plan(&stored, run);
+            assert_eq!(result.steps[0].status, status);
+            assert_eq!(result.steps[0].detail, description);
+        }
     }
 
     #[test]

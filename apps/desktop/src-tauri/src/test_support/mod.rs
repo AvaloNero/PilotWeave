@@ -304,6 +304,8 @@ pub fn endpoint(url: &str) -> String {
         format!("/github/{path}")
     } else if url == "https://openrouter.ai/api/v1/models" {
         "/prices".into()
+    } else if let Some(path) = url.strip_prefix("https://models.example.invalid/") {
+        format!("/model-discovery/{path}")
     } else {
         "/rejected".into()
     };

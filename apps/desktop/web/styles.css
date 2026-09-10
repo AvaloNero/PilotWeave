@@ -928,6 +928,22 @@ textarea:focus {
   border-color: rgba(255, 123, 143, 0.4);
 }
 
+.model-discovery { padding: 14px; border: 1px solid var(--border); border-radius: 10px; }
+.model-discovery-actions { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.discovered-models { max-height: 200px; overflow: auto; margin: 10px 0; }
+.discovered-models label { display: flex; gap: 8px; padding: 5px 0; align-items: flex-start; overflow-wrap: anywhere; }
+.discovered-models input[type="checkbox"] { width: auto; height: auto; margin: 3px 0 0; flex-shrink: 0; }
+.model-discovery[data-status="loading"] [data-model-status] { color: var(--accent); }
+
+.setup-connection-card { margin-bottom: 20px; }
+.setup-connection-card > .step-body { width: 100%; }
+.setup-connection-controls { display: flex; gap: 10px; align-items: flex-end; flex-wrap: wrap; }
+.setup-connection-controls .setup-select { flex: 1 1 250px; }
+.setup-connection-controls button { margin-bottom: 2px; }
+.setup-endpoint { overflow-wrap: anywhere; }
+.setup-checks > summary, .setup-target-details > summary { cursor: pointer; color: var(--muted); padding: 12px 0; }
+.setup-target-details { margin-top: 10px; }
+
 @keyframes toast-in {
   from {
     opacity: 0;
