@@ -80,6 +80,7 @@ pub fn initialize() -> AppResult<()> {
         "copilot.exe",
         "code.exe",
         "github-copilot.exe",
+        "pwsh.exe",
     ] {
         let path = checked(&format!("bin/{name}"))?;
         if !path.exists() {
@@ -185,7 +186,13 @@ pub fn credential(reference: &str, change: Option<Option<&str>>) -> AppResult<Op
     }
 }
 pub fn registry(name: &str, change: Option<Option<&[u8]>>) -> AppResult<Option<Vec<u8>>> {
-    if !name.starts_with("COPILOT_") || !name.bytes().all(|c| c.is_ascii_uppercase() || c == b'_') {
+    if (!name.starts_with("COPILOT_")
+        && !matches!(
+            name,
+            "PILOTWEAVE_COPILOT_OWNER_ID" | "PILOTWEAVE_COPILOT_CONNECTION_ID"
+        ))
+        || !name.bytes().all(|c| c.is_ascii_uppercase() || c == b'_')
+    {
         return Err(invalid());
     }
     let path = checked(&format!("private/registry/{name}"))?;
@@ -210,6 +217,7 @@ pub fn executable(name: &str) -> Option<PathBuf> {
     let file = match name.to_ascii_lowercase().as_str() {
         "winget.exe" => "winget.exe",
         "gh.exe" | "gh" => "gh.exe",
+        "pwsh.exe" => "pwsh.exe",
         "copilot.exe" | "copilot" | "copilot.cmd" if installed("copilot-cli") => "copilot.exe",
         "code.exe" | "code" if installed("vscode") => "vscode/Code.exe",
         "github-copilot.exe" if installed("copilot-app") => "github-copilot.exe",
@@ -245,7 +253,9 @@ pub fn process(
     let _ = mode;
     let mut stdout = String::new();
     let mut code = 0;
-    if args.first().map(String::as_str) == Some("install") {
+    if args.as_slice() == ["source", "export", "winget"] {
+        stdout = include_str!("../../tests/fixtures/installer/winget-source-export-v1.json").into();
+    } else if args.first().map(String::as_str) == Some("install") {
         let name = match args.get(2).map(String::as_str) {
             Some("Microsoft.VisualStudioCode") => "vscode",
             Some("GitHub.Copilot") => "copilot-cli",
@@ -272,6 +282,20 @@ pub fn process(
         if installed("vscode-copilot") {
             stdout = "GitHub.copilot-chat@0.65.0\n".into();
         }
+    } else if args.as_slice() == ["--version"] {
+        stdout = if executable
+            .file_name()
+            .is_some_and(|name| name == "copilot.exe")
+        {
+            "GitHub Copilot CLI 1.0.90\n".into()
+        } else if executable
+            .file_name()
+            .is_some_and(|name| name == "pwsh.exe")
+        {
+            "PowerShell 7.5.3\n".into()
+        } else {
+            return Err(invalid());
+        };
     } else if args.first().map(String::as_str) == Some("api") {
         if installed("signed-in") {
             stdout = r#"{"login":"fixture-user","id":42}"#.into();

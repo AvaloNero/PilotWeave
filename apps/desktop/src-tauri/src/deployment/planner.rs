@@ -14,9 +14,10 @@ pub const MAX_PLAN_TARGETS: usize = 64;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct PlanContext {
-    owner_id: String,
+    pub(super) owner_id: String,
     state_revision: String,
     credential_revision: String,
+    pub(crate) ownership: Vec<super::ownership::TargetOwnership>,
 }
 
 impl PlanContext {
@@ -28,7 +29,12 @@ impl PlanContext {
                 "deployment-credential-v1",
                 secret.map(str::as_bytes),
             ),
+            ownership: Vec::new(),
         }
+    }
+    pub fn with_ownership(mut self, ownership: &[super::ownership::TargetOwnership]) -> Self {
+        self.ownership = ownership.to_vec();
+        self
     }
 }
 
@@ -37,6 +43,7 @@ pub struct StoredPlan {
     pub plan: DeploymentPlan,
     pub writes: Vec<crate::transaction::PreparedWrite>,
     pub after_fingerprints: BTreeMap<String, String>,
+    pub ownership_after: Vec<super::ownership::TargetOwnership>,
     context: PlanContext,
     connection_revision: String,
     operation_digest: String,
@@ -76,7 +83,8 @@ impl PlanStore {
                 .ok_or(AppError::PlanChanged)?;
             fingerprints.insert(target_id.clone(), fingerprint_target(target)?);
         }
-        let writes = prepare_writes(connection, secret, &mut plan, targets)?;
+        let (writes, ownership_after) =
+            prepare_writes(connection, secret, &mut plan, targets, &context)?;
         let mut after_fingerprints = BTreeMap::new();
         for target in targets
             .iter()
@@ -93,6 +101,7 @@ impl PlanStore {
         let stored = StoredPlan {
             writes,
             after_fingerprints,
+            ownership_after,
             connection_revision: fingerprint::json("deployment-connection-v1", connection)?,
             operation_digest: fingerprint::json("deployment-plan-v1", &plan)?,
             plan: plan.clone(),
@@ -130,7 +139,8 @@ fn validate_shape(
     targets: &[ClientTarget],
 ) -> AppResult<()> {
     if plan.connection_id != connection.id
-        || plan.target_ids.is_empty()
+        || (plan.target_ids.is_empty()
+            && plan.purpose != crate::domain::DeploymentPurpose::RevokeAndDelete)
         || plan.target_ids.len() > MAX_PLAN_TARGETS
         || plan.operations.len() != plan.target_ids.len()
     {

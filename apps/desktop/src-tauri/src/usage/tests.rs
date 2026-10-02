@@ -615,7 +615,7 @@ impl super::runtime::ReadOnlyRpc for FakeRpc {
                 Ok(json!({"protocolVersion":self.protocol,"version":"0.0.fixture"}))
             }
             "auth.getStatus" => Ok(
-                json!({"isAuthenticated":true,"login":self.login,"host":"github.com","statusMessage":"PRIVATE_TOKEN_DO_NOT_RETAIN"}),
+                json!({"isAuthenticated":true,"authType":"user","login":self.login,"host":"github.com","statusMessage":"PRIVATE_TOKEN_DO_NOT_RETAIN"}),
             ),
             "account.getQuota" => {
                 if self.quota_failure {
@@ -636,6 +636,23 @@ impl super::runtime::ReadOnlyRpc for FakeRpc {
             _ => panic!("Runtime must not create a session or invoke a prompt"),
         }
     }
+}
+#[test]
+fn official_identity_observation_does_not_request_usage_sessions_or_sensitive_status_text() {
+    use super::runtime;
+    let mut rpc = FakeRpc {
+        calls: vec![],
+        protocol: 3,
+        login: "fixture".into(),
+        quota_failure: false,
+    };
+    assert_eq!(runtime::identity_with(&mut rpc).unwrap(), "fixture");
+    assert_eq!(rpc.calls, ["connect", "auth.getStatus"]);
+    rpc.protocol = 4;
+    assert!(runtime::identity_with(&mut rpc).is_err());
+    rpc.protocol = 3;
+    rpc.login = "private@invalid".into();
+    assert!(runtime::identity_with(&mut rpc).is_err());
 }
 #[test]
 fn runtime_uses_readonly_methods_and_distinguishes_zero_unlimited_empty_and_schema_error() {
@@ -797,8 +814,11 @@ fn sensitive_usage_symlink_is_refused_without_reading_its_content() {
     #[cfg(windows)]
     let created = std::os::windows::fs::symlink_file(&target, &f.roots.vscode_otel);
     if let Err(error) = created {
-        if error.kind() == std::io::ErrorKind::PermissionDenied {
-            eprintln!("Symlink creation is unavailable to this test account");
+        if (error.kind() == std::io::ErrorKind::PermissionDenied
+            || error.raw_os_error() == Some(1314))
+            && std::env::var_os("PILOTWEAVE_TEST_REQUIRE_LINKS").is_none()
+        {
+            eprintln!("SKIP: symlink creation is unavailable to this test account (Windows privilege 1314). Set PILOTWEAVE_TEST_REQUIRE_LINKS=1 to require this capability");
             return;
         }
         panic!("Could not create temporary test symlink: {error}");

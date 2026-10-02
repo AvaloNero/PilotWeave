@@ -149,6 +149,20 @@ export async function nativeSuite(options, record) {
       await d.click('[data-usage-action="sync"]');
       await until(async()=>!(await d.browser.$('[data-usage-action="sync"]').getText()).includes('Importing'),'UI import did not finish');
       await d.browser.$('#usage-filters select[name="sourceId"]').selectByAttribute('value','vscode-otel');
+      // Fixed fixture dates must not depend on the moving default 30-day range.
+      // Native date controls interpret keyboard input in the OS locale. Set the
+      // canonical value, then use the real form submission and native query.
+      const dates = await d.browser.execute((start, end) => {
+        const form = document.querySelector('#usage-filters');
+        for (const [name, value] of [['start', start], ['end', end]]) {
+          const input = form.elements.namedItem(name);
+          input.value = value;
+          input.dispatchEvent(new Event('input', { bubbles: true }));
+          input.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+        return { start: form.elements.namedItem('start').value, end: form.elements.namedItem('end').value, valid: form.checkValidity() };
+      }, query.start, query.end);
+      assert.deepEqual(dates, { start: query.start, end: query.end, valid: true });
       await d.click('#usage-filters button[type="submit"]');
       await until(async()=>(await d.browser.$('.usage-metrics > div:first-child strong').getText())==='1000','Native Usage metrics did not refresh');
       assert.equal(await d.browser.$('.usage-metrics > div:nth-child(5) strong').getText(),'0');
@@ -388,7 +402,7 @@ export async function nativeSuite(options, record) {
       await d.click('#primary-nav [data-route="overview"]');
       const before=(await d.ipc('get_dashboard')).deployments.length;
       await d.click('.setup-connection-card [data-action="add-connection"]');
-      for(const [selector,value] of [['#connection-name','Home connection'],['#base-url','https://models.example.invalid/v1'],['#models','home-model | Home Model']]) await d.browser.$(selector).setValue(value);
+      for(const [selector,value] of [['#connection-name','Home connection'],['#base-url','https://models.example.invalid/v1'],['#api-key','fixture-home-key'],['#models','home-model | Home Model']]) await d.browser.$(selector).setValue(value);
       await d.click('#save-connection');
       await until(async()=>(await d.ipc('get_dashboard')).connections.some(c=>c.name==='Home connection'),'Home connection did not save');
       let current=(await d.ipc('get_dashboard')).connections.find(c=>c.name==='Home connection');
@@ -404,6 +418,13 @@ export async function nativeSuite(options, record) {
       assert.equal((await d.ipc('get_dashboard')).deployments.length,before);
       if(options.evidenceRoot) await d.browser.saveScreenshot(path.join(options.evidenceRoot,'native-home-connections.png'));
       await d.click('.setup-connection-card [data-action="setup-deploy"]');
+      // B08/B16 deliberately left externally changed, detached CLI state. It
+      // must not be adopted by this independent Home UI preview.
+      const vsTarget=(await d.ipc('get_dashboard')).clients.find(c=>c.kind==='vs-code-copilot'&&c.detected);
+      await d.click('.modal-body details > summary');
+      for(const checkbox of await d.browser.$$('input[name="deployment-target"]')) {
+        if(await checkbox.isEnabled() && await checkbox.isSelected() !== ((await checkbox.getValue())===vsTarget.id)) await checkbox.click();
+      }
       await d.click('#preview-deployment');
       await d.browser.$('button=Apply supported changes').waitForExist();
       assert.equal((await d.ipc('get_dashboard')).deployments.length,before);
@@ -432,6 +453,78 @@ export async function nativeSuite(options, record) {
         await assert.rejects(d.ipc('apply_login_plan',{planId:plan.id}));
         fs.unlinkSync(file('fault.json'));
       }
+    });
+    await step('B30 Authored MCP/Skills/Instructions publish, stale rejection and reviewed revoke', async () => {
+      const mcp = file('home/.copilot/mcp-config.json');
+      fs.mkdirSync(path.dirname(mcp),{recursive:true});
+      fs.writeFileSync(mcp,JSON.stringify({mcpServers:{foreign:{type:'http',url:'https://user.example.invalid/mcp',headers:{authorization:'PRIVATE_RESOURCE_FIXTURE'}}},userSetting:true}));
+      for(const kind of ['mcp','skill','instructions']) {
+        const resource = await d.ipc('upsert_resource',{input:{name:'Native '+kind,kind,body:kind==='mcp'?'https://service.example.invalid/mcp':'# Authored fixture\nNo imported conversation content.'}});
+        const review=()=>d.ipc('preview_resource_sync',{resourceId:resource.id,revokeAndDelete:false});
+        const stale=await review();
+        await d.ipc('upsert_resource',{input:{id:resource.id,name:'Updated '+kind,kind,body:resource.body}});
+        await assert.rejects(d.ipc('apply_resource_plan',{planId:stale.id,confirmed:true}),/changed|stale/i);
+        const plan=await review(); assert.ok(plan.operations.some(o=>o.supported));
+        assert.doesNotMatch(JSON.stringify(plan),/PRIVATE_RESOURCE_FIXTURE/);
+        assert.ok(plan.operations.some(o=>o.supported&&o.change==='create'&&o.destination&&o.contentPreview));
+        await d.ipc('apply_resource_plan',{planId:plan.id,confirmed:true});
+        await assert.rejects(d.ipc('apply_resource_plan',{planId:plan.id,confirmed:true}),/consumed|expired|unknown/i);
+        assert.ok((await d.ipc('get_resources')).bindings.some(b=>b.resourceId===resource.id));
+        if(kind==='skill') assert.ok(fs.existsSync(file(`home/.copilot/skills/pilotweave-${resource.id}/SKILL.md`)));
+        const revoke=await d.ipc('preview_resource_sync',{resourceId:resource.id,revokeAndDelete:true});
+        await d.ipc('apply_resource_plan',{planId:revoke.id,confirmed:true});
+        assert.ok(!(await d.ipc('get_resources')).resources.some(r=>r.id===resource.id));
+      }
+      const preserved=JSON.parse(fs.readFileSync(mcp,'utf8'));
+      assert.equal(preserved.userSetting,true);assert.equal(preserved.mcpServers.foreign.url,'https://user.example.invalid/mcp');
+      await d.click('#primary-nav [data-route="resources"]');
+      assert.match(await d.browser.$('#content').getText(),/Resources|authored resources/);
+      await d.click('[data-resource-action="add"]');
+      await d.browser.$('#resource-form input[name="name"]').setValue('UI resource fixture');
+      await d.browser.$('#resource-form textarea[name="body"]').setValue('Use clear names. This is authored test content, not an imported conversation.');
+      await d.click('#save-resource');
+      await until(async()=>(await d.ipc('get_resources')).resources.some(r=>r.name==='UI resource fixture'),'Resource form did not save through native IPC');
+      const authored=(await d.ipc('get_resources')).resources.find(r=>r.name==='UI resource fixture');
+      assert.equal((await d.ipc('get_resources')).bindings.some(b=>b.resourceId===authored.id),false);
+      await d.click(`[data-resource-action="publish"][data-resource-id="${authored.id}"]`);
+      await d.click('#review-resource');
+      await until(async()=>(await d.browser.$('#resource-plan').getText()).includes('Create owned projection'),'Resource review did not show semantic changes');
+      await d.click('#resource-plan details > summary');
+      assert.match(await d.browser.$('#resource-plan pre').getText(),/Use clear names/);
+      if(options.evidenceRoot) await d.browser.saveScreenshot(path.join(options.evidenceRoot,'native-resource-review.png'));
+      await d.click('button=Confirm publication');
+      await until(async()=>(await d.ipc('get_resources')).bindings.some(b=>b.resourceId===authored.id),'Resource UI did not publish the reviewed plan');
+      await until(async()=>(await d.browser.$('#content').getText()).includes('last-published binding'),'Published binding was not rendered');
+      if(options.evidenceRoot) await d.browser.saveScreenshot(path.join(options.evidenceRoot,'native-resources.png'));
+      await d.click(`[data-resource-action="remove"][data-resource-id="${authored.id}"]`);
+      await d.click('#review-resource');await d.click('button=Confirm revoke and delete');
+      await until(async()=>!(await d.ipc('get_resources')).resources.some(r=>r.id===authored.id),'Resource UI did not revoke the owned publication');
+    });
+    await step('B31 Installation history and current CLI account follow-up persist without credential copying', async () => {
+      const installs=await d.ipc('get_install_runs');assert.ok(installs.length>0);assert.ok(installs.some(r=>r.status==='complete'));
+      const plan=await d.ipc('preview_login',{surfaces:['copilotCli']});
+      const started=await d.ipc('apply_login_plan',{planId:plan.id});
+      const verified=await d.ipc('verify_login_run',{runId:started.run.id});
+      assert.equal(verified.run.status,'completed');assert.equal(verified.run.observedCliLogin,'fixture-user');
+      const manual=await d.ipc('preview_login',{surfaces:['vsCodeCopilot']});
+      const manualRun=await d.ipc('apply_login_plan',{planId:manual.id});
+      const cancelled=await d.ipc('cancel_login_run',{runId:manualRun.run.id});assert.equal(cancelled.run.status,'cancelled');
+      assert.equal((await d.ipc('verify_login_run',{runId:manualRun.run.id})).run.status,'cancelled');
+      await restart();
+      assert.ok((await d.ipc('get_account_status')).loginRuns.some(r=>r.id===manualRun.run.id&&r.status==='cancelled'));
+      assert.doesNotMatch(fs.readFileSync(file('config/PilotWeave/login-runs.json'),'utf8'),/PRIVATE_TOKEN|SENTINEL/);
+    });
+    await step('B32 Owned VS Code connection revoke deletes only proven projection', async () => {
+      const fresh = await put({id:null,name:'Reviewed revoke fixture'});
+      const target=(await d.ipc('get_dashboard')).clients.find(c=>c.kind==='vs-code-copilot'&&c.detected);
+      const deployment=await d.ipc('preview_deployment',{connectionId:fresh.id,targetIds:[target.id]});
+      await d.ipc('apply_deployment_plan',{planId:deployment.id,confirmed:true});
+      const revoke=await d.ipc('preview_revoke_and_delete',{connectionId:fresh.id});
+      const result=await d.ipc('apply_deployment_plan',{planId:revoke.id,confirmed:true});
+      assert.equal(result.connectionDeleted,true);
+      assert.doesNotMatch(fs.readFileSync(settings,'utf8'),new RegExp(fresh.id));
+      assert.match(fs.readFileSync(settings,'utf8'),/Foreign/);
+      await assert.rejects(d.ipc('apply_deployment_plan',{planId:revoke.id,confirmed:true}));
     });
   } finally {
     try { await d?.stop(); await server.close(); record('B cleanup: owned driver, app and loopback ports', 'PASS', 'Closed owned process tree; fixtures retained privately'); }

@@ -37,7 +37,8 @@ uuid = { version = "1.11", features = ["v4", "serde"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 winreg = "0.52"
-windows-sys = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging", "Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_Storage_FileSystem", "Win32_Security_Authorization", "Win32_System_Registry"] }
+# WinTrust/cryptography expose the OS publisher check; no shell-based signature probe.
+windows-sys = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging", "Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_Storage_FileSystem", "Win32_Storage_Packaging_Appx", "Win32_Security_Authorization", "Win32_System_Registry", "Win32_Security_WinTrust", "Win32_Security_Cryptography", "Win32_Security_Cryptography_Catalog", "Win32_Security_Cryptography_Sip"] }
 
 [target.'cfg(unix)'.dependencies]
 # flock/O_NOFOLLOW without raising the workspace Rust 1.88 minimum.

@@ -2,6 +2,11 @@ use std::path::Path;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
+    #[error("Operation cancelled; verify any effects already completed")]
+    Cancelled,
+
+    #[error("Native process or its output pipes exceeded the time limit")]
+    TimedOut,
     #[error("PlanChanged: the connection, credential, application state, or target changed; preview again")]
     PlanChanged,
 

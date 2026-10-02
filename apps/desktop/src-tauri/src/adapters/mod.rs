@@ -84,6 +84,7 @@ pub fn preview_resolved(
 
     Ok(DeploymentPlan {
         id: Uuid::new_v4().to_string(),
+        purpose: crate::domain::DeploymentPurpose::Deploy,
         connection_id: connection.id.clone(),
         connection_name: connection.name.clone(),
         target_ids: canonical_ids,
@@ -92,6 +93,7 @@ pub fn preview_resolved(
     })
 }
 
+#[cfg(test)]
 pub fn apply_to_target(
     connection: &Connection,
     secret: Option<&str>,

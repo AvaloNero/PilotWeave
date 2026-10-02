@@ -46,7 +46,7 @@ export async function fixtures(repo) {
       body = { user: 'fixture-user', usageItems: [], timePeriod: { year: Number(url.searchParams.get('year')), month: Number(url.searchParams.get('month')) } };
       if (status === 'schema') { status = 200; body = { unsupported: true }; }
     } else if (url.pathname === '/rpc/connect') body = { protocolVersion: scenario.runtime === 'unsupported' ? 999 : 3, version: 'fixture-3' };
-    else if (url.pathname === '/rpc/auth.getStatus') body = { isAuthenticated: scenario.runtime !== 'unauthorized', host: 'github.com', login: 'fixture-user' };
+    else if (url.pathname === '/rpc/auth.getStatus') body = { isAuthenticated: scenario.runtime !== 'unauthorized', authType: 'user', host: 'github.com', login: 'fixture-user' };
     else if (url.pathname === '/rpc/account.getQuota') body = scenario.runtime === 'schema' ? { changed: true } : scenario.runtime === 'empty' ? { quotaSnapshots: {} } : JSON.parse(read('copilot-quota-v3.json'));
     else if (url.pathname === '/rpc/models.list') body = { models: [{ id: 'gpt-5', name: 'GPT-5' }] };
     else { status = 404; body = {}; }

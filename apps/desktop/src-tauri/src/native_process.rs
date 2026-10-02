@@ -5,6 +5,7 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -150,6 +151,18 @@ pub(crate) fn run_capture_with_mode(
     max_output_bytes: usize,
     mode: CaptureMode,
 ) -> AppResult<CapturedOutput> {
+    run_capture_cancelable(executable, args, timeout, max_output_bytes, mode, None)
+}
+
+pub(crate) fn run_capture_cancelable(
+    executable: &Path,
+    args: &[&OsStr],
+    timeout: Duration,
+    max_output_bytes: usize,
+    mode: CaptureMode,
+    cancel: Option<&AtomicBool>,
+) -> AppResult<CapturedOutput> {
+    check_cancel(cancel)?;
     #[cfg(feature = "local-e2e")]
     if crate::test_support::active() {
         return crate::test_support::process(executable, args, mode);
@@ -198,6 +211,7 @@ pub(crate) fn run_capture_with_mode(
     let deadline = Instant::now() + timeout;
     let result = (|| -> AppResult<CapturedOutput> {
         let status = loop {
+            check_cancel(cancel)?;
             if let Some(status) = child
                 .try_wait()
                 .map_err(|error| AppError::io(&executable, error))?
@@ -211,8 +225,8 @@ pub(crate) fn run_capture_with_mode(
         };
         // The same deadline includes pipe drains. Descendants cannot turn an
         // exited parent into an unbounded reader-thread join.
-        let (stdout, stdout_truncated) = receive_reader(out, deadline)?;
-        let (stderr, stderr_truncated) = receive_reader(err, deadline)?;
+        let (stdout, stdout_truncated) = receive_reader(out, deadline, cancel)?;
+        let (stderr, stderr_truncated) = receive_reader(err, deadline, cancel)?;
         Ok(CapturedOutput {
             status,
             stdout: String::from_utf8_lossy(&stdout).into_owned(),
@@ -292,14 +306,39 @@ fn start_reader(reader: impl Read + Send + 'static, limit: usize) -> Receiver<Re
     receiver
 }
 
-fn receive_reader(receiver: Receiver<ReaderResult>, deadline: Instant) -> ReaderResult {
-    receiver
-        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-        .map_err(|_| timeout_error())?
+fn check_cancel(cancel: Option<&AtomicBool>) -> AppResult<()> {
+    if cancel.is_some_and(|value| value.load(Ordering::Acquire)) {
+        Err(AppError::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
+fn receive_reader(
+    receiver: Receiver<ReaderResult>,
+    deadline: Instant,
+    cancel: Option<&AtomicBool>,
+) -> ReaderResult {
+    loop {
+        check_cancel(cancel)?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(timeout_error());
+        }
+        match receiver.recv_timeout(remaining.min(Duration::from_millis(50))) {
+            Ok(result) => return result,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(AppError::Config(
+                    "Native output reader stopped unexpectedly".into(),
+                ))
+            }
+        }
+    }
 }
 
 fn timeout_error() -> AppError {
-    AppError::Config("Native process or its output pipes exceeded the time limit".into())
+    AppError::TimedOut
 }
 
 fn drain_capped(mut reader: impl Read, limit: usize) -> ReaderResult {
@@ -408,6 +447,29 @@ mod tests {
         assert_eq!(env[OsStr::new("ELECTRON_RUN_AS_NODE")], None);
     }
     use std::io::Cursor;
+
+    #[test]
+    fn cancellation_before_spawn_and_during_pipe_drain_is_bounded() {
+        let cancel = AtomicBool::new(true);
+        let result = run_capture_cancelable(
+            Path::new("never-executed"),
+            &[],
+            Duration::from_secs(60),
+            1024,
+            CaptureMode::Standard,
+            Some(&cancel),
+        );
+        assert!(matches!(result, Err(AppError::Cancelled)));
+        let (_sender, receiver) = mpsc::sync_channel(1);
+        assert!(matches!(
+            receive_reader(
+                receiver,
+                Instant::now() + Duration::from_secs(60),
+                Some(&cancel)
+            ),
+            Err(AppError::Cancelled)
+        ));
+    }
 
     #[test]
     fn bounded_reader_drains_but_only_keeps_prefix() {

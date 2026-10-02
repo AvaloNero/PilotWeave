@@ -15,6 +15,7 @@ const MAX_CONFIG_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_DISCOVERED_TARGETS: usize = 64;
 const MANAGED_MARKER: &str = "pilotWeaveManaged";
 const CONNECTION_ID_FIELD: &str = "pilotWeaveConnectionId";
+const OWNER_ID_FIELD: &str = "pilotWeaveInstallationOwnerId";
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -171,6 +172,7 @@ pub fn preview(connection: &Connection, target: &ClientTarget) -> DeploymentOper
     }
 }
 
+#[cfg(test)]
 pub fn apply(
     connection: &Connection,
     secret: Option<&str>,
@@ -189,6 +191,7 @@ pub fn apply(
     Ok(format!("Updated {}", path.display()))
 }
 
+#[cfg(test)]
 pub(crate) fn prepare(
     connection: &Connection,
     secret: Option<&str>,
@@ -218,6 +221,74 @@ pub(crate) fn prepare(
         ));
     }
     Ok(write)
+}
+
+/// Only this guarded projection is used by native deployment. Legacy marker
+/// handling above remains a fixture-level renderer, not ownership authority.
+pub(crate) fn prepare_owned(
+    connection: &Connection,
+    secret: Option<&str>,
+    path: &Path,
+    owner_id: &str,
+    proofs: &[crate::deployment::ownership::TargetOwnership],
+    revoke: bool,
+) -> AppResult<(crate::transaction::PreparedWrite, Option<String>)> {
+    use crate::deployment::ownership;
+    crate::validation::validate_connection(connection)?;
+    let before = crate::safe_io::read_optional(path, MAX_CONFIG_BYTES)?;
+    let groups = read_groups(path)?;
+    let resource = crate::transaction::Resource::File(crate::safe_io::resource_path(path)?);
+    let resource_id = ownership::resource_id(&resource);
+    let candidates = groups
+        .iter()
+        .filter(|group| {
+            group.get(CONNECTION_ID_FIELD).and_then(Value::as_str) == Some(&connection.id)
+        })
+        .collect::<Vec<_>>();
+    if candidates.len() > 1 {
+        return Err(ownership::conflict());
+    }
+    for group in &candidates {
+        if !is_owned_group(group, &connection.id)
+            || group.get(OWNER_ID_FIELD).and_then(Value::as_str) != Some(owner_id)
+        {
+            return Err(ownership::conflict());
+        }
+        let projection = crate::fingerprint::json("vscode-owned-group-v1", group)?;
+        ownership::verify_projection(proofs, owner_id, &connection.id, &resource_id, &projection)?;
+    }
+    if !revoke
+        && candidates.is_empty()
+        && proofs
+            .iter()
+            .any(|proof| proof.connection_id == connection.id && proof.resource_id == resource_id)
+    {
+        return Err(ownership::conflict());
+    }
+    let mut desired = groups.clone();
+    desired.retain(|group| !is_owned_group(group, &connection.id));
+    let projection = if !revoke && connection.default_model().is_some() {
+        let mut group = render_group(connection, secret);
+        group[OWNER_ID_FIELD] = json!(owner_id);
+        let fingerprint = crate::fingerprint::json("vscode-owned-group-v1", &group)?;
+        desired.push(group);
+        Some(fingerprint)
+    } else {
+        None
+    };
+    let after = if desired == groups {
+        before.clone()
+    } else {
+        let mut bytes = serde_json::to_vec_pretty(&Value::Array(desired))
+            .map_err(|_| AppError::Config("Cannot render VS Code model configuration".into()))?;
+        bytes.push(b'\n');
+        Some(bytes)
+    };
+    let write = crate::transaction::PreparedWrite::file(path, after, false)?;
+    if write.before != before {
+        return Err(AppError::PlanChanged);
+    }
+    Ok((write, projection))
 }
 
 pub(crate) fn original_backup(
@@ -453,6 +524,7 @@ fn backup_path(path: &Path) -> PathBuf {
     path.with_extension("json.pilotweave.bak")
 }
 
+#[cfg(test)]
 fn create_backup_once(path: &Path) -> AppResult<()> {
     if !path.exists() {
         return Ok(());
@@ -469,6 +541,7 @@ fn ensure_regular_file_or_missing(path: &Path) -> AppResult<()> {
     crate::safe_file::ensure_regular_or_missing(path)
 }
 
+#[cfg(test)]
 fn atomic_write_private(path: &Path, bytes: &[u8]) -> AppResult<()> {
     crate::safe_file::atomic_write_private(path, bytes)
 }

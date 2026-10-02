@@ -6,7 +6,8 @@ use crate::adapters;
 use crate::deployment::{self, PlanContext, PlanStore, StoredPlan};
 use crate::domain::{
     ApplyResult, Connection, ConnectionInput, DashboardSnapshot, DeploymentOperation,
-    DeploymentPlan, DeploymentRecord, DeploymentStatus, UsageDbStatus, STATE_VERSION,
+    DeploymentPlan, DeploymentPurpose, DeploymentRecord, DeploymentStatus, UsageDbStatus,
+    STATE_VERSION,
 };
 use crate::error::{AppError, AppResult};
 use crate::github_auth::{
@@ -20,6 +21,7 @@ use crate::state::{DeleteConnectionResult, StateStore};
 use crate::usage_db::UsageDb;
 use chrono::Utc;
 use std::sync::{Arc, Mutex, MutexGuard};
+use tauri::Emitter;
 use tauri::State;
 use uuid::Uuid;
 
@@ -42,9 +44,11 @@ pub enum RecoveryAction {
 
 #[derive(Clone)]
 pub struct ManagedState {
-    writes: Arc<Mutex<()>>,
+    pub(crate) writes: Arc<Mutex<()>>,
+    pub(crate) resource_plans: Arc<Mutex<crate::resources::ResourcePlans>>,
     recovery_plan: Arc<Mutex<Option<RecoveryPlan>>>,
     installs: Arc<Mutex<()>>,
+    install_jobs: Arc<installer::history::InstallJobs>,
     logins: Arc<Mutex<()>>,
     store: Arc<Mutex<StateStore>>,
     plans: Arc<Mutex<PlanStore>>,
@@ -65,10 +69,15 @@ impl ManagedState {
         usage_db: Option<UsageDb>,
         usage_db_error: Option<String>,
     ) -> Self {
+        let install_jobs = Arc::new(installer::history::InstallJobs::open(
+            store.path().with_file_name("install-history.json"),
+        ));
         Self {
             writes: Arc::new(Mutex::new(())),
+            resource_plans: Arc::new(Mutex::new(crate::resources::ResourcePlans::default())),
             recovery_plan: Arc::new(Mutex::new(None)),
             installs: Arc::new(Mutex::new(())),
+            install_jobs,
             logins: Arc::new(Mutex::new(())),
             store: Arc::new(Mutex::new(store)),
             plans: Arc::new(Mutex::new(PlanStore::default())),
@@ -203,6 +212,7 @@ pub async fn preview_install(
 #[tauri::command(rename_all = "camelCase")]
 pub async fn apply_install_plan(
     state: State<'_, ManagedState>,
+    app: tauri::AppHandle,
     plan_id: String,
 ) -> Result<InstallApplyResult, String> {
     let state = state.inner().clone();
@@ -211,13 +221,45 @@ pub async fn apply_install_plan(
             .installs
             .try_lock()
             .map_err(|_| "Another installation is active".to_string())?;
+        let _write = state.writes.try_lock().map_err(|_| "Another managed write is active".to_string())?;
+        let _lease = {
+            let store = state.store().map_err(command_error)?;
+            store.ensure_writable().map_err(command_error)?;
+            deployment::ensure_no_pending_journal(store.path()).map_err(command_error)?;
+            crate::write_lock::WriteLock::acquire(store.path()).map_err(command_error)?
+        };
         let plan = state
             .install_plans()
             .and_then(|mut plans| plans.consume(&plan_id))
             .map_err(command_error)?;
-        installer::execute_plan(plan).map_err(command_error)
+        let (ticket, started) = state.install_jobs.begin(&plan).map_err(command_error)?;
+        let _ = app.emit("pilotweave:install-progress", &started);
+        let result = installer::execute_plan(plan, ticket.cancel.clone(), &mut |component, result| {
+            let progress = state.install_jobs.progress(&ticket.id, component, result)?;
+            let _ = app.emit("pilotweave:install-progress", &progress);
+            Ok(())
+        });
+        let finished = state.install_jobs.finish(&ticket.id, &result, ticket.cancel.load(std::sync::atomic::Ordering::Acquire))
+            .map_err(|_| "Installation may have changed components, but the final summary could not be saved. Rediscover and inspect interrupted history before retrying".to_string())?;
+        let _ = app.emit("pilotweave:install-progress", &finished);
+        result.map_err(command_error)
     })
     .await
+}
+
+#[tauri::command]
+pub async fn get_install_runs(
+    state: State<'_, ManagedState>,
+) -> Result<Vec<installer::history::InstallRun>, String> {
+    state.install_jobs.runs().map_err(command_error)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn cancel_install_run(
+    state: State<'_, ManagedState>,
+    run_id: String,
+) -> Result<bool, String> {
+    state.install_jobs.cancel(&run_id).map_err(command_error)
 }
 
 #[tauri::command]
@@ -284,6 +326,65 @@ pub async fn apply_login_plan(
         account_status: account::discover_status(runs, recovery),
     })
 
+    }).await
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn verify_login_run(
+    state: State<'_, ManagedState>,
+    run_id: String,
+) -> Result<LoginApplyResult, String> {
+    let state = state.inner().clone();
+    native_job(move || {
+        let _run = state
+            .logins
+            .try_lock()
+            .map_err(|_| "Another sign-in launch or verification is active".to_string())?;
+        let run = state
+            .login_store()
+            .map_err(command_error)?
+            .run(&run_id)
+            .map_err(command_error)?;
+        let observation = if account::lifecycle::needs_cli_probe(&run) {
+            Some(crate::usage::runtime::identity(
+                &std::sync::atomic::AtomicBool::new(false),
+            ))
+        } else {
+            None
+        };
+        let (run, runs, recovery) = {
+            let mut history = state.login_store().map_err(command_error)?;
+            // Re-read after the bounded probe: a concurrent Cancel wins over a
+            // late result and is never overwritten by a success observation.
+            let run = history
+                .reconcile(&run_id, observation)
+                .map_err(command_error)?;
+            (run, history.runs(), history.recovery())
+        };
+        Ok(LoginApplyResult {
+            run,
+            account_status: account::discover_status(runs, recovery),
+        })
+    })
+    .await
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn cancel_login_run(
+    state: State<'_, ManagedState>,
+    run_id: String,
+) -> Result<LoginApplyResult, String> {
+    let state = state.inner().clone();
+    native_job(move || {
+        let (run, runs, recovery) = {
+            let mut history = state.login_store().map_err(command_error)?;
+            if history.run(&run_id).map_err(command_error)?.status == account::LoginRunStatus::InProgress {
+                return Err("The official client launcher is still running; cancel follow-up after its result appears".into());
+            }
+            let run = history.cancel(&run_id).map_err(command_error)?;
+            (run, history.runs(), history.recovery())
+        };
+        Ok(LoginApplyResult { run, account_status: account::discover_status(runs, recovery) })
     }).await
 }
 
@@ -438,7 +539,8 @@ pub async fn preview_deployment(
                 store.installation_owner_id(),
                 store.revision().map_err(command_error)?,
                 secret.as_deref(),
-            );
+            )
+            .with_ownership(store.ownership());
             (connection, secret, context)
         };
         let targets = adapters::discover_all();
@@ -474,7 +576,51 @@ pub async fn apply_deployment_plan(
     .await
 }
 
+#[tauri::command(rename_all = "camelCase")]
+pub async fn preview_revoke_and_delete(
+    state: State<'_, ManagedState>,
+    connection_id: String,
+) -> Result<DeploymentPlan, String> {
+    let state = state.inner().clone();
+    native_job(move || {
+        let store = state.store().map_err(command_error)?;
+        store.ensure_writable().map_err(command_error)?;
+        deployment::ensure_no_pending_journal(store.path()).map_err(command_error)?;
+        let connection = store.connection(&connection_id).map_err(command_error)?;
+        // Pre-hardening audits do not prove that existing client data is ours.
+        if store.deployments().iter().any(|record| record.connection_id == connection_id
+            && record.status == DeploymentStatus::Applied && !record.ownership_tracked) {
+            return Err("Legacy deployments have no durable ownership proof. Review their configuration manually, or choose Detach only; no client data was changed".into());
+        }
+        let targets = adapters::discover_all();
+        let owned_ids = store.ownership().iter().filter(|proof| proof.connection_id == connection_id)
+            .map(|proof| proof.target_id.clone()).collect::<Vec<_>>();
+        let mut plan = if owned_ids.is_empty() {
+            DeploymentPlan {
+                id: Uuid::new_v4().to_string(), purpose: DeploymentPurpose::RevokeAndDelete,
+                connection_id: connection.id.clone(), connection_name: connection.name.clone(),
+                target_ids: Vec::new(), operations: Vec::new(), created_at: Utc::now(),
+            }
+        } else {
+            adapters::preview_resolved(&connection, &owned_ids, &targets).map_err(command_error)?
+        };
+        plan.purpose = DeploymentPurpose::RevokeAndDelete;
+        for operation in &mut plan.operations {
+            if !operation.supported { return Err("An owned target is unavailable; revoke it after rediscovery or explicitly choose Detach only".into()); }
+            operation.title = "Revoke owned configuration".into();
+            operation.description = "Remove only configuration proven to belong to this installation and connection".into();
+            operation.changes = vec!["Verify durable ownership and current projection fingerprint".into(),
+                "Prepare all target removals before writing; compensate on failure".into(),
+                "Delete connection and credential only after target removal commits".into()];
+        }
+        let context = PlanContext::new(store.installation_owner_id(), store.revision().map_err(command_error)?, None)
+            .with_ownership(store.ownership());
+        state.plans().and_then(|mut plans| plans.insert(&connection, None, plan, &targets, context)).map_err(command_error)
+    }).await
+}
+
 fn execute_stored_plan(state: &ManagedState, stored: StoredPlan) -> AppResult<ApplyResult> {
+    let revoke = stored.plan.purpose == DeploymentPurpose::RevokeAndDelete;
     let _write = state
         .writes
         .try_lock()
@@ -486,12 +632,17 @@ fn execute_stored_plan(state: &ManagedState, stored: StoredPlan) -> AppResult<Ap
         store.ensure_writable()?;
         deployment::ensure_no_pending_journal(store.path())?;
         let connection = store.connection(&stored.plan.connection_id)?;
-        let secret = store.secret_for(&connection)?;
+        let secret = if revoke {
+            None
+        } else {
+            store.secret_for(&connection)?
+        };
         let context = PlanContext::new(
             store.installation_owner_id(),
             store.revision()?,
             secret.as_deref(),
-        );
+        )
+        .with_ownership(store.ownership());
         (connection, secret, context)
     };
     let targets = adapters::discover_all();
@@ -566,7 +717,19 @@ fn execute_stored_plan(state: &ManagedState, stored: StoredPlan) -> AppResult<Ap
                 return Err(AppError::PlanChanged);
             }
         }
-        state.store()?.record_deployments(records.clone())?;
+        state.store()?.commit_deployment(
+            records.clone(),
+            if failed {
+                context.ownership.clone()
+            } else {
+                stored.ownership_after.clone()
+            },
+            if revoke && !failed {
+                Some(connection.id.as_str())
+            } else {
+                None
+            },
+        )?;
         Ok(records)
     });
     if let Err(error) = &recorded {
@@ -587,12 +750,27 @@ fn execute_stored_plan(state: &ManagedState, stored: StoredPlan) -> AppResult<Ap
     }
     // Notification is not part of registry persistence; failure does not undo
     // a successfully committed environment or falsely report a failed write.
-    if let Some(warning) = adapters::copilot_cli::notify_environment() {
-        log::warn!("{warning}");
+    if !failed
+        && stored
+            .plan
+            .operations
+            .iter()
+            .any(|op| op.supported && op.target_kind == crate::domain::ClientKind::CopilotCli)
+    {
+        if let Some(warning) = adapters::copilot_cli::notify_environment() {
+            log::warn!("{warning}");
+        }
     }
     Ok(ApplyResult {
         plan_id: stored.plan.id,
         records,
+        connection_deleted: revoke && !failed,
+        credential_cleanup_warning: if revoke && !failed {
+            crate::secrets::delete(&connection.secret_ref).err().map(|_|
+                "Configuration was revoked and the connection deleted, but its OS credential could not be removed".into())
+        } else {
+            None
+        },
     })
 }
 
@@ -613,6 +791,7 @@ fn record(
         created_at: Utc::now(),
         target_fingerprint: None,
         connection_revision: None,
+        ownership_tracked: true,
     }
 }
 
@@ -626,7 +805,15 @@ pub async fn preview_deployment_recovery(
         let path = deployment::journal_path(state.store().map_err(command_error)?.path());
         let action = action.unwrap_or_default();
         let allowed = match action {
-            RecoveryAction::Restore => deployment::recovery_resources().unwrap_or_default(),
+            RecoveryAction::Restore => {
+                let mut allowed = deployment::recovery_resources().unwrap_or_default();
+                if let Ok(resources) = crate::resources::recovery_resources(
+                    state.store().map_err(command_error)?.resources(),
+                ) {
+                    allowed.extend(resources);
+                }
+                allowed
+            }
             RecoveryAction::KeepCurrent => Vec::new(),
         };
         let plan = RecoveryPlan {
@@ -675,7 +862,10 @@ pub async fn apply_deployment_recovery(
         let path = deployment::journal_path(store.path());
         match plan.action {
             RecoveryAction::Restore => {
-                let allowed = deployment::recovery_resources().unwrap_or_default();
+                let mut allowed = deployment::recovery_resources().unwrap_or_default();
+                if let Ok(resources) = crate::resources::recovery_resources(store.resources()) {
+                    allowed.extend(resources);
+                }
                 crate::transaction::recover(&path, &plan.view.digest, &allowed)
             }
             RecoveryAction::KeepCurrent => {

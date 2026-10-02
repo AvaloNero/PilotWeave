@@ -24,16 +24,25 @@ pub fn recovery_resources() -> AppResult<Vec<transaction::Resource>> {
 #[cfg(test)]
 use std::fs;
 
+pub mod ownership;
 mod planner;
 pub use planner::{validate_plan, PlanContext, PlanStore, StoredPlan};
+#[cfg(test)]
+mod ownership_tests;
 
 pub(super) fn prepare_writes(
     connection: &Connection,
     secret: Option<&str>,
     plan: &mut DeploymentPlan,
     targets: &[ClientTarget],
-) -> AppResult<Vec<transaction::PreparedWrite>> {
+    context: &PlanContext,
+) -> AppResult<(
+    Vec<transaction::PreparedWrite>,
+    Vec<ownership::TargetOwnership>,
+)> {
     let mut writes = Vec::new();
+    let mut ownership_after = context.ownership.clone();
+    let revoke = plan.purpose == crate::domain::DeploymentPurpose::RevokeAndDelete;
     for operation in &mut plan.operations {
         let target = targets
             .iter()
@@ -45,12 +54,20 @@ pub(super) fn prepare_writes(
         if !target.detected || !target.supports_write {
             return Err(AppError::Unsupported("Target is not writable".into()));
         }
-        let prepared = match target.kind {
+        let (prepared, resource_id, projection) = match target.kind {
             ClientKind::VsCodeCopilot => {
                 let path = Path::new(target.path.as_deref().ok_or_else(|| {
                     AppError::Config("Missing VS Code configuration path".into())
                 })?);
-                let write = adapters::vscode::prepare(connection, secret, path)?;
+                let (write, projection) = adapters::vscode::prepare_owned(
+                    connection,
+                    secret,
+                    path,
+                    &context.owner_id,
+                    &context.ownership,
+                    revoke,
+                )?;
+                let resource_id = ownership::resource_id(&write.resource);
                 let mut prepared = Vec::new();
                 if write.changed() {
                     if let Some(before) = &write.before {
@@ -60,22 +77,52 @@ pub(super) fn prepare_writes(
                     }
                 }
                 prepared.push(write);
-                prepared
+                (prepared, resource_id, projection)
             }
-            ClientKind::CopilotCli => adapters::copilot_cli::prepare(connection, secret)?,
+            ClientKind::CopilotCli => {
+                let prepared = adapters::copilot_cli::prepare_owned(
+                    connection,
+                    secret,
+                    &context.owner_id,
+                    &context.ownership,
+                    revoke,
+                )?;
+                let projection = if revoke {
+                    None
+                } else {
+                    Some(ownership::cli_projection(&prepared, true)?)
+                };
+                (prepared, ownership::cli_resource_id(), projection)
+            }
             ClientKind::GithubCopilotApp => {
                 return Err(AppError::Unsupported(
                     "Copilot app remains manual/read-only".into(),
                 ))
             }
         };
+        ownership_after.retain(|proof| {
+            !(proof.resource_id == resource_id
+                && (target.kind == ClientKind::CopilotCli || proof.connection_id == connection.id))
+        });
+        if let Some(projection_fingerprint) = projection {
+            ownership_after.push(ownership::TargetOwnership {
+                owner_id: context.owner_id.clone(),
+                connection_id: connection.id.clone(),
+                target_id: target.id.clone(),
+                target_kind: target.kind,
+                resource_id,
+                projection_fingerprint,
+                target_fingerprint: fingerprint_target_with_writes(target, Some(&prepared))?,
+                deployed_at: chrono::Utc::now(),
+            });
+        }
         let changed = prepared.iter().filter(|write| write.changed()).count();
         operation.changes.push(format!(
             "{changed} physical resource(s) require changes; identical data is not rewritten"
         ));
         writes.extend(prepared);
     }
-    transaction::deduplicate(writes)
+    Ok((transaction::deduplicate(writes)?, ownership_after))
 }
 
 pub fn fingerprint_target(target: &ClientTarget) -> AppResult<String> {
@@ -91,6 +138,9 @@ pub(super) fn fingerprint_target_with_writes(
         serde_json::to_vec(target)
             .map_err(|_| AppError::Config("Cannot fingerprint target".into()))?,
     );
+    if target.kind == ClientKind::CopilotCli && target.detected {
+        hash.update(adapters::copilot_cli::routing_fingerprint()?.as_bytes());
+    }
     let resources = match target.kind {
         ClientKind::CopilotCli if target.detected => adapters::copilot_cli::observed_resources()?,
         ClientKind::VsCodeCopilot if target.detected => vec![transaction::Resource::File(
@@ -190,6 +240,7 @@ mod tests {
     pub(super) fn plan(connection: &Connection, target: &ClientTarget) -> DeploymentPlan {
         DeploymentPlan {
             id: "plan".to_string(),
+            purpose: crate::domain::DeploymentPurpose::Deploy,
             connection_id: connection.id.clone(),
             connection_name: connection.name.clone(),
             target_ids: vec![target.id.clone()],

@@ -31,6 +31,7 @@
       add: false,
     },
     usage: { title: "Usage", subtitle: "Official quota, personal Billing, and local observations with source coverage.", add: false },
+    resources: { title: "Resources", subtitle: "Reviewed MCP, Skills and Instructions publication through public paths.", add: false },
     about: { title: "About", subtitle: "PilotWeave", add: false },
     activity: {
       title: "Activity",
@@ -184,6 +185,10 @@
     switch (command) {
       case "get_dashboard":
         return structuredClone(demoState);
+      case "get_install_runs":
+        return [];
+      case "get_resources":
+        return { resources: [], bindings: [], detail: "Browser preview has no native resource catalog" };
       case "upsert_connection": {
         const input = args.input;
         const existing = input.id
@@ -384,10 +389,10 @@
     refreshButton.disabled = true;
     content.innerHTML = '<div class="loading"><div><div class="spinner"></div>Loading local state…</div></div>';
     try {
-      await loadSections([["dashboard", "get_dashboard"], ["components", "get_installation_status"], ["setup", "get_setup_status"], ["authorization", "get_github_authorization_status"], ...usageSections()]);
+      await loadSections([["dashboard", "get_dashboard"], ["components", "get_installation_status"], ["installRuns", "get_install_runs"], ["resources", "get_resources"], ["setup", "get_setup_status"], ["authorization", "get_github_authorization_status"], ...usageSections()]);
       if (!data.dashboard) throw new Error(data.errors.dashboard);
       snapshot = data.dashboard;
-      window.PilotWeaveInstaller.hydrate(data.components);
+      window.PilotWeaveInstaller.hydrate(data.components, data.installRuns);
       window.PilotWeaveAccount.hydrate(data.setup?.accounts);
       window.PilotWeaveGithubAuth.hydrate(data.authorization);
       setRuntimeState();
@@ -428,6 +433,7 @@
       connections: renderConnections,
       clients: renderClients,
       usage: () => window.PilotWeaveUsage.render(snapshot, data, isDesktop),
+      resources: () => window.PilotWeaveResources.render(data.resources, data.errors.resources, isDesktop, Boolean(snapshot.stateRecovery || snapshot.deploymentRecovery)),
       about: () => '<section class="setting-row"><div><h2>PilotWeave</h2><p>An independent Copilot setup tool. Pre-release; not affiliated with GitHub.</p><p>Configuration is local. Client authentication stays in each official client.</p></div></section>',
       activity: renderActivity,
       settings: renderSettings,
@@ -472,10 +478,11 @@
   function renderActivity() {
     const entries = [
       ...snapshot.deployments.map((r) => ({ time: r.createdAt, kind: "Deployment / rollback", source: r.targetId, status: r.status, detail: r.detail, route: "connections" })),
+      ...(data.installRuns ?? []).map((r) => ({ time: r.finishedAt ?? r.startedAt, kind: "Installation", source: r.componentIds.join(", "), status: r.status, detail: r.detail, route: "clients" })),
       ...(data.setup?.accounts?.loginRuns ?? []).map((r) => ({ time: r.finishedAt ?? r.startedAt, kind: "Official sign-in", source: r.requestedSurfaces.join(", "), status: r.status, detail: r.summary, route: "clients" })),
       ...(data.runs ?? []).map((r) => ({ time: r.finishedAt ?? r.startedAt, kind: "Import / refresh", source: r.sourceId, status: r.status, detail: r.detail, route: "usage" })),
     ].sort((a, b) => Date.parse(b.time) - Date.parse(a.time));
-    return `<section class="usage-panel"><div class="step-heading"><h2>Recent activity</h2><span>Local, redacted history</span></div>${data.errors.runs ? `<p class="inline-error">${escapeHtml(data.errors.runs)}</p>` : ""}
+    return `<section class="usage-panel"><div class="step-heading"><h2>Recent activity</h2><span>Local, redacted history</span></div>${[data.errors.runs, data.errors.installRuns].filter(Boolean).map((error) => `<p class="inline-error">${escapeHtml(error)}</p>`).join("")}
       ${entries.length ? `<div class="usage-table-wrap"><table class="usage-table"><thead><tr><th>Time</th><th>Operation</th><th>Target / source</th><th>Status</th><th>Detail</th><th>Next step</th></tr></thead><tbody>${entries.slice(0, 200).map((r) => `<tr><td>${escapeHtml(formatDate(r.time))}</td><td>${escapeHtml(r.kind)}</td><td>${escapeHtml(r.source)}</td><td>${escapeHtml(window.PilotWeaveUsage.label(r.status))}</td><td>${escapeHtml(r.detail)}</td><td><button class="button ghost small" data-action="route" data-route="${r.route}">Review</button></td></tr>`).join("")}</tbody></table></div>` : '<p class="usage-empty">No recorded activity yet.</p>'}</section>`;
   }
 
@@ -766,22 +773,61 @@
       return;
     }
     openModal({
-      title: "Delete connection",
-      body: `<p class="muted" style="line-height:1.7">Delete <strong style="color:var(--text)">${escapeHtml(connection.name)}</strong>, its local deployment history, and its credential-store entry? Native client configuration is not automatically removed in this MVP.</p>`,
-      footer: `<button class="button ghost" data-modal-close>Cancel</button><button class="button danger" id="confirm-delete">Delete connection</button>`,
+      title: "Remove connection",
+      body: `<p class="muted" style="line-height:1.7">Remove <strong style="color:var(--text)">${escapeHtml(connection.name)}</strong>? Revoke and delete reviews removal of configuration proven to belong to this installation. Detach only leaves all client configuration, including materialized credentials, untouched.</p><div id="delete-preview" role="status"></div>`,
+      footer: `<button class="button ghost" data-modal-close>Cancel</button><button class="button ghost" id="confirm-delete">Detach only…</button><button class="button danger" id="revoke-delete">Preview revoke and delete</button>`,
       onOpen(root) {
         root.querySelectorAll("[data-modal-close]").forEach((button) =>
           button.addEventListener("click", closeModal),
         );
-        root.querySelector("#confirm-delete").addEventListener("click", async () => {
+        let plan = null;
+        let busy = false;
+        const detach = root.querySelector("#confirm-delete");
+        const revoke = root.querySelector("#revoke-delete");
+        const preview = root.querySelector("#delete-preview");
+        detach.addEventListener("click", async () => {
+          if (busy) return;
+          if (detach.textContent !== "Confirm detach only") {
+            plan = null;
+            preview.textContent = "Client configuration and any keys already written there will remain. PilotWeave will discard ownership, local deployment history and its stored credential. Confirm only if you intend to manage that configuration manually.";
+            detach.textContent = "Confirm detach only";
+            revoke.textContent = "Preview revoke and delete";
+            return;
+          }
+          busy = true; detach.disabled = true; revoke.disabled = true;
           try {
             const result = await invoke("delete_connection", { connectionId: connection.id });
             closeModal();
-            showToast(result?.credentialCleanupWarning ?? "Connection deleted", result?.credentialCleanupWarning ? "warning" : "success");
+            showToast(result?.credentialCleanupWarning ?? "Connection detached; client configuration remains", result?.credentialCleanupWarning ? "warning" : "success");
             await refresh();
           } catch (error) {
             showToast(error?.message ?? String(error), "error");
-          }
+          } finally { busy = false; detach.disabled = false; revoke.disabled = false; }
+        });
+        revoke.addEventListener("click", async () => {
+          if (busy) return;
+          busy = true; detach.disabled = true; revoke.disabled = true;
+          detach.textContent = "Detach only…";
+          try {
+            if (!plan) {
+              plan = await invoke("preview_revoke_and_delete", { connectionId: connection.id });
+              preview.innerHTML = `<p>${plan.operations.length ? "Reviewed owned targets:" : "No owned targets are recorded; no client files will be removed."}</p><ul>${plan.operations.map((op) => `<li>${escapeHtml(op.title)} · ${escapeHtml(op.targetId)}</li>`).join("")}</ul><p>Client removal, ownership and connection deletion commit together. External changes invalidate this one-shot preview. Credential-store cleanup failures are reported separately.</p>`;
+              revoke.textContent = "Confirm revoke and delete";
+            } else {
+              const planId = plan.id;
+              plan = null; // An uncertain or failed apply must never be replayed.
+              const result = await invoke("apply_deployment_plan", { planId, confirmed: true });
+              if (!result.connectionDeleted) throw new Error("Revocation did not complete; the connection was preserved. Review Activity or recovery.");
+              closeModal();
+              showToast(result.credentialCleanupWarning ?? "Owned configuration revoked and connection deleted", result.credentialCleanupWarning ? "warning" : "success");
+              await refresh();
+            }
+          } catch (error) {
+            plan = null;
+            revoke.textContent = "Preview revoke and delete";
+            preview.textContent = error?.message ?? String(error);
+            showToast(error?.message ?? String(error), "error");
+          } finally { busy = false; detach.disabled = false; revoke.disabled = false; }
         });
       },
     });
@@ -1000,5 +1046,6 @@
   });
   document.addEventListener("pilotweave:refresh-setup", () => refresh());
   window.PilotWeaveUsage.configure({ invoke, refresh: refreshUsage, render, showToast, openModal, closeModal, getData: () => data, native: isDesktop });
+  window.PilotWeaveResources.configure({ invoke, refresh, showToast, openModal, closeModal, getData: () => data, native: isDesktop });
   refresh();
 })();

@@ -116,9 +116,67 @@ fn read_bounded(key: &winreg::RegKey, name: &str) -> AppResult<Option<RawValue>>
     Ok(Some(RawValue { value_type, bytes }))
 }
 
+#[cfg(windows)]
+pub(super) fn routing_overrides() -> AppResult<[bool; 2]> {
+    #[cfg(feature = "local-e2e")]
+    if crate::test_support::active() {
+        return routing_overrides_with(|name| {
+            crate::test_support::registry(name, None).map(|v| v.is_some())
+        });
+    }
+    use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ};
+    let mut keys = Vec::new();
+    for (hive, path) in [
+        (HKEY_CURRENT_USER, "Environment"),
+        (
+            HKEY_LOCAL_MACHINE,
+            "SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment",
+        ),
+    ] {
+        match winreg::RegKey::predef(hive).open_subkey_with_flags(path, KEY_READ) {
+            Ok(key) => keys.push(key),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => {
+                return Err(AppError::Config(
+                    "Cannot inspect public routing override presence; environment is unknown"
+                        .into(),
+                ))
+            }
+        }
+    }
+    routing_overrides_with(|name| {
+        let mut present = false;
+        for key in &keys {
+            present |= read_bounded(key, name)?.is_some();
+        }
+        Ok(present)
+    })
+}
+
+fn routing_overrides_with(mut read: impl FnMut(&str) -> AppResult<bool>) -> AppResult<[bool; 2]> {
+    Ok([read("COPILOT_HOME")?, read("COPILOT_PROVIDERS_CONFIG")?])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fresh_public_override_presence_is_not_limited_to_inherited_process_environment() {
+        assert_eq!(
+            routing_overrides_with(|_| Ok(false)).unwrap(),
+            [false, false]
+        );
+        assert_eq!(
+            routing_overrides_with(|name| Ok(name == "COPILOT_HOME")).unwrap(),
+            [true, false]
+        );
+        assert_eq!(
+            routing_overrides_with(|name| Ok(name == "COPILOT_PROVIDERS_CONFIG")).unwrap(),
+            [false, true]
+        );
+        assert!(routing_overrides_with(|_| Err(AppError::Busy)).is_err());
+    }
 
     #[test]
     fn raw_registry_type_presence_and_secret_changes_affect_the_fingerprint() {

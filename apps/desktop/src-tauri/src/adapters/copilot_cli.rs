@@ -14,6 +14,15 @@ use uuid::Uuid;
 
 #[cfg(any(windows, test))]
 mod env_snapshot;
+mod provider_registry;
+
+pub(crate) fn routing_fingerprint() -> AppResult<String> {
+    provider_registry::routing_fingerprint()
+}
+
+pub(crate) fn has_custom_home() -> AppResult<bool> {
+    Ok(provider_registry::override_presence()?[0])
+}
 
 // Validate bounded existing configuration before preparing a transaction. In
 // particular, unknown registry types are not silently replaced as missing data.
@@ -47,6 +56,8 @@ const MANAGED_VARIABLES: &[&str] = &[
     "COPILOT_PROVIDER_MODEL_ID",
     "COPILOT_PROVIDER_WIRE_MODEL",
     "COPILOT_PROVIDER_MAX_OUTPUT_TOKENS",
+    "PILOTWEAVE_COPILOT_OWNER_ID",
+    "PILOTWEAVE_COPILOT_CONNECTION_ID",
 ];
 
 #[cfg(unix)]
@@ -100,6 +111,7 @@ pub fn preview(connection: &Connection, target: &ClientTarget) -> DeploymentOper
     }
 }
 
+#[cfg(test)]
 pub fn apply(
     connection: &Connection,
     secret: Option<&str>,
@@ -192,6 +204,7 @@ pub(crate) fn prepare(
     connection: &Connection,
     secret: Option<&str>,
 ) -> AppResult<Vec<crate::transaction::PreparedWrite>> {
+    provider_registry::ensure_environment_is_effective()?;
     validate_existing_configuration()?;
     let values = desired_environment(connection, secret)?;
     #[cfg(windows)]
@@ -265,7 +278,133 @@ pub(crate) fn observed_resources() -> AppResult<Vec<crate::transaction::Resource
     }
 }
 
+pub(crate) fn prepare_owned(
+    connection: &Connection,
+    secret: Option<&str>,
+    owner_id: &str,
+    proofs: &[crate::deployment::ownership::TargetOwnership],
+    revoke: bool,
+) -> AppResult<Vec<crate::transaction::PreparedWrite>> {
+    use crate::deployment::ownership;
+    let mut writes = if revoke {
+        validate_existing_configuration()?;
+        observed_resources()?
+            .into_iter()
+            .map(|resource| {
+                let before = resource.read()?;
+                Ok(crate::transaction::PreparedWrite {
+                    resource,
+                    after: before.clone(),
+                    before,
+                    restore_mode: None,
+                    write_mode: None,
+                })
+            })
+            .collect::<AppResult<Vec<_>>>()?
+    } else {
+        prepare(connection, secret)?
+    };
+    let physical_id = ownership::cli_resource_id();
+    let existing = proofs.iter().find(|proof| proof.resource_id == physical_id);
+    if let Some(proof) = existing {
+        if revoke && proof.connection_id != connection.id {
+            return Err(ownership::conflict());
+        }
+        ownership::verify_projection(
+            proofs,
+            owner_id,
+            &proof.connection_id,
+            &physical_id,
+            &ownership::cli_projection(&writes, false)?,
+        )?;
+    } else {
+        #[cfg(windows)]
+        let unmanaged = writes.iter().any(|write| write.before.is_some());
+        #[cfg(unix)]
+        let unmanaged = writes.iter().enumerate().any(|(index, write)| {
+            if matches!(index, 0 | 1 | 5) {
+                write.before.is_some()
+            } else {
+                write.before.as_deref().is_some_and(|bytes| {
+                    let text = String::from_utf8_lossy(bytes);
+                    text.contains(BLOCK_START) || text.contains(BLOCK_END)
+                })
+            }
+        });
+        if unmanaged {
+            return Err(ownership::conflict());
+        }
+        if revoke {
+            return Err(ownership::conflict());
+        }
+    }
+    #[cfg(windows)]
+    for write in &mut writes {
+        use winreg::types::ToRegValue;
+        if revoke {
+            write.after = None;
+            continue;
+        }
+        let crate::transaction::Resource::UserEnvironment(name) = &write.resource else {
+            continue;
+        };
+        let value = match name.as_str() {
+            "PILOTWEAVE_COPILOT_OWNER_ID" => Some(owner_id),
+            "PILOTWEAVE_COPILOT_CONNECTION_ID" => Some(connection.id.as_str()),
+            _ => None,
+        };
+        if let Some(value) = value {
+            let raw = value.to_reg_value();
+            let mut bytes = (raw.vtype as u32).to_le_bytes().to_vec();
+            bytes.extend(raw.bytes);
+            write.after = Some(bytes);
+        }
+    }
+    #[cfg(unix)]
+    {
+        let marker = format!(
+            "# PilotWeave owner={owner_id} connection={}",
+            crate::fingerprint::bytes("cli-connection-marker-v1", Some(connection.id.as_bytes()))
+        );
+        for (index, write) in writes.iter_mut().enumerate() {
+            if revoke {
+                if matches!(index, 0 | 1 | 5) {
+                    write.after = None;
+                } else if let Some(before) = &write.before {
+                    let text = std::str::from_utf8(before).map_err(|_| ownership::conflict())?;
+                    // Never append a block or newline when there is nothing to revoke.
+                    write.after = if text.contains(BLOCK_START) {
+                        Some(replace_bounded_block(text, "")?.into_bytes())
+                    } else {
+                        write.before.clone()
+                    };
+                }
+                if let crate::transaction::Resource::File(path) = &write.resource {
+                    use std::os::unix::fs::PermissionsExt;
+                    write.restore_mode = std::fs::metadata(path)
+                        .ok()
+                        .map(|m| m.permissions().mode() & 0o777);
+                    write.write_mode = write.restore_mode;
+                }
+            } else if let Some(after) = &write.after {
+                let text = std::str::from_utf8(after).map_err(|_| ownership::conflict())?;
+                write.after = Some(if matches!(index, 0 | 1 | 5) {
+                    format!("{marker}\n{text}").into_bytes()
+                } else {
+                    text.replacen(BLOCK_START, &format!("{BLOCK_START}\n{marker}"), 1)
+                        .into_bytes()
+                });
+            }
+        }
+    }
+    Ok(writes)
+}
+
 pub(crate) fn notify_environment() -> Option<String> {
+    #[cfg(feature = "local-e2e")]
+    if crate::test_support::active() {
+        return None;
+    }
     #[cfg(windows)]
     if broadcast_environment_change().is_err() {
         return Some("Configuration is saved, but the environment-change notification failed; restart the terminal or sign out/in".into());
@@ -381,7 +520,7 @@ fn executable_extensions() -> Vec<String> {
 /// Writable user-environment backend. Production uses the Windows registry;
 /// tests substitute an in-memory fake so the deployment transaction is never
 /// exercised against the real user environment.
-#[cfg(any(windows, test))]
+#[cfg(test)]
 trait UserEnvStore {
     fn get(&self, name: &str) -> Option<String>;
     fn set(&mut self, name: &str, value: &str) -> std::io::Result<()>;
@@ -390,7 +529,7 @@ trait UserEnvStore {
 
 /// Snapshot the managed variables, apply every change, and restore the
 /// snapshot if any write fails so a partial environment is never left behind.
-#[cfg(any(windows, test))]
+#[cfg(test)]
 fn apply_env_values(
     store: &mut dyn UserEnvStore,
     values: &BTreeMap<String, Option<String>>,
@@ -434,10 +573,10 @@ fn apply_env_values(
     Ok(())
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, test))]
 struct RegistryEnvStore(winreg::RegKey);
 
-#[cfg(windows)]
+#[cfg(all(windows, test))]
 impl UserEnvStore for RegistryEnvStore {
     fn get(&self, name: &str) -> Option<String> {
         self.0.get_value::<String, _>(name).ok()
@@ -452,7 +591,7 @@ impl UserEnvStore for RegistryEnvStore {
     }
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, test))]
 fn apply_windows(values: &BTreeMap<String, Option<String>>) -> AppResult<()> {
     #[cfg(feature = "local-e2e")]
     if crate::test_support::active() {
@@ -508,7 +647,7 @@ fn broadcast_environment_change() -> AppResult<()> {
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 fn apply_unix(values: &BTreeMap<String, Option<String>>) -> AppResult<()> {
     let home = crate::platform::home_dir()
         .ok_or_else(|| AppError::Config("Cannot resolve the user home directory".into()))?;
@@ -517,7 +656,7 @@ fn apply_unix(values: &BTreeMap<String, Option<String>>) -> AppResult<()> {
 
 /// Write the managed environment files and shell-profile blocks under `home`.
 /// Split from [`apply_unix`] so tests can target a temporary home directory.
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 fn apply_unix_at(home: &Path, values: &BTreeMap<String, Option<String>>) -> AppResult<()> {
     let writes = prepare_unix_at(home, values)?;
     let path = home.join(".pilotweave/cli-adapter-journal.json");

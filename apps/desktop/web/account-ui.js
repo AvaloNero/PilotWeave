@@ -219,10 +219,12 @@
         <div>
           <strong>${escapeHtml(target)}</strong>
           <p>${escapeHtml(run.summary)}</p>
+          ${run.observedCliLogin ? `<p>Observed CLI account: ${escapeHtml(run.observedCliLogin)} · github.com</p>` : ""}
         </div>
         <div class="account-run-meta">
           <span>${escapeHtml(formatDateTime(run.finishedAt ?? run.startedAt))}</span>
           <span>${escapeHtml(run.requestedSurfaces?.map(surfaceName).join(", ") ?? "No surfaces")}</span>
+          ${isDesktop && ["actionRequired", "partial", "conflict", "interrupted"].includes(run.status) ? `<div class="account-panel-actions"><button class="button ghost small" data-account-action="verify-run" data-run-id="${escapeHtml(run.id)}" ${loading ? "disabled" : ""}>Verify official account</button><button class="button danger small" data-account-action="cancel-run" data-run-id="${escapeHtml(run.id)}">Stop follow-up</button></div>` : ""}
         </div>
       </div>`;
   }
@@ -437,6 +439,8 @@
 
   async function applyPlan(plan) {
     if (!isDesktop) return;
+    if (!currentPlan || currentPlan.id !== plan.id) return;
+    currentPlan = null;
     const confirm = modalRoot.querySelector("[data-account-confirm]");
     if (confirm) {
       confirm.disabled = true;
@@ -445,7 +449,6 @@
     try {
       const result = await invoke("apply_login_plan", { planId: plan.id });
       validateStatus(result.accountStatus);
-      currentPlan = null;
       accountStatus = result.accountStatus;
       document.dispatchEvent(new Event("pilotweave:refresh-setup"));
       showResultModal(result.run);
@@ -560,6 +563,9 @@
       failed: "Failed",
       completed: "Completed",
       interrupted: "Interrupted",
+      cancelled: "Follow-up cancelled",
+      timedOut: "Verification expired",
+      conflict: "Account conflict",
     }[status] ?? status;
   }
 
@@ -571,6 +577,9 @@
       failed: "conflict",
       completed: "verified",
       interrupted: "unknown",
+      cancelled: "unknown",
+      timedOut: "action",
+      conflict: "conflict",
     }[status] ?? "unknown";
   }
 
@@ -582,6 +591,10 @@
       skippedNotInstalled: "Not installed",
       unsupported: "Unsupported",
       failed: "Failed",
+      verified: "Verified CLI identity",
+      conflict: "Account conflict",
+      cancelled: "Cancelled",
+      timedOut: "Verification expired",
     }[status] ?? status;
   }
 
@@ -593,6 +606,10 @@
       skippedNotInstalled: "not-installed",
       unsupported: "unsupported",
       failed: "conflict",
+      verified: "verified",
+      conflict: "conflict",
+      cancelled: "unknown",
+      timedOut: "action",
     }[status] ?? "unknown";
   }
 
@@ -608,6 +625,10 @@
   document.addEventListener("click", (event) => {
     const button = event.target.closest("[data-account-action]");
     if (!button) return;
+    if (["verify-run", "cancel-run"].includes(button.dataset.accountAction)) {
+      followUpRun(button.dataset.runId, button.dataset.accountAction === "cancel-run");
+      return;
+    }
     if (button.dataset.accountAction === "refresh") {
       refreshStatus();
       return;
@@ -616,6 +637,20 @@
       previewLogin();
     }
   });
+
+  async function followUpRun(runId, cancel) {
+    if (!isDesktop || (!cancel && loading)) return;
+    loading = true; markChanged();
+    try {
+      const result = await invoke(cancel ? "cancel_login_run" : "verify_login_run", { runId });
+      validateStatus(result.accountStatus);
+      accountStatus = result.accountStatus;
+      if (!cancel) showResultModal(result.run);
+      showToast(cancel ? "Follow-up stopped; official client windows remain open" : result.run.summary, ["conflict", "failed"].includes(result.run.status) ? "error" : "success");
+      document.dispatchEvent(new Event("pilotweave:refresh-setup"));
+    } catch (error) { showToast(error?.message ?? String(error), "error"); }
+    finally { loading = false; markChanged(); }
+  }
 
   window.PilotWeaveAccount = {
     hydrate(value) { accountStatus = value; renderVersion += 1; },

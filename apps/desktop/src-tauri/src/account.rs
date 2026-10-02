@@ -23,6 +23,7 @@ const MAX_LOGIN_RUNS: usize = 100;
 const MAX_GH_OUTPUT_BYTES: usize = 64 * 1_024;
 const MAX_ACCOUNT_TEXT_BYTES: usize = 1_024;
 const GH_ACCOUNT_TIMEOUT_SECONDS: u64 = 15;
+pub(crate) mod lifecycle;
 
 const GITHUB_AUTH_ENVIRONMENT: &[&str] = &[
     "COPILOT_GITHUB_TOKEN",
@@ -146,6 +147,10 @@ pub enum LoginStepStatus {
     SkippedNotInstalled,
     Unsupported,
     Failed,
+    Verified,
+    Conflict,
+    Cancelled,
+    TimedOut,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -165,6 +170,9 @@ pub enum LoginRunStatus {
     Failed,
     Completed,
     Interrupted,
+    Conflict,
+    Cancelled,
+    TimedOut,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -174,6 +182,8 @@ pub struct LoginRunRecord {
     pub plan_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_identity: Option<GithubIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_cli_login: Option<String>,
     pub requested_surfaces: Vec<LoginSurface>,
     pub status: LoginRunStatus,
     pub steps: Vec<LoginStepResult>,
@@ -203,6 +213,7 @@ pub struct StoredLoginPlan {
     account_fingerprint: String,
     executables: BTreeMap<LoginSurface, ExecutableLoginOperation>,
     skip_statuses: BTreeMap<LoginSurface, LoginStepStatus>,
+    deadline: std::time::Instant,
 }
 
 #[derive(Default)]
@@ -288,6 +299,8 @@ impl LoginPlanStore {
                 account_fingerprint: account_fingerprint(&status),
                 executables,
                 skip_statuses,
+                deadline: std::time::Instant::now()
+                    + Duration::from_secs(LOGIN_PLAN_TTL_SECONDS as u64),
             },
         );
         Ok(plan)
@@ -330,7 +343,9 @@ impl LoginPlanStore {
 
     fn purge_expired(&mut self) {
         let now = Utc::now();
-        self.plans.retain(|_, stored| stored.plan.expires_at >= now);
+        let monotonic_now = std::time::Instant::now();
+        self.plans
+            .retain(|_, stored| stored.plan.expires_at >= now && stored.deadline > monotonic_now);
     }
 }
 
@@ -338,6 +353,7 @@ pub struct LoginStore {
     path: Option<PathBuf>,
     state: LoginHistoryState,
     recovery: Option<String>,
+    disk_bytes: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -369,6 +385,7 @@ impl LoginStore {
                 path: None,
                 state: LoginHistoryState::default(),
                 recovery: Some("Cannot resolve the user config directory".to_string()),
+                disk_bytes: None,
             };
         };
         Self::open_at(config_dir.join("PilotWeave").join("login-runs.json"))
@@ -376,7 +393,7 @@ impl LoginStore {
 
     pub fn open_at(path: PathBuf) -> Self {
         match load_history(&path) {
-            Ok(mut state) => {
+            Ok((mut state, disk_bytes)) => {
                 let now = Utc::now();
                 let mut changed = false;
                 for run in &mut state.runs {
@@ -393,6 +410,7 @@ impl LoginStore {
                     path: Some(path),
                     state,
                     recovery: None,
+                    disk_bytes,
                 };
                 if changed {
                     if let Err(error) = store.persist() {
@@ -405,6 +423,7 @@ impl LoginStore {
                 path: Some(path),
                 state: LoginHistoryState::default(),
                 recovery: Some(error.to_string()),
+                disk_bytes: None,
             },
         }
     }
@@ -417,6 +436,31 @@ impl LoginStore {
         self.recovery.clone()
     }
 
+    pub(crate) fn run(&self, id: &str) -> AppResult<LoginRunRecord> {
+        self.state
+            .runs
+            .iter()
+            .find(|run| run.id == id)
+            .cloned()
+            .ok_or(AppError::PlanUnavailable)
+    }
+
+    pub(crate) fn reconcile(
+        &mut self,
+        id: &str,
+        observation: Option<crate::usage::runtime::RpcResult<String>>,
+    ) -> AppResult<LoginRunRecord> {
+        let run = lifecycle::reconcile(self.run(id)?, observation, Utc::now());
+        self.finish_run(run.clone())?;
+        Ok(run)
+    }
+
+    pub(crate) fn cancel(&mut self, id: &str) -> AppResult<LoginRunRecord> {
+        let run = lifecycle::cancel(self.run(id)?, Utc::now());
+        self.finish_run(run.clone())?;
+        Ok(run)
+    }
+
     pub fn begin_run(&mut self, plan: &LoginPlan) -> AppResult<LoginRunRecord> {
         self.ensure_writable()?;
         let previous = self.state.clone();
@@ -424,6 +468,7 @@ impl LoginStore {
             id: Uuid::new_v4().to_string(),
             plan_id: plan.id.clone(),
             target_identity: plan.target_identity.clone(),
+            observed_cli_login: None,
             requested_surfaces: plan.requested_surfaces.clone(),
             status: LoginRunStatus::InProgress,
             steps: plan
@@ -480,12 +525,19 @@ impl LoginStore {
         Ok(())
     }
 
-    fn persist(&self) -> AppResult<()> {
+    fn persist(&mut self) -> AppResult<()> {
         let path = self
             .path
             .as_deref()
             .ok_or_else(|| AppError::Config("Sign-in history path is unavailable".to_string()))?;
-        write_history(path, &self.state)
+        let bytes = serde_json::to_vec_pretty(&self.state)
+            .map_err(|_| AppError::Config("Cannot serialize sign-in history".into()))?;
+        if bytes.len() as u64 > MAX_LOGIN_HISTORY_BYTES {
+            return Err(AppError::Config("Sign-in history exceeds its limit".into()));
+        }
+        crate::safe_file::atomic_write_private_if(path, &bytes, self.disk_bytes.as_deref())?;
+        self.disk_bytes = Some(bytes);
+        Ok(())
     }
 }
 
@@ -498,7 +550,7 @@ pub fn discover_status(
     let clients = adapters::discover_all();
     let components = installer::discover_components();
     let environment_overrides = present_auth_environment();
-    let surfaces = [
+    let mut surfaces: Vec<SurfaceAccountObservation> = [
         LoginSurface::VsCodeCopilot,
         LoginSurface::CopilotCli,
         LoginSurface::GithubCopilotApp,
@@ -515,6 +567,46 @@ pub fn discover_status(
         )
     })
     .collect();
+    // A saved launch/manual confirmation is never verified. A recent native
+    // public-RPC observation is qualified by its own timestamp and surface.
+    if environment_overrides.is_empty() {
+        if let Some(run) = login_runs.iter().find(|run| {
+            run.observed_cli_login.is_some()
+                && run.finished_at.is_some_and(|at| {
+                    observed_at >= at && observed_at - at <= ChronoDuration::minutes(5)
+                })
+                && run.steps.iter().any(|s| {
+                    s.surface == LoginSurface::CopilotCli
+                        && matches!(
+                            s.status,
+                            LoginStepStatus::Verified | LoginStepStatus::Conflict
+                        )
+                })
+        }) {
+            if let Some(surface) = surfaces.iter_mut().find(|s| {
+                s.surface == LoginSurface::CopilotCli
+                    && s.state != AccountObservationState::NotInstalled
+            }) {
+                let login = run.observed_cli_login.as_ref().expect("filtered");
+                surface.state = if run.steps.iter().any(|s| {
+                    s.surface == LoginSurface::CopilotCli && s.status == LoginStepStatus::Conflict
+                }) {
+                    AccountObservationState::Conflict
+                } else {
+                    AccountObservationState::Verified
+                };
+                surface.identity = Some(GithubIdentity {
+                    host: "github.com".into(),
+                    login: login.clone(),
+                    user_id: None,
+                    avatar_url: None,
+                });
+                surface.observed_at = run.finished_at.expect("filtered timestamp");
+                surface.evidence = "Recent official protocol-3 auth.getStatus response; not client credential storage".into();
+                surface.detail = "CLI/runtime account only. Verify again after switching accounts; the observation expires after five minutes".into();
+            }
+        }
+    }
     AccountStatusSnapshot {
         anchor,
         surfaces,
@@ -1048,6 +1140,15 @@ fn bounded_detail(value: &str) -> String {
 }
 
 fn validate_run(run: &LoginRunRecord) -> AppResult<()> {
+    if run
+        .observed_cli_login
+        .as_deref()
+        .is_some_and(|login| !valid_login(login))
+    {
+        return Err(AppError::Config(
+            "Invalid observed CLI account metadata".into(),
+        ));
+    }
     for value in [&run.id, &run.plan_id, &run.summary] {
         if value.is_empty() || value.len() > MAX_ACCOUNT_TEXT_BYTES {
             return Err(AppError::InvalidInput(
@@ -1075,9 +1176,9 @@ fn validate_run(run: &LoginRunRecord) -> AppResult<()> {
     Ok(())
 }
 
-fn load_history(path: &Path) -> AppResult<LoginHistoryState> {
+fn load_history(path: &Path) -> AppResult<(LoginHistoryState, Option<Vec<u8>>)> {
     let Some(bytes) = crate::safe_file::read_optional(path, MAX_LOGIN_HISTORY_BYTES)? else {
-        return Ok(LoginHistoryState::default());
+        return Ok((LoginHistoryState::default(), None));
     };
     let state: LoginHistoryState =
         serde_json::from_slice(&bytes).map_err(|error| AppError::json(path, error))?;
@@ -1095,9 +1196,16 @@ fn load_history(path: &Path) -> AppResult<LoginHistoryState> {
     for run in &state.runs {
         validate_run(run)?;
     }
-    Ok(state)
+    let mut ids = std::collections::HashSet::new();
+    if state.runs.iter().any(|r| !ids.insert(&r.id)) {
+        return Err(AppError::Config(
+            "Duplicate sign-in history identity".into(),
+        ));
+    }
+    Ok((state, Some(bytes)))
 }
 
+#[cfg(test)]
 fn write_history(path: &Path, state: &LoginHistoryState) -> AppResult<()> {
     let bytes = serde_json::to_vec_pretty(state)
         .map_err(|error| AppError::Config(format!("Cannot serialize sign-in history: {error}")))?;
@@ -1132,6 +1240,7 @@ mod tests {
                 account_fingerprint: "test".to_string(),
                 executables: BTreeMap::new(),
                 skip_statuses: BTreeMap::new(),
+                deadline: std::time::Instant::now() + Duration::from_secs(900),
             },
         );
         let _ = store.take(&plan.id).expect("consume");
@@ -1200,6 +1309,7 @@ mod tests {
                 id: "run".into(),
                 plan_id: plan.id.clone(),
                 target_identity: None,
+                observed_cli_login: None,
                 requested_surfaces: vec![surface],
                 status: LoginRunStatus::InProgress,
                 steps: Vec::new(),
@@ -1212,6 +1322,7 @@ mod tests {
                 account_fingerprint: "fixture".into(),
                 executables: BTreeMap::new(),
                 skip_statuses: BTreeMap::from([(surface, status)]),
+                deadline: std::time::Instant::now() + Duration::from_secs(900),
             };
             let result = execute_plan(&stored, run);
             assert_eq!(result.steps[0].status, status);
@@ -1243,6 +1354,7 @@ mod tests {
             id: "run".to_string(),
             plan_id: "plan".to_string(),
             target_identity: None,
+            observed_cli_login: None,
             requested_surfaces: vec![LoginSurface::CopilotCli],
             status: LoginRunStatus::InProgress,
             steps: vec![LoginStepResult {
@@ -1284,5 +1396,29 @@ mod tests {
         };
         assert!(store.begin_run(&plan).is_err());
         assert_eq!(fs::read(&path).expect("history"), b"not json");
+    }
+
+    #[test]
+    fn external_login_history_changes_are_not_overwritten_by_a_followup() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("login-runs.json");
+        let mut history = LoginStore::open_at(path.clone());
+        let now = Utc::now();
+        let plan = LoginPlan {
+            id: Uuid::new_v4().to_string(),
+            target_identity: None,
+            requested_surfaces: vec![LoginSurface::CopilotCli],
+            operations: vec![],
+            created_at: now,
+            expires_at: now + ChronoDuration::minutes(15),
+        };
+        let run = history.begin_run(&plan).unwrap();
+        fs::write(&path, b"external-history-fixture").unwrap();
+        assert!(history.cancel(&run.id).is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"external-history-fixture");
+        assert_eq!(
+            history.run(&run.id).unwrap().status,
+            LoginRunStatus::InProgress
+        );
     }
 }

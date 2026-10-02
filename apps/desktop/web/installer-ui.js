@@ -20,6 +20,7 @@
   let observations = null;
   let loading = false;
   let lastResult = null;
+  let lastRun = null;
   let renderVersion = 0;
 
   const browserObservations = [
@@ -82,6 +83,8 @@
       skippedAlreadyReady: "Already ready",
       skippedDependencyFailed: "Dependency unavailable",
       failed: "Failed",
+      cancelled: "Cancelled — rediscover",
+      timedOut: "Timed out — rediscover",
     }[status] ?? status;
   }
 
@@ -151,6 +154,7 @@
       ${loading && values.length === 0 ? '<div class="install-loading">Discovering components…</div>' : ""}
       ${!loading && values.length === 0 ? '<div class="install-loading">Installation status has not been loaded.</div>' : ""}
       ${values.length ? `<div class="install-grid">${values.map(renderComponent).join("")}</div>` : ""}
+      ${lastRun ? `<div class="install-result-summary"><div><strong>Installation ${escapeHtml(lastRun.status)}</strong><span>${escapeHtml(lastRun.detail)}</span></div>${lastRun.status === "running" ? `<button class="button danger small" data-install-action="cancel" data-run-id="${escapeHtml(lastRun.id)}">Cancel run</button>` : ""}</div>` : ""}
       ${lastResult ? renderLastResult(lastResult) : ""}
     `;
   }
@@ -316,6 +320,8 @@
                 </div>
                 <div class="install-plan-meta">
                   <span>${escapeHtml(operation.source)}</span>
+                  <span>${escapeHtml(operation.version ?? "Current compatible extension")} · ${escapeHtml(operation.architecture ?? "Windows")}</span>
+                  ${(operation.dependencies ?? []).map(dependency => `<span>${escapeHtml(dependency)}</span>`).join("")}
                   <span>${operation.requiresElevation ? "Elevation may be required" : "User-level operation"}</span>
                 </div>
               </div>`,
@@ -372,19 +378,53 @@
 
   async function applyPlan(plan) {
     if (!isDesktop) return;
+    if (!currentModalPlan || currentModalPlan.id !== plan.id) return;
+    currentModalPlan = null;
     const confirm = modalRoot.querySelector("[data-install-confirm]");
     if (confirm) {
       confirm.disabled = true;
       confirm.textContent = "Installing…";
     }
+    let runId = null;
+    let unlisten = null;
+    let poll = null;
+    let closed = false;
+    const acceptProgress = (run) => {
+      if (closed || run?.planId !== plan.id) return;
+      runId = run.id; lastRun = run;
+      const list = modalRoot.querySelector(".install-plan-list");
+      if (list) list.innerHTML = `<p role="status">${escapeHtml(run.currentComponentId ? `Working on ${componentName(run.currentComponentId)}` : statusLabel(run.status))}</p><p>${escapeHtml(run.detail)}</p>${run.results.map((item) => `<p>${escapeHtml(componentName(item.componentId))}: ${escapeHtml(statusLabel(item.status))}</p>`).join("")}`;
+      const cancel = modalRoot.querySelector("[data-install-cancel-run]");
+      if (cancel) cancel.disabled = run.status !== "running";
+      markChanged();
+    };
+    const cancel = document.createElement("button");
+    cancel.className = "button danger"; cancel.textContent = "Cancel running installation";
+    cancel.dataset.installCancelRun = ""; cancel.disabled = true;
+    modalRoot.querySelector(".modal-footer")?.append(cancel);
+    cancel.addEventListener("click", async () => {
+      if (!runId) return;
+      cancel.disabled = true;
+      try { await invoke("cancel_install_run", { runId }); cancel.textContent = "Cancellation requested — rediscover when finished"; }
+      catch (error) { showToast(error?.message ?? String(error), "error"); cancel.disabled = false; }
+    });
+    const observe = async () => {
+      try { const runs = await invoke("get_install_runs"); const run = runs.find((value) => value.planId === plan.id); if (run) { acceptProgress(run); cancel.disabled = run.status !== "running"; } }
+      catch { /* Final native result/history reports persistence errors explicitly. */ }
+    };
     try {
+      if (window.__TAURI__?.event?.listen) unlisten = await window.__TAURI__.event.listen("pilotweave:install-progress", (event) => {
+        acceptProgress(event.payload); cancel.disabled = event.payload?.status !== "running";
+      });
+      poll = setInterval(observe, 2000);
       const result = await invoke("apply_install_plan", { planId: plan.id });
       lastResult = result;
       observations = result.observations;
       document.dispatchEvent(new Event("pilotweave:refresh-setup"));
       currentModalPlan = null;
       showResultModal(result);
-      showToast("Installation run completed");
+      const attention = result.results.some((item) => !["completedAndVerified", "skippedAlreadyReady"].includes(item.status));
+      showToast(attention ? "Installation finished with items to review" : "Every requested component is verified ready", attention ? "warning" : "success");
       markChanged();
     } catch (error) {
     closeModal();
@@ -392,7 +432,7 @@
       `${error?.message ?? String(error)} Generate a new preview before retrying.`,
       "error",
     );
-  }
+    } finally { closed = true; if (poll) clearInterval(poll); unlisten?.(); }
 
   }
 
@@ -443,6 +483,11 @@
       refreshStatus();
       return;
     }
+    if (action === "cancel") {
+      button.disabled = true;
+      invoke("cancel_install_run", { runId: button.dataset.runId }).then((accepted) => showToast(accepted ? "Cancellation requested; completed installations will remain" : "This run is no longer active", "warning")).catch((error) => showToast(error?.message ?? String(error), "error")).finally(() => { button.disabled = false; });
+      return;
+    }
     if (action === "install-one") {
       previewInstall([button.dataset.componentId]);
       return;
@@ -456,7 +501,7 @@
   });
 
   window.PilotWeaveInstaller = {
-    hydrate(value) { observations = value; renderVersion += 1; },
+    hydrate(value, runs) { observations = value; if (Array.isArray(runs)) { lastRun = runs[0] ?? null; if (lastRun) lastResult = { planId: lastRun.planId, results: lastRun.results }; } renderVersion += 1; },
     mount: ensurePanel,
     previewStatus: () => structuredClone(browserObservations),
     preview: previewInstall,

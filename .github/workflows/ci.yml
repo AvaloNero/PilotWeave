@@ -71,6 +71,8 @@ jobs:
       - name: Run Rust tests
         id: tests
         continue-on-error: true
+        env:
+          PILOTWEAVE_TEST_REQUIRE_LINKS: "1"
         run: cargo test --workspace --locked
       - name: Run Clippy
         id: clippy

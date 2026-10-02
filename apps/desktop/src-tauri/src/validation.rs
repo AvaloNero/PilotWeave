@@ -237,6 +237,16 @@ pub fn validate_persistent_state(state: &PersistentState) -> AppResult<()> {
         }
     }
 
+    crate::deployment::ownership::validate(
+        &state.ownership,
+        &state.installation_owner_id,
+        &connection_ids,
+    )?;
+    crate::resources::validate_state(
+        &state.resources,
+        &state.resource_bindings,
+        &state.installation_owner_id,
+    )?;
     let mut record_ids = HashSet::new();
     for record in &state.deployments {
         validate_deployment_record(record)?;
@@ -456,6 +466,9 @@ mod tests {
             installation_owner_id: uuid::Uuid::new_v4().to_string(),
             connections: vec![first.clone(), duplicate],
             deployments: Vec::new(),
+            ownership: Vec::new(),
+            resources: Vec::new(),
+            resource_bindings: Vec::new(),
         };
         assert!(validate_persistent_state(&state).is_err());
 
@@ -471,6 +484,7 @@ mod tests {
             created_at: Utc::now(),
             target_fingerprint: None,
             connection_revision: None,
+            ownership_tracked: false,
         });
         assert!(validate_persistent_state(&state).is_err());
     }

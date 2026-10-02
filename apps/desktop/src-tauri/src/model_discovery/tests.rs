@@ -239,7 +239,7 @@ fn server(
     let handle = thread::spawn(move || {
         let mut requests = Vec::new();
         for (code, body, extra) in responses {
-            let end = Instant::now() + Duration::from_secs(5);
+            let end = Instant::now() + Duration::from_secs(15);
             let mut stream = loop {
                 match listener.accept() {
                     Ok((stream, _)) => break stream,
@@ -252,8 +252,11 @@ fn server(
                     Err(error) => panic!("fixture did not receive request: {error}"),
                 }
             };
+            // Windows can propagate the listener's nonblocking mode to accepted
+            // sockets. Header reads must not race the client under parallel load.
+            stream.set_nonblocking(false).unwrap();
             stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
+                .set_read_timeout(Some(Duration::from_secs(10)))
                 .unwrap();
             let mut request = Vec::new();
             while !request.ends_with(b"\r\n\r\n") {

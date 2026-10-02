@@ -2,7 +2,7 @@ mod account;
 pub mod adapters;
 mod commands;
 pub mod decimal;
-mod deployment;
+pub mod deployment;
 pub mod domain;
 pub mod error;
 mod fingerprint;
@@ -14,6 +14,7 @@ mod model_discovery;
 mod native_process;
 mod platform;
 mod redact;
+mod resources;
 mod safe_file;
 mod safe_io;
 mod secrets;
@@ -21,7 +22,7 @@ mod setup;
 mod state;
 #[cfg(feature = "local-e2e")]
 mod test_support;
-mod transaction;
+pub mod transaction;
 mod usage;
 pub mod usage_db;
 mod validation;
@@ -105,12 +106,20 @@ pub fn run() {
         ))
         .invoke_handler(tauri::generate_handler![
             commands::get_dashboard,
+            resources::commands::get_resources,
+            resources::commands::upsert_resource,
+            resources::commands::preview_resource_sync,
+            resources::commands::apply_resource_plan,
             commands::get_installation_status,
             commands::preview_install,
             commands::apply_install_plan,
+            commands::get_install_runs,
+            commands::cancel_install_run,
             commands::get_account_status,
             commands::preview_login,
             commands::apply_login_plan,
+            commands::verify_login_run,
+            commands::cancel_login_run,
             commands::get_github_authorization_status,
             commands::get_github_billing_overview,
             commands::refresh_github_billing,
@@ -121,6 +130,7 @@ pub fn run() {
             model_discovery::discover_connection_models,
             commands::delete_connection,
             commands::preview_deployment,
+            commands::preview_revoke_and_delete,
             commands::apply_deployment_plan,
             commands::preview_deployment_recovery,
             commands::apply_deployment_recovery,

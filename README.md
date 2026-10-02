@@ -29,8 +29,12 @@ PilotWeave is still pre-release, but the repository now contains working vertica
 - Exact decimal serialization and checked arithmetic for monetary data; binary floating-point JSON values are rejected from the money domain.
 - Native Settings and Clients panels for installation, account orchestration, sign-in history, separate GitHub authorization, storage recovery, and browser-preview limitations.
 - A browser fallback for reviewing the interface without native writes or real authentication.
+- Durable installation-owner proofs, explicit reviewed revoke-and-delete, and a separate detach-only action that does not remove deployed credentials.
+- Native MCP, Skills, and Instructions authoring/publication on supported public paths, with one-shot reviews, ownership checks, journals, and rollback.
+- Private persisted installation runs with per-component outcomes, progress, scoped cancellation, and explicit interrupted recovery.
+- Official read-only CLI account follow-up with matching/conflicting/expired outcomes; other clients retain their manual account boundary.
 
-The Home setup flow now combines component discovery, account evidence, a persistent user confirmation, a selected Connection, live deployment fingerprints, and manual app setup. Its four core steps are independent from Billing authorization and usage opt-in. Navigation is Home, Connections, Usage, and More; unfinished Resources navigation and obsolete one-off workflows have been removed.
+The Home setup flow combines component discovery, account evidence, a persistent user confirmation, a selected Connection, live deployment fingerprints, and manual app setup. Its four core steps are independent from Billing authorization and usage opt-in. Navigation is Home, Connections, Resources, Usage, and More. Resources are locally authored configuration, not imported conversation content; a last-published binding is not proof that every client consumes it.
 
 Usage has native commands and a SQLite v2 migration for:
 
@@ -48,11 +52,13 @@ See [adapter provenance and supported schemas](docs/usage-sources.md) and the [P
 The complete behavior and acceptance criteria are defined in [the MVP implementation specification](docs/mvp-implementation-spec.md). Remaining required work includes:
 
 - Complete clean Windows 11 x64 installation verification, including every applicable package/product/publisher requirement and partial/cancellation behavior.
-- Continue same-account verification after official client flows where stable, token-free client observations are available; preserve Action required or Unsupported elsewhere.
+- Validate CLI protocol-3 account follow-up on real supported clients; VS Code and the app still require their own account checks without reading credentials.
 - Validate runtime quota and personal Billing with actual supported client/account combinations during P2.
 - Expand usage coverage only when upstream exposes the missing semantics: current CLI shutdown metrics do not establish fresh-vs-total input, VS Code may omit cache-write tokens, and no separate supported Copilot app usage source is established. Current data remains Unknown/Partial/Unsupported where appropriate.
-- Implement the required MCP, Skills, and Instructions synchronization only for stable public paths with the normal preview, ownership, journal, and rollback contract.
-- Finish deletion/revocation, ownership, interrupted-operation, and clean-machine regression cases that remain open in the normative specification.
+- Validate public-path Resources on actual supported client versions. Secret-bearing/local-command MCP, named profiles, custom roots, and Copilot app resources remain explicitly manual.
+- Complete the clean-machine acceptance run. Automated ownership/revocation, interruption, and resource regressions are implemented, but do not establish real-machine release acceptance.
+
+See [the current hardening handoff](docs/hardening-handoff.md) for verified behavior, upstream provenance, and precise remaining acceptance boundaries.
 
 The primary clean-machine acceptance environment is Windows 11 x64. Existing macOS and Linux discovery/deployment behavior must not regress, but full one-click installation on those platforms is outside the required scope.
 

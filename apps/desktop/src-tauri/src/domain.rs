@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, HashSet};
 use url::Url;
 use uuid::Uuid;
 
-pub const STATE_VERSION: u32 = 1;
+pub const STATE_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "kebab-case")]
@@ -285,6 +285,8 @@ pub struct DeploymentOperation {
 #[serde(rename_all = "camelCase")]
 pub struct DeploymentPlan {
     pub id: String,
+    #[serde(default)]
+    pub purpose: DeploymentPurpose,
     pub connection_id: String,
     pub connection_name: String,
     pub target_ids: Vec<String>,
@@ -315,6 +317,8 @@ pub struct DeploymentRecord {
     pub target_fingerprint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connection_revision: Option<String>,
+    #[serde(default)]
+    pub ownership_tracked: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -322,6 +326,18 @@ pub struct DeploymentRecord {
 pub struct ApplyResult {
     pub plan_id: String,
     pub records: Vec<DeploymentRecord>,
+    #[serde(default)]
+    pub connection_deleted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_cleanup_warning: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DeploymentPurpose {
+    #[default]
+    Deploy,
+    RevokeAndDelete,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -396,6 +412,12 @@ pub struct PersistentState {
     pub connections: Vec<Connection>,
     #[serde(default)]
     pub deployments: Vec<DeploymentRecord>,
+    #[serde(default)]
+    pub ownership: Vec<crate::deployment::ownership::TargetOwnership>,
+    #[serde(default)]
+    pub resources: Vec<crate::resources::SharedResource>,
+    #[serde(default)]
+    pub resource_bindings: Vec<crate::resources::ResourceBinding>,
 }
 
 fn default_state_version() -> u32 {
@@ -413,6 +435,9 @@ impl Default for PersistentState {
             installation_owner_id: new_owner_id(),
             connections: Vec::new(),
             deployments: Vec::new(),
+            ownership: Vec::new(),
+            resources: Vec::new(),
+            resource_bindings: Vec::new(),
         }
     }
 }

@@ -153,6 +153,16 @@ Frontend `setup-ui.js` and `usage-ui.js` render explicit app routes. Installatio
 
 Concrete source schemas, limits, provenance and remaining upstream limitations are recorded in [usage-sources.md](usage-sources.md). The module tree below remains the normative target decomposition for later milestones, not a claim that every listed file exists.
 
+### Ownership, Resources, and operation lifecycle hardening
+
+`state.json` schema v2 retains v1 compatibility and adds native-owned projection proofs, authored resources, and resource bindings. Existing deployment records without a durable proof are not adopted as owned. Ownership binds installation, Connection/resource identity, canonical physical target identity, and projection digest. Markers alone are insufficient. Revoke-and-delete uses the same one-shot plan, prepare-all transaction, stale checks, compensation, and audit commit as deployment; detach-only never mutates a client.
+
+`resources/` owns validation, public-path adapters, native plan storage, commands, and fixtures. Skills are Markdown-only under the shared personal `.copilot/skills` root. Instructions and credential-free HTTPS MCP entries use reviewed public CLI/default VS Code paths. App configuration, named profiles, custom roots, local commands, MCP headers/secrets, and arbitrary supporting files are not projected. MCP changes preserve unknown/user entries; semantic no-ops preserve source bytes. Archived resource identities retain bounded recovery tombstones with cleared authored bodies.
+
+`installer/history.rs` persists a prepared run before execution and per-component results without process output. Active cancellation is scoped to the exact native run ID; bounded capture kills the owned process tree. Restarted or abandoned runs are Interrupted, not automatically retried. Reviewed package versions/architecture/dependencies are compiled into `installer/catalog.rs`. Windows package-manager identity uses registered App Installer paths and the OS Authenticode trust result, not the PATH name alone. Native plans bind executable bytes and have a monotonic TTL as well as a display expiry. Installation never uninstalls or downgrades as compensation.
+
+`account/lifecycle.rs` reconciles explicit login follow-up against only official protocol-3 `connect` and `auth.getStatus`. It records a bounded CLI login, rejects unsupported authentication modes, separates account conflicts, and never promotes VS Code/app or manual evidence. A recent CLI observation expires after five minutes; verification runs expire after fifteen. Cancellation stops follow-up without closing or signing out official clients. Login history uses compare-before-replace writes so external changes are not overwritten. See [hardening handoff](hardening-handoff.md) for remaining platform boundaries.
+
 ## Required target modules
 
 One acceptable layout is:

@@ -32,6 +32,8 @@ $node = (Get-Command node.exe -ErrorAction Stop).Source
 $start = [Diagnostics.ProcessStartInfo]::new($node)
 $start.UseShellExecute = $false
 $start.CreateNoWindow = $true
+$start.RedirectStandardOutput = $true
+$start.RedirectStandardError = $true
 $start.WorkingDirectory = $repo
 foreach ($arg in @((Join-Path $PSScriptRoot 'verify-local.mjs'), $Mode, $runRoot, $ToolRoot, $LiveTarget, [string]$Resume.IsPresent, $CompletedAction)) {
     $start.ArgumentList.Add([string]$arg)
@@ -43,6 +45,10 @@ foreach ($arg in @((Join-Path $PSScriptRoot 'verify-local.mjs'), $Mode, $runRoot
 $release = Join-Path $runRoot ('launch-' + [guid]::NewGuid().ToString('N'))
 $start.Environment['PILOTWEAVE_VALIDATION_RELEASE'] = $release
 $process = [Diagnostics.Process]::Start($start)
+# A hidden child must have owned output pipes rather than inherited console
+# handles. Drain both concurrently so verbose failures cannot block the runner.
+$validationStdout = $process.StandardOutput.ReadToEndAsync()
+$validationStderr = $process.StandardError.ReadToEndAsync()
 $job = [IntPtr]::Zero
 try {
     $job = [PilotWeaveValidationJob]::Attach($process.Handle)
@@ -53,6 +59,18 @@ try {
     if ($job -ne [IntPtr]::Zero) { [PilotWeaveValidationJob]::CloseHandle($job) | Out-Null }
     elseif (!$process.HasExited) { $process.Kill($true) }
     if (Test-Path -LiteralPath $release) { Remove-Item -LiteralPath $release }
+}
+if (!$validationStdout.Wait(5000) -or !$validationStderr.Wait(5000)) {
+    Write-Warning 'Validation output did not close after owned process cleanup; this run is not a pass'
+    $result = 1
+} else {
+    $validationText = $validationStdout.Result + $validationStderr.Result
+    $validationText = $validationText -replace '(?:github_pat_|gh[pousr]_|sk-)[A-Za-z0-9_-]{8,}', '[REDACTED]'
+    $validationText = $validationText -replace '(?i)(Authorization\s*[:=]\s*(?:Bearer\s+)?)[^\s,;"}]+', '$1[REDACTED]'
+    $validationText = $validationText.Replace($env:USERPROFILE, '<USERPROFILE>')
+    if ($validationText.Length -gt 1048576) { $validationText = $validationText.Substring(0,1048576) + "`n[runner output truncated]" }
+    [IO.File]::WriteAllText((Join-Path $runRoot 'runner.log'), $validationText)
+    if ($validationText) { Write-Output $validationText.TrimEnd() }
 }
 Write-Output "Report: $runRoot\report.html"
 exit $result

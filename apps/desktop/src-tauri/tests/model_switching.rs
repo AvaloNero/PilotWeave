@@ -11,11 +11,13 @@
 
 use chrono::Utc;
 use pilotweave_lib::adapters::{self, copilot_cli};
+use pilotweave_lib::deployment::{self, ownership::TargetOwnership, PlanContext, PlanStore};
 use pilotweave_lib::domain::{
     ApiProtocol, ClientKind, ClientStatus, ClientTarget, Connection, ModelCapabilities, ModelSpec,
     ProviderKind,
 };
 use pilotweave_lib::error::AppError;
+use pilotweave_lib::transaction::Transaction;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs;
@@ -66,6 +68,35 @@ fn read_config(path: &Path) -> Value {
     serde_json::from_str(&text).expect("config must stay valid JSON")
 }
 
+// Exercise the same guarded native-held plan and journal path as production,
+// not the obsolete single-target write shortcut.
+fn apply_fixture(
+    connection: &Connection,
+    target: &ClientTarget,
+    proofs: &mut Vec<TargetOwnership>,
+) {
+    let context = PlanContext::new(
+        "9b50b398-1d85-4acb-9104-51990542c21e",
+        "fixture-state".into(),
+        Some("pw-key"),
+    )
+    .with_ownership(proofs);
+    let targets = std::slice::from_ref(target);
+    let plan =
+        adapters::preview_resolved(connection, std::slice::from_ref(&target.id), targets).unwrap();
+    let mut plans = PlanStore::default();
+    let preview = plans
+        .insert(connection, Some("pw-key"), plan, targets, context.clone())
+        .unwrap();
+    let stored = plans.consume(&preview.id).unwrap();
+    deployment::validate_plan(&stored, connection, targets, &context).unwrap();
+    let path = Path::new(target.path.as_ref().unwrap()).with_file_name("fixture-journal.json");
+    let mut tx = Transaction::begin(path, &preview.id, stored.writes).unwrap();
+    tx.apply().unwrap();
+    *proofs = stored.ownership_after;
+    tx.complete().unwrap();
+}
+
 #[test]
 fn switching_models_projects_every_supported_client() {
     let directory = tempfile::tempdir().expect("temp directory");
@@ -79,7 +110,8 @@ fn switching_models_projects_every_supported_client() {
 
     // Activate the connection with model-a on every surface.
     let mut connection = connection("upstream/model-a");
-    adapters::apply_to_target(&connection, Some("pw-key"), &target).expect("apply model-a");
+    let mut proofs = Vec::new();
+    apply_fixture(&connection, &target, &mut proofs);
     let groups = read_config(&config);
     let rendered = serde_json::to_string(&groups).expect("serialize");
     assert!(rendered.contains("upstream/model-a"));
@@ -95,7 +127,7 @@ fn switching_models_projects_every_supported_client() {
     // Switch the connection to model-b: every surface must follow.
     connection.models = vec![model("upstream/model-b", true)];
 
-    adapters::apply_to_target(&connection, Some("pw-key"), &target).expect("apply model-b");
+    apply_fixture(&connection, &target, &mut proofs);
     let groups = read_config(&config);
     let rendered = serde_json::to_string(&groups).expect("serialize");
     assert!(rendered.contains("upstream/model-b"));
@@ -125,7 +157,7 @@ fn switching_models_projects_every_supported_client() {
 
     // The GitHub Copilot app refuses automated writes by design.
     let app_target = pilotweave_lib::adapters::github_app::discover_target();
-    let error = adapters::apply_to_target(&connection, Some("pw-key"), &app_target)
+    let error = adapters::github_app::apply(&connection, Some("pw-key"), &app_target)
         .expect_err("GitHub Copilot app must stay read-only");
     assert!(matches!(error, AppError::Unsupported(_)));
 }

@@ -67,6 +67,64 @@ pub trait ReadOnlyRpc {
     fn request(&mut self, method: &'static str, params: Value) -> RpcResult<Value>;
 }
 
+/// Current CLI/runtime identity, not an identity for VS Code or the app.
+/// This observation intentionally does not request quota, models or sessions.
+pub(crate) fn identity(cancel: &AtomicBool) -> RpcResult<String> {
+    #[cfg(feature = "local-e2e")]
+    if crate::test_support::active() {
+        return identity_with(&mut crate::test_support::Rpc);
+    }
+    identity_with(&mut StdioRpc::start(cancel)?)
+}
+
+pub(crate) fn identity_with(rpc: &mut impl ReadOnlyRpc) -> RpcResult<String> {
+    let hello = rpc.request(
+        "connect",
+        json!({"enableGitHubTelemetryForwarding":false,"supportedTaskKinds":[]}),
+    )?;
+    if hello["protocolVersion"].as_u64() != Some(3) {
+        return Err(RuntimeError(
+            DataStatus::Unsupported,
+            "Only the reviewed protocol-3 identity schema is supported",
+        ));
+    }
+    let auth = rpc.request("auth.getStatus", json!({}))?;
+    if !auth["isAuthenticated"].as_bool().ok_or_else(schema)? {
+        return Err(RuntimeError(
+            DataStatus::Unauthorized,
+            "Complete the official CLI sign-in flow and verify again",
+        ));
+    }
+    if !matches!(auth["authType"].as_str(), Some("user" | "gh-cli")) {
+        return Err(RuntimeError(
+            DataStatus::Unsupported,
+            "This runtime identity is not a supported user or GitHub CLI authentication mode",
+        ));
+    }
+    if !matches!(
+        auth["host"].as_str(),
+        Some("github.com" | "https://github.com" | "https://github.com/")
+    ) {
+        return Err(RuntimeError(
+            DataStatus::Unsupported,
+            "Account verification supports github.com only",
+        ));
+    }
+    let login = auth["login"]
+        .as_str()
+        .filter(|login| {
+            !login.is_empty()
+                && login.len() <= 128
+                && !login.starts_with('-')
+                && !login.ends_with('-')
+                && login
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
+        .ok_or_else(schema)?;
+    Ok(login.into())
+}
+
 fn schema() -> RuntimeError {
     RuntimeError(
         DataStatus::SchemaError,

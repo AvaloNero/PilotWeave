@@ -132,6 +132,112 @@ impl StateStore {
         &self.state.deployments
     }
 
+    pub fn ownership(&self) -> &[crate::deployment::ownership::TargetOwnership] {
+        &self.state.ownership
+    }
+
+    pub fn resources(&self) -> &[crate::resources::SharedResource] {
+        &self.state.resources
+    }
+    pub fn resource_bindings(&self) -> &[crate::resources::ResourceBinding] {
+        &self.state.resource_bindings
+    }
+    pub fn resource(&self, id: &str) -> AppResult<crate::resources::SharedResource> {
+        self.state
+            .resources
+            .iter()
+            .find(|record| record.id == id && !record.archived)
+            .cloned()
+            .ok_or_else(|| AppError::InvalidInput("Unknown authored resource".into()))
+    }
+    pub fn upsert_resource(
+        &mut self,
+        input: crate::resources::ResourceInput,
+    ) -> AppResult<crate::resources::SharedResource> {
+        self.ensure_writable()?;
+        let existing = input
+            .id
+            .as_deref()
+            .map(|id| self.resource(id))
+            .transpose()?;
+        if existing
+            .as_ref()
+            .is_some_and(|record| record.kind != input.kind)
+        {
+            return Err(AppError::InvalidInput(
+                "Resource kind cannot change; revoke the old resource and create a new one".into(),
+            ));
+        }
+        let now = Utc::now();
+        let record = crate::resources::SharedResource {
+            id: existing
+                .as_ref()
+                .map_or_else(|| Uuid::new_v4().to_string(), |record| record.id.clone()),
+            name: input.name.trim().into(),
+            kind: input.kind,
+            body: input.body,
+            created_at: existing.as_ref().map_or(now, |record| record.created_at),
+            updated_at: now,
+            archived: false,
+        };
+        crate::resources::validate_resource(&record)?;
+        let mut next = self.state.clone();
+        next.resources.retain(|value| value.id != record.id);
+        next.resources.push(record.clone());
+        self.replace_state(next)?;
+        Ok(record)
+    }
+    pub fn commit_resource(
+        &mut self,
+        id: &str,
+        bindings: Vec<crate::resources::ResourceBinding>,
+        revoke: bool,
+    ) -> AppResult<()> {
+        self.ensure_writable()?;
+        self.resource(id)?;
+        let mut next = self.state.clone();
+        next.resource_bindings = bindings;
+        if revoke {
+            if next
+                .resource_bindings
+                .iter()
+                .any(|binding| binding.resource_id == id)
+            {
+                return Err(AppError::Config(
+                    "Owned resource bindings remain; catalog entry was not deleted".into(),
+                ));
+            }
+            let record = next
+                .resources
+                .iter_mut()
+                .find(|record| record.id == id)
+                .ok_or(AppError::PlanChanged)?;
+            record.archived = true;
+            record.body.clear();
+            record.updated_at = Utc::now();
+            // Bounded metadata tombstones keep native-derived paths available for interrupted recovery.
+            next.resources
+                .sort_by_key(|record| (record.archived, std::cmp::Reverse(record.updated_at)));
+            let active = next
+                .resources
+                .iter()
+                .filter(|record| !record.archived)
+                .count();
+            next.resources.truncate(active + 64);
+        }
+        self.replace_state(next)
+    }
+
+    fn replace_state(&mut self, next: PersistentState) -> AppResult<()> {
+        serialized_state(&next)?;
+        let old = std::mem::replace(&mut self.state, next);
+        if let Err(error) = self.persist() {
+            self.state = old;
+            return Err(error);
+        }
+        Ok(())
+    }
+
     pub fn connection(&self, id: &str) -> AppResult<Connection> {
         self.state
             .connections
@@ -286,6 +392,9 @@ impl StateStore {
         next_state
             .deployments
             .retain(|record| record.connection_id != id);
+        next_state
+            .ownership
+            .retain(|proof| proof.connection_id != id);
         validation::validate_persistent_state(&next_state)?;
 
         let old_state = std::mem::replace(&mut self.state, next_state);
@@ -306,10 +415,41 @@ impl StateStore {
         })
     }
 
+    #[cfg(test)]
     pub fn record_deployments(&mut self, records: Vec<DeploymentRecord>) -> AppResult<()> {
+        self.commit_deployment(records, self.state.ownership.clone(), None)
+    }
+
+    /// Audit, ownership and optional connection removal commit in one state revision.
+    /// Credential cleanup is deliberately separate and follows client/state commit.
+    pub fn commit_deployment(
+        &mut self,
+        records: Vec<DeploymentRecord>,
+        ownership: Vec<crate::deployment::ownership::TargetOwnership>,
+        delete_id: Option<&str>,
+    ) -> AppResult<()> {
         self.ensure_writable()?;
         let mut next_state = self.state.clone();
+        next_state.ownership = ownership;
         next_state.deployments.extend(records);
+        if let Some(id) = delete_id {
+            self.connection(id)?;
+            if next_state
+                .ownership
+                .iter()
+                .any(|proof| proof.connection_id == id)
+            {
+                return Err(AppError::Config(
+                    "Owned targets remain; connection was not deleted".into(),
+                ));
+            }
+            next_state
+                .connections
+                .retain(|connection| connection.id != id);
+            next_state
+                .deployments
+                .retain(|record| record.connection_id != id);
+        }
         next_state
             .deployments
             .sort_by_key(|record| std::cmp::Reverse(record.created_at));

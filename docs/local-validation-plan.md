@@ -2,7 +2,7 @@
 
 本机入口已实现。A 是代码/浏览器回归，B 是隔离的真实 Windows WebView/IPC 集成测试，C1 使用现有环境观察真实能力，C2 为专用空白用户保留可接续验收入口。维护者本轮选择现有环境，未创建用户或 VM，未执行 C2 安装验收。各次实际结果以仓库外的报告为准；本文不把未执行的项目算作通过。
 
-完成这些验证不等于完整 MVP 达标；仍按 [实现规范 §21](mvp-implementation-spec.md#21-final-acceptance) 判定。P0/P1 之外的 Resources 等缺口不由本套件补齐。
+完成这些验证不等于完整 MVP 达标；仍按 [实现规范 §21](mvp-implementation-spec.md#21-final-acceptance) 判定。Resources 的受支持公共路径发布与撤销已纳入 B；真实客户端消费、手动边界和干净机器验收仍须单独核对，见 [加固交接](hardening-handoff.md)。
 
 ## 运行入口
 
@@ -19,7 +19,7 @@ A 的既有浏览器套件使用现有 Playwright。自动查找 Codex 的捆绑
 
 `PrepareLive` 构建默认 feature 的 current-user NSIS 包，复制 EXE/安装包，记录源码指纹和 SHA-256，准备范围清单，**不安装**。`scripts/package-local.ps1` 是这一打包入口的快捷方式。
 
-报告目录为 `%LOCALAPPDATA%\PilotWeave-validation\runs\<RunId>`。`-ToolRoot` 可指定非链接的独立工具目录。退出码：0 通过、1 失败、2 阻塞。每步结束写入 HTML、JSON 和 JUnit；未结束显示 RUNNING。重跑同一 ID 会保留以前的报告到 `attempts/`，不覆盖失败历史。执行中修改源码会使“Source tree remained unchanged”失败，防止把混合源码验证当作同一版本。
+报告目录为 `%LOCALAPPDATA%\PilotWeave-validation\runs\<RunId>`。`-ToolRoot` 可指定非链接的独立工具目录。退出码：0 通过、1 失败、2 阻塞。每步结束写入 HTML、JSON 和 JUnit；未结束显示 RUNNING。隐藏子进程使用独立输出管道并同时读取输出与错误；脱敏的 `runner.log` 保留异常终止诊断。重跑同一 ID 会保留以前的报告到 `attempts/`，不覆盖失败历史。执行中修改源码会使“Source tree remained unchanged”失败，防止把混合源码验证当作同一版本。
 
 ## 分层与边界
 
@@ -60,6 +60,9 @@ B 覆盖表（具体通过情况见每次报告）：
 | B27 | 实际 Tauri IPC 请求本地模型目录夹具；URL/key 发现、筛选追加、保存/凭据复用、HTTP 错误及关闭后的迟到响应 |
 | B28 | 首页原位新增/编辑连接、保存后选中、模型摘要刷新；预览部署前后均不产生配置部署 |
 | B29 | 首页只预览选定客户端；VS Code 关闭/已打开/重复登录操作均不调用进程启动，保持原生计划一次性消费 |
+| B30 | MCP/Skills/Instructions 实际原生发布、陈旧状态与重放拒绝、保留用户配置；资源表单保存、审核发布、显示绑定与撤销 |
+| B31 | 持久安装记录、官方 CLI 只读身份跟踪、手动客户端跟踪取消、重启后历史与凭据隔离 |
+| B32 | 仅撤销有持久所有权证明的 VS Code 投影后删除连接，保留无关用户组并拒绝重放 |
 
 计划 TTL、更多目标消失/不可读的恢复组合、客户端输入语义/共享 runtime 去重、价格旧响应等还有既有 Rust/浏览器回归；并非每项都另有原生 UI 重复用例。结果应引用相应层级。
 
