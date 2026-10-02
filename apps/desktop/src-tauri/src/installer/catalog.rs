@@ -3,6 +3,7 @@
 use super::*;
 
 pub(super) struct Package {
+    #[cfg(any(windows, test))]
     pub id: &'static str,
     pub version: &'static str,
     pub dependencies: &'static [&'static str],
@@ -10,9 +11,24 @@ pub(super) struct Package {
 
 pub(super) fn package(component: &str) -> AppResult<Package> {
     match component {
-        COMPONENT_VSCODE => Ok(Package { id: "Microsoft.VisualStudioCode", version: "1.140.0", dependencies: &[] }),
-        COMPONENT_COPILOT_CLI => Ok(Package { id: "GitHub.Copilot", version: "v1.0.90", dependencies: &["PowerShell 7 or newer must already be installed; automatic dependency installation is disabled"] }),
-        COMPONENT_COPILOT_APP => Ok(Package { id: "GitHub.CopilotApp", version: "1.1.25", dependencies: &[] }),
+        COMPONENT_VSCODE => Ok(Package {
+            #[cfg(any(windows, test))]
+            id: "Microsoft.VisualStudioCode",
+            version: "1.140.0",
+            dependencies: &[],
+        }),
+        COMPONENT_COPILOT_CLI => Ok(Package {
+            #[cfg(any(windows, test))]
+            id: "GitHub.Copilot",
+            version: "v1.0.90",
+            dependencies: &["PowerShell 7 or newer must already be installed; automatic dependency installation is disabled"],
+        }),
+        COMPONENT_COPILOT_APP => Ok(Package {
+            #[cfg(any(windows, test))]
+            id: "GitHub.CopilotApp",
+            version: "1.1.25",
+            dependencies: &[],
+        }),
         _ => Err(AppError::InvalidInput("Component has no reviewed WinGet package".into())),
     }
 }

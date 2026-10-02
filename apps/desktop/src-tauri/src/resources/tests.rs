@@ -71,7 +71,7 @@ fn mcp_preserves_unmanaged_servers_unknown_fields_and_semantic_noop_bytes() {
         value["mcpServers"]["user"]["headers"]["authorization"],
         "private-fixture"
     );
-    let rendered = format!("// keep formatting\n{}\n", value);
+    let rendered = format!("// keep formatting\n{value}\n");
     std::fs::write(&path, &rendered).unwrap();
     let (noop, _) = prepare(&record, "owner", &target, &[binding.unwrap()], false).unwrap();
     assert!(!noop.changed());

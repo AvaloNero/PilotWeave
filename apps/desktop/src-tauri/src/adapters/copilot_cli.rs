@@ -379,13 +379,12 @@ pub(crate) fn prepare_owned(
                         write.before.clone()
                     };
                 }
-                if let crate::transaction::Resource::File(path) = &write.resource {
-                    use std::os::unix::fs::PermissionsExt;
-                    write.restore_mode = std::fs::metadata(path)
-                        .ok()
-                        .map(|m| m.permissions().mode() & 0o777);
-                    write.write_mode = write.restore_mode;
-                }
+                let crate::transaction::Resource::File(path) = &write.resource;
+                use std::os::unix::fs::PermissionsExt;
+                write.restore_mode = std::fs::metadata(path)
+                    .ok()
+                    .map(|m| m.permissions().mode() & 0o777);
+                write.write_mode = write.restore_mode;
             } else if let Some(after) = &write.after {
                 let text = std::str::from_utf8(after).map_err(|_| ownership::conflict())?;
                 write.after = Some(if matches!(index, 0 | 1 | 5) {
